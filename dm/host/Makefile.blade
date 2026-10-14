@@ -5,9 +5,9 @@
 # Usage: make -f Makefile.blade           → dmhost_blade
 #        make -f Makefile.blade run       → run the game (needs DM_ROMFS / DM_SAVE / DM_TEMP / DM_OUT, see below)
 MACOS_MIN ?= 26.0
-CFLAGS=-O1 -g -Wall -Wno-unused-function -mmacosx-version-min=$(MACOS_MIN) -DAPP_NAME='"Blade II Mobile"'
+CFLAGS=-O1 -g -Wall -Wno-unused-function -mmacosx-version-min=$(MACOS_MIN) -DAPP_NAME='"Blade II Mobile"' -DDM_FORCE_LOOSE=1 -DDM_GENERIC_HOST=1
 SRC=app_mac.m crash.c entry.S front_mac.m hle.c loader.c main.c memstat.m romfs_validate.c thread.c \
-    blade_stubs.c hle_blade.c \
+    blade_stubs.c \
     $(sort $(wildcard hle_*.c))
 GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m))
 GFX_H=$(sort $(wildcard ../gfx/nvn/*.h ../gfx/nvn/include/*.h ../gfx/tex/*.h))

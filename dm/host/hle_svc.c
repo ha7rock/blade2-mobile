@@ -22,7 +22,15 @@
 // about 4.2 GB in total; on iOS without the "extended virtual addressing" entitlement a single reservation can be at most 6 GB
 // (read on a real device: 6 GB succeeds, 7 GB fails), so it cannot be made any wider --
 // with an 8 GB reservation, builds from developer accounts that cannot sign that entitlement (free accounts) would exit at this step.
-#define RESERVE (5ull << 30)
+// Blade II（UE4）：StandardAllocator 以「虚拟地址内存」方式初始化，向 SDK 的 VammManager 要 16 GB 地址区（物理上限 3650 MB），
+// 地址区从 alias 区里划——d2r 的 alias 只有 512 MB，不够就在 StandardAllocator::Initialize 里中止。Mac 宿主用 DM_ALIAS_GB=<GB> 放大 alias 区
+// （只占地址不占内存），整块预留随之变大；不设时与 d2r 完全相同。iOS 上没有「扩展虚拟寻址」权限最多预留 6 GB，到时要么签那项权限、要么剪口把游戏要的 16 GB 改小。
+// Blade II (UE4): the StandardAllocator is initialised in "virtual address memory" mode and asks the SDK's VammManager for a 16 GB address region (physical cap 3650 MB);
+// address regions are carved from the alias region -- d2r's alias is only 512 MB, and when it is too small StandardAllocator::Initialize aborts. The Mac host enlarges the alias
+// region with DM_ALIAS_GB=<GB> (address space only, no memory) and the whole reservation grows with it; unset, everything is identical to d2r. On iOS at most 6 GB can be reserved
+// without the "extended virtual addressing" entitlement: either sign that entitlement or cut the 16 GB the game asks for down.
+static uint64_t alias_cap(void) { static uint64_t v; if (!v) { const char *e = getenv("DM_ALIAS_GB"); double gb = e ? atof(e) : 0.5; if (gb < 0.5) gb = 0.5; v = (uint64_t)(gb * (1ull << 30)) & ~0xFFFFFFFull; } return v; }
+#define RESERVE (alias_cap() - 0x20000000ull + (5ull << 30))   // d2r：alias 512 MB 时正好 5 GB | d2r: exactly 5 GB with a 512 MB alias
 static uint8_t *g_as;              // ASLR 区基址 = 整块 | ASLR region base = the whole block
 static uint8_t *g_heap; static size_t g_heap_cur, g_heap_cap; static int g_heap_rejects;
 // 地址段整个落在客体堆当前已开放（可读写）的范围内：这种读不用陷内核核对，直接 memcpy（diag.c tk_rd 等每拍读客体内存的地方用）
@@ -37,9 +45,9 @@ static void mem_init(void) {
     if (g_as == MAP_FAILED) die("reserve guest AS");
     // 固定划分（都在预留块内）：alias 512MB、stack 256MB、heap 其余从 2GB 处起
     // Fixed partition (all inside the reserved block): alias 512MB, stack 256MB, heap the rest starting at 2GB
-    g_alias = g_as + 0x10000000; g_alias_cap = 0x20000000;
-    g_stack = g_as + 0x30000000; g_stack_cap = 0x10000000;
-    g_heap  = g_as + 0x40000000; g_heap_cap  = RESERVE - 0x40000000;   // 4 GB，容得下游戏那一整块约 3.2 GB 的堆 | 4 GB, enough to hold the game's single heap block of about 3.2 GB
+    g_alias = g_as + 0x10000000; g_alias_cap = alias_cap();
+    g_stack = g_alias + g_alias_cap; g_stack_cap = 0x10000000;
+    g_heap  = g_stack + g_stack_cap; g_heap_cap  = RESERVE - (size_t)(g_heap - g_as);   // 4 GB，容得下游戏那一整块约 3.2 GB 的堆 | 4 GB, enough to hold the game's single heap block of about 3.2 GB
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)RESERVE, g_heap, g_alias, g_stack);
 }
 
@@ -76,6 +84,9 @@ static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++)
 static module_t *mod_named(const char *n) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, n)) return &g_mod[i]; return NULL; }
 static _Atomic unsigned long long g_gheap_last[3];
 int dm_guest_heap_stat(unsigned long long *total_mb, unsigned long long *free_mb, unsigned long long *maxblk_kb) {
+#ifdef DM_GENERIC_HOST
+    (void)total_mb; (void)free_mb; (void)maxblk_kb; return 0;   // 读数靠暗黑 main / sdk 里的固定偏移，别的游戏不适用 | the readout relies on fixed offsets in Diablo's main / sdk, not applicable to another game
+#endif
     module_t *mm = mod_named("main"), *ms = mod_named("sdk"); if (!mm || !ms || !g_heap_cur) return 0;
     uint8_t *al = mm->base + 0x32137a0; if (!al[0]) return 0;   // 首字节 = 已初始化（sdk+0x2f9898 写） | First byte = initialized (written by sdk+0x2f9898)
     uint64_t fr = ((uint64_t (*)(void *))(ms->base + 0x2f9d78))(al), mx = ((uint64_t (*)(void *))(ms->base + 0x2f9dbc))(al);
@@ -86,7 +97,9 @@ int dm_guest_heap_stat(unsigned long long *total_mb, unsigned long long *free_mb
 // The last main-heap readout (total MB, free MB, largest allocatable block KB; all 0 if never read). Callable from any thread - does not enter the allocator (the iOS shell uses it on the main thread for the memory-warning log line)
 void dm_guest_heap_last(unsigned long long v[3]) { for (int i = 0; i < 3; i++) v[i] = atomic_load(&g_gheap_last[i]); }
 HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEmm", "照原版分配，只在返回空时报红（原版调用方多处不判空）", void *, hle_stdalloc_allocate, void *self, size_t size, size_t align) {
-    static void *(*orig)(void *, size_t, size_t); if (!orig) { module_t *ms = mod_named("sdk"); orig = (void *(*)(void *, size_t, size_t))(ms->base + 0x2f9974); }
+    // 原实现按符号名从 sdk 里取（强制接管只改引用，不改 sdk 的符号表）；d2r 原来写死 sdk+0x2f9974，换一版 SDK 就是野指针（Blade 的 SDK 7.4 在此崩过）
+    // The original implementation is taken from the sdk by symbol name (forced takeover only redirects references, the sdk's symbol table is untouched); d2r hard-coded sdk+0x2f9974, a wild pointer with any other SDK version (crashed here with Blade's SDK 7.4)
+    static void *(*orig)(void *, size_t, size_t); if (!orig) { module_t *ms = mod_named("sdk"); orig = (void *(*)(void *, size_t, size_t))module_sym(ms, "_ZN2nn3mem17StandardAllocator8AllocateEmm"); if (!orig) die("sdk 里没有 StandardAllocator::Allocate"); }
     void *p = orig(self, size, align);
     if (!p && size) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) LOG("【红】游戏堆分配返回空：申请 %zu 字节（对齐 %zu），分配器 %p；上次读数 主堆 %llu MB、余量 %llu MB、最大可分配块 %llu KB", size, align, self,
         (unsigned long long)g_gheap_last[0], (unsigned long long)g_gheap_last[1], (unsigned long long)g_gheap_last[2]); }

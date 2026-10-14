@@ -23,10 +23,8 @@ void hle_signal_system_event(void *ev);
 HLE_FORCE("_ZN5movie9MediaData5ClearEv", "过场空播：空 MediaData", void, h_mv_Clear, void **self) { *self = 0; }
 HLE_FORCE("_ZN5movie9MediaDataC1ERKS0_", "过场空播：空 MediaData（拷贝构造）", void, h_mv_CopyCtor, void **self, void **other) { *self = *other; }
 HLE_FORCE("_ZN5movie9MediaDataaSERKS0_", "过场空播：空 MediaData（赋值）", void *, h_mv_Assign, void **self, void **other) { *self = *other; return self; }
-HLE_FORCE("_ZNK5movie9MediaData10FindStringEPKcPS2_", "过场空播：媒体信息一律「没有」（返回 bool）", unsigned, h_mv_FindString, const void *self, const char *key, const char **out) { (void)self; (void)key; if (out) *out = ""; return 0; }
+// FindString / FindInt32 / FindInt64 已在 hle_movie.c 里 | FindString / FindInt32 / FindInt64 are already in hle_movie.c
 HLE_FORCE("_ZNK5movie9MediaData8FindRectEPKcPiS3_S3_S3_", "过场空播：媒体信息一律「没有」", unsigned, h_mv_FindRect, const void *self, const char *key, int *l, int *t, int *r, int *b) { (void)self; (void)key; if (l) *l = 0; if (t) *t = 0; if (r) *r = 0; if (b) *b = 0; return 0; }
-HLE_FORCE("_ZNK5movie9MediaData9FindInt32EPKcPi", "过场空播：媒体信息一律「没有」", unsigned, h_mv_FindInt32, const void *self, const char *key, int *out) { (void)self; (void)key; if (out) *out = 0; return 0; }
-HLE_FORCE("_ZNK5movie9MediaData9FindInt64EPKcPl", "过场空播：媒体信息一律「没有」", unsigned, h_mv_FindInt64, const void *self, const char *key, int64_t *out) { (void)self; (void)key; if (out) *out = 0; return 0; }
 
 // ---------- nn::hid 六轴 / 握持方式 / 手柄支持小程序 / 震动信息 ----------
 // ---------- nn::hid six-axis / joy hold type / controller support applet / vibration info ----------
@@ -77,8 +75,38 @@ HLE_FORCE("_ZN2nn3err9ShowErrorENS0_9ErrorCodeE", "错误码显示小程序：�
 HLE_FORCE("_ZN2nn4pctl32CheckFreeCommunicationPermissionEb", "家长控制·自由通信许可：单机，直接允许", Result, h_pctl_CheckFree, unsigned show) { (void)show; return RES_OK; }
 // 可变参数：Switch 的可变参数在寄存器里、苹果在栈上，不能按 "..." 收；只打印格式串本身
 // Variadic: on the Switch variadic arguments are in registers, on Apple on the stack; cannot be received as "..."; only the format string itself is printed
-HLE_FORCE("_ZN2nn4diag6detail7LogImplERKNS0_11LogMetaDataEPKcz", "SDK 日志（lm 服务）：宿主只打印格式串", void, h_diag_Log, const void *meta, const char *fmt) { (void)meta; if (g_flag.dbg) LOG("[nn::diag] %s", fmt ? fmt : "(null)"); }
-HLE_FORCE("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i", "SDK 中止：宿主打印位置后退出", void, h_diag_Abort, const char *cond, const char *func, const char *file, int line) { die("nn::diag::Abort：%s（%s，%s:%d）", cond ? cond : "", func ? func : "", file ? file : "", line); }
+// Switch 的可变参数就在 x2..x7 里（标准 AAPCS64），这里按格式串自己消费前 6 个整数 / 字符串参数（够看启动日志的数字）
+// The Switch's variadic arguments are simply in x2..x7 (standard AAPCS64); the first 6 integer / string arguments are consumed here by the format string (enough to read the numbers in the boot log)
+static void diag_fmt(char *out, size_t cap, const char *fmt, const uint64_t *a, int na) {
+    size_t o = 0; int ai = 0;
+    for (const char *p = fmt; *p && o + 32 < cap; p++) {
+        if (*p != '%') { out[o++] = *p; continue; }
+        const char *q = p + 1; while (*q && strchr("0123456789.-+ #lhzj", *q)) q++;
+        if (!*q) break;
+        uint64_t v = ai < na ? a[ai] : 0; if (*q != '%') ai++;
+        switch (*q) {
+        case 'd': case 'i': o += snprintf(out + o, cap - o, "%lld", (long long)(strchr(p, 'l') && strchr(p, 'l') < q ? (int64_t)v : (int32_t)v)); break;
+        case 'u': o += snprintf(out + o, cap - o, "%llu", (unsigned long long)(strchr(p, 'l') && strchr(p, 'l') < q ? v : (uint32_t)v)); break;
+        case 'x': case 'X': case 'p': o += snprintf(out + o, cap - o, "%#llx", (unsigned long long)v); break;
+        case 's': o += snprintf(out + o, cap - o, "%s", v ? (const char *)(uintptr_t)v : "(null)"); break;
+        case 'c': out[o++] = (char)v; break;
+        case '%': out[o++] = '%'; break;
+        default: o += snprintf(out + o, cap - o, "%%%c", *q); break;
+        }
+        p = q;
+    }
+    out[o] = 0; while (o && (out[o - 1] == '\n' || out[o - 1] == '\r')) out[--o] = 0;
+}
+HLE_FORCE("_ZN2nn4diag6detail7LogImplERKNS0_11LogMetaDataEPKcz", "SDK 日志（lm 服务）：宿主按格式串打印（前 6 个参数）", void, h_diag_Log, const void *meta, const char *fmt, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)meta; if (!g_flag.dbg) return;
+    uint64_t a[6] = {a0, a1, a2, a3, a4, a5}; char buf[1024]; diag_fmt(buf, sizeof buf, fmt ? fmt : "(null)", a, 6);
+    if (buf[0]) LOG("[nn::diag] %s", buf);
+}
+HLE_FORCE("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i", "SDK 中止：宿主打印位置与回溯后退出", void, h_diag_Abort, const char *cond, const char *func, const char *file, int line) {
+    LOG("nn::diag::Abort：%s（%s，%s:%d）——回溯：", cond ? cond : "", func ? func : "", file ? file : "", line);
+    dm_backtrace((uint64_t)(uintptr_t)__builtin_frame_address(0));
+    die("nn::diag::Abort");
+}
 HLE_FORCE("nndetailDiagAbortFormatImpl", "SDK 中止（带格式）：宿主打印后退出", void, h_diag_AbortFmt, const char *cond, const char *func, const char *file, int line, const void *result, const void *fmt) { (void)result; die("nn::diag::Abort：%s（%s，%s:%d）%s", cond ? cond : "", func ? func : "", file ? file : "", line, fmt ? (const char *)fmt : ""); }
 
 // ---------- nn::audio 音频渲染器（audren）：先只维持协议 ----------
@@ -166,9 +194,8 @@ NET_INT(h_sk_GetSockOpt, "_ZN2nn6socket10GetSockOptEiiiPvPj") NET_INT(h_sk_SetSo
 NET_INT(h_sk_GetAddrInfo2, "_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_") NET_VOID(h_sk_FreeAddrInfo2, "_ZN2nn6socket12FreeAddrInfoEP8addrinfo")
 NET_INT(h_sk_GetPeerName, "_ZN2nn6socket11GetPeerNameEiP8sockaddrPj") NET_INT(h_sk_GetSockName, "_ZN2nn6socket11GetSockNameEiP8sockaddrPj")
 NET_INT(h_sk_GetLastErrno, "_ZN2nn6socket12GetLastErrnoEv") NET_INT(h_sk_Bind, "_ZN2nn6socket4BindEiPK8sockaddrj") NET_INT(h_sk_Poll, "_ZN2nn6socket4PollEP6pollfdmi")
-NET_INT(h_sk_Recv2, "_ZN2nn6socket4RecvEiPvmi") NET_INT(h_sk_Send2, "_ZN2nn6socket4SendEiPKvmi") NET_INT(h_sk_Close, "_ZN2nn6socket5CloseEi")
-NET_INT(h_sk_Fcntl, "_ZN2nn6socket5FcntlEiiz") NET_INT(h_sk_Ioctl, "_ZN2nn6socket5IoctlEijPvm") NET_INT(h_sk_Accept, "_ZN2nn6socket6AcceptEiP8sockaddrPj")
-NET_INT(h_sk_Listen, "_ZN2nn6socket6ListenEii") NET_INT(h_sk_Select, "_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval") NET_INT(h_sk_SendTo, "_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj")
+NET_INT(h_sk_Recv2, "_ZN2nn6socket4RecvEiPvmi") NET_INT(h_sk_Send2, "_ZN2nn6socket4SendEiPKvmi") NET_INT(h_sk_Fcntl, "_ZN2nn6socket5FcntlEiiz") NET_INT(h_sk_Ioctl, "_ZN2nn6socket5IoctlEijPvm") NET_INT(h_sk_Accept, "_ZN2nn6socket6AcceptEiP8sockaddrPj")
+NET_INT(h_sk_Select, "_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval") NET_INT(h_sk_SendTo, "_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj")
 NET_INT(h_sk_Socket, "_ZN2nn6socket6SocketEiii") NET_INT(h_sk_Connect, "_ZN2nn6socket7ConnectEiPK8sockaddrj") NET_INT(h_sk_RecvFrom2, "_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj")
 NET_INT(h_sk_Shutdown, "_ZN2nn6socket8ShutdownEii")
 HLE_FORCE("_ZN2nn6socket8InetNtoaE7in_addr", "纯计算：点分地址字符串（静态缓冲）", const char *, h_sk_InetNtoa, uint32_t a) { static char b[20]; snprintf(b, sizeof b, "%u.%u.%u.%u", a & 255, (a >> 8) & 255, (a >> 16) & 255, a >> 24); return b; }
@@ -178,20 +205,9 @@ HLE_FORCE("_ZN2nn6socket9InetHtonlEj", "纯计算：主机序 → 网络序", ui
 HLE_FORCE("_ZN2nn6socket9InetNtohlEj", "纯计算：网络序 → 主机序", uint32_t, h_sk_Ntohl, uint32_t v) { return __builtin_bswap32(v); }
 HLE_FORCE("_ZN2nn6socket9InetHtonsEt", "纯计算：主机序 → 网络序", uint32_t, h_sk_Htons, unsigned v) { return __builtin_bswap16((uint16_t)v); }
 HLE_FORCE("_ZN2nn6socket9InetNtohsEt", "纯计算：网络序 → 主机序", uint32_t, h_sk_Ntohs, unsigned v) { return __builtin_bswap16((uint16_t)v); }
-NET_INT(h_nsk_Bind, "nnsocketBind") NET_INT(h_nsk_Close, "nnsocketClose") NET_INT(h_nsk_Connect, "nnsocketConnect") NET_INT(h_nsk_Fcntl, "nnsocketFcntl")
-NET_INT(h_nsk_GetPeerName, "nnsocketGetPeerName") NET_INT(h_nsk_GetSockName, "nnsocketGetSockName") NET_INT(h_nsk_GetSockOpt, "nnsocketGetSockOpt")
-NET_INT(h_nsk_Poll, "nnsocketPoll") NET_INT(h_nsk_ResGetOpt, "nnsocketResolverGetOption") NET_INT(h_nsk_ResSetOpt, "nnsocketResolverSetOption")
-NET_INT(h_nsk_SetSockOpt, "nnsocketSetSockOpt") NET_INT(h_nsk_Socket, "nnsocketSocket")
 HLE_FORCE("nnsocketInetHtons", "纯计算：主机序 → 网络序", uint32_t, h_nsk_Htons, unsigned v) { return __builtin_bswap16((uint16_t)v); }
 HLE_FORCE("nnsocketInetNtohs", "纯计算：网络序 → 主机序", uint32_t, h_nsk_Ntohs, unsigned v) { return __builtin_bswap16((uint16_t)v); }
-NET_RES(h_ssl_ConnCreate, "nnsslConnectionCreate") NET_RES(h_ssl_ConnDestroy, "nnsslConnectionDestroy") NET_RES(h_ssl_Handshake, "nnsslConnectionDoHandshakeWithCertBuffer")
-NET_RES(h_ssl_ConnId, "nnsslConnectionGetConnectionId") NET_RES(h_ssl_VerifyErr, "nnsslConnectionGetVerifyCertError") NET_RES(h_ssl_Peek, "nnsslConnectionPeek")
-NET_RES(h_ssl_Pending, "nnsslConnectionPending") NET_RES(h_ssl_Read, "nnsslConnectionRead") NET_RES(h_ssl_HostName, "nnsslConnectionSetHostName")
-NET_RES(h_ssl_IoMode, "nnsslConnectionSetIoMode") NET_RES(h_ssl_Option, "nnsslConnectionSetOption") NET_RES(h_ssl_CacheMode, "nnsslConnectionSetSessionCacheMode")
-NET_RES(h_ssl_SockDesc, "nnsslConnectionSetSocketDescriptor") NET_RES(h_ssl_VerifyOpt, "nnsslConnectionSetVerifyOption") NET_RES(h_ssl_Write, "nnsslConnectionWrite")
-NET_RES(h_ssl_CtxDestroy, "nnsslContextDestroy") NET_RES(h_ssl_CtxId, "nnsslContextGetContextId")
-NET_RES(h_ssl_ImportPki, "_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE") NET_RES(h_ssl_CtxCreate, "_ZN2nn3ssl7Context6CreateENS1_10SslVersionE")
-NET_VOID(h_nifm_LocalMode, "_ZN2nn4nifm19SetLocalNetworkModeEb") NET_RES(h_nifm_PrimaryIp2, "_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr")
+NET_RES(h_ssl_ImportPki, "_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE") NET_VOID(h_nifm_LocalMode, "_ZN2nn4nifm19SetLocalNetworkModeEb") NET_RES(h_nifm_PrimaryIp2, "_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr")
 NET_RES(h_nifm_HandleResult, "_ZN2nn4nifm26HandleNetworkRequestResultEv") NET_VOID(h_nifm_SubmitWait, "_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv")
 NET_RES(h_ldn_Init, "_ZN2nn3ldn10InitializeEv") NET_RES(h_ldn_OpenStation, "_ZN2nn3ldn11OpenStationEv") NET_RES(h_ldn_CloseStation, "_ZN2nn3ldn12CloseStationEv")
 NET_RES(h_ldn_CreateNet, "_ZN2nn3ldn13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE") NET_RES(h_ldn_DestroyNet, "_ZN2nn3ldn14DestroyNetworkEv")

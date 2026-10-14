@@ -12,5 +12,5 @@ mkdir -p "$DM_SAVE" "$DM_TEMP" "$W/run/log"
 LOG=$W/run/log/host_$(date +%m%d_%H%M%S).log
 echo "log: $LOG"
 cd "$HERE/dm/host" || exit 1
-env DM_WINDOW=${DM_WINDOW:-1} DM_WATCH="$SECS" DM_DBG=${DM_DBG:-1} DM_IMPORTS=${DM_IMPORTS:-0} "$@" ./dmhost_blade "$OUT" main sdk 2> "$LOG"
+env DM_ALIAS_GB=${DM_ALIAS_GB:-18} DM_WINDOW=${DM_WINDOW:-1} DM_WATCH="$SECS" DM_DBG=${DM_DBG:-1} DM_IMPORTS=${DM_IMPORTS:-0} "$@" ./dmhost_blade "$OUT" main sdk 2> "$LOG"
 echo "exit code $?"

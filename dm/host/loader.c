@@ -145,7 +145,13 @@ static void force_check(void) {
     int bad = 0;
     for (unsigned i = 0; i < g_nforce; i++)
         if (!g_force_hits[i]) { LOG("强制接管条目无任何引用：%s", g_force[i].name); bad = 1; }
+#ifdef DM_FORCE_LOOSE
+    // 多游戏宿主（Blade 构建）：清单里有别的游戏才引用的条目是正常的，只记日志不中止；严格模式仍是 d2r 的缺省
+    // Multi-game host (Blade build): entries only another game references are normal, log only and do not abort; strict mode remains d2r's default
+    if (bad) { unsigned hit = 0; for (unsigned i = 0; i < g_nforce; i++) hit += g_force_hits[i] != 0; LOG("force: %u 条，本游戏引用 %u 条（其余是别的游戏才用的，DM_FORCE_LOOSE）", g_nforce, hit); return; }
+#else
     if (bad) die("强制接管清单有误");
+#endif
     LOG("force: %u 条全部命中", g_nforce);
 }
 

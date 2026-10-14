@@ -217,6 +217,9 @@ void dm_3d_scale_hot(int hot) { (void)hot; }   // 过热不再直接降档（改
 static _Atomic float g_scale3d_cur = 1.0f;
 float dm_3d_scale_cur(void) { return atomic_load(&g_scale3d_cur); }
 static void scale3d_tick(void) {
+#ifdef DM_GENERIC_HOST
+    return;   // 渲染比例改写靠暗黑 main 里的固定偏移（渲染器对象 / 改分辨率函数），别的游戏是野指针 | the render-scale rewrite relies on fixed offsets in Diablo's main (renderer object / resolution function): wild pointers for another game
+#endif
     static float want_cfg = -1, cur = 1.0f; static module_t *main;
     if (want_cfg < 0) {
         const char *e = getenv("DM_3D_SCALE"); want_cfg = TARGET_OS_IPHONE ? 0.75f : 1.0f;
