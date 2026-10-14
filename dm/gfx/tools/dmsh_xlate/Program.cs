@@ -28,6 +28,7 @@ using System.Text.Json.Nodes;
 
 static class SwshXlate
 {
+    const int CombBase = 0x20, ImgBase = 0x120;   // 合并贴图 + 采样器句柄表 c[2][0x20 + 8r]（32 槽，紧接图像表之前；与 dmsh_build.py COMB_BASE / IMG_BASE 一致） | combined texture + sampler handle table c[2][0x20 + 8r] (32 slots, right before the image table; matches dmsh_build.py COMB_BASE / IMG_BASE)
     const int TexBase = 0x168, SampBase = 0x568;   // NVN 分离贴图 / 采样器句柄在 c[2] 的字节基址（每槽 8 字节；dm/gfx/tools/maxwell_refs.py 全量实测） | byte base of NVN separate texture / sampler handles in c[2] (8 bytes per slot; full measurement in dm/gfx/tools/maxwell_refs.py)
 
     sealed class Accessor : IGpuAccessor
@@ -54,6 +55,7 @@ static class SwshXlate
         {
             (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
             int bytes = off0 * 4;
+            if ((cbufSlot < 0 || (cbufSlot & 0xffff) == 2) && bytes >= CombBase && bytes < ImgBase && (bytes - CombBase) % 8 == 0) return (bytes - CombBase) / 8;   // 合并句柄表（UE4 的 NVN RHI：nvnCommandBufferBindTexture）| combined handle table (UE4's NVN RHI: nvnCommandBufferBindTexture)
             return (cbufSlot < 0 || (cbufSlot & 0xffff) == 2) && bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0 ? (bytes - TexBase) / 8 : -1;
         }
         public SamplerType QuerySamplerType(int handle, int cbufSlot = -1)

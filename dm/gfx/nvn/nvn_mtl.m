@@ -2963,6 +2963,20 @@ static inline int m3_use_seen(void *p, uint32_t u) {
     return 0;
 }
 #endif
+// DM_NVN_TEXFACTS=文件：记每个着色器各贴图槽实际绑定的贴图类型（键 \t 槽 \t 类型词），给离线翻译作答（dmsh_from_dump.py 合进 nvn/shader_facts.tsv 的 tex）。
+// 翻译器离线看不到贴图描述符，默认把每个槽当 2D：缓冲贴图（UE4 蒙皮的骨骼矩阵 Buffer<float4>）、3D / 立方体贴图在 Metal 里类型不符就读到 0
+// DM_NVN_TEXFACTS=file: record the texture type actually bound to each texture slot of each shader (key \t slot \t type word) as answers for offline translation (dmsh_from_dump.py merges them into tex of nvn/shader_facts.tsv).
+// The translator cannot see texture descriptors offline and treats every slot as 2D by default: texture buffers (UE4 skinning's bone matrices Buffer<float4>), 3D / cube textures read 0 on Metal when the type does not match
+static void texfacts_note(NvShader *sh, int reg, MTLTextureType tt) {
+    static FILE *f; static int tried; static NSMutableSet *seen;
+    if (!tried) { tried = 1; const char *e = getenv("DM_NVN_TEXFACTS"); if (e) { f = fopen(e, "a"); seen = [NSMutableSet set]; } }
+    if (!f || !sh || !sh->key[0]) return;
+    static const char *const words[] = {"1d", "1darray", "2d", "2darray", "2dms", "cube", "cubearray", "3d", "2dmsarray", "buffer"};
+    if ((unsigned)tt >= sizeof words / sizeof *words) return;
+    NSString *line = [NSString stringWithFormat:@"%.16s\t%d\t%s", sh->key, reg, words[tt]];
+    if ([seen containsObject:line]) return;
+    [seen addObject:line]; fprintf(f, "%s\n", line.UTF8String); fflush(f);
+}
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
     uint64_t slots[NVN_REFL_MAXB] = {0};
@@ -3028,6 +3042,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                        (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType);
+            if (t) texfacts_note(sh, reg, t.textureType);
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);

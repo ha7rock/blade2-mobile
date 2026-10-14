@@ -45,10 +45,29 @@ with open(os.path.join(NVN, 'shader_map.tsv'), 'w') as f:
 # The compute threadgroup size / shared-memory bytes live in the NVN control section (measured on Blade's 4: 3 u32 from +0x748 = threadgroup, +0x754 = shared bytes; all 0 for graphics shaders)
 # → written as the answer table nvn/shader_facts.tsv (the translator's default of 48 KB shared memory exceeds Metal's limit, so the real value is required)
 import json
+# 贴图类型作答：宿主 DM_NVN_TEXFACTS 记录的「键 \t 槽 \t 类型词」（缓冲 / 3D / 立方体…；翻译器缺省按 2D，类型不符 Metal 读到 0——UE4 蒙皮的骨骼矩阵就是缓冲贴图）
+# 同一槽见过多种类型时取最后一种并提示
+# Texture type answers: "key \t slot \t type word" recorded by the host via DM_NVN_TEXFACTS (buffer / 3D / cube ...; the translator defaults to 2D and Metal reads 0 when the type does not match -- UE4 skinning's bone matrices are a texture buffer)
+# When one slot was seen with several types the last one wins with a notice
+texfacts = {}
+tf = os.environ.get('DM_TEXFACTS', os.path.join(os.environ.get('DM_ROOT', os.path.expanduser('~/blade2-work')), 'texfacts.tsv'))
+if os.path.exists(tf):
+    for ln in open(tf):
+        c = ln.rstrip('\n').split('\t')
+        if len(c) == 3:
+            prev = texfacts.setdefault(c[0], {}).get(c[1])
+            if prev and prev != c[2]: print(f'贴图类型作答：{c[0]} 槽 {c[1]} 既见 {prev} 又见 {c[2]}，取 {c[2]}')
+            texfacts[c[0]][c[1]] = c[2]
 with open(os.path.join(NVN, 'shader_facts.tsv'), 'w') as f:
-    f.write('# 翻译查询的作答表（dmsh_from_dump.py 从控制段解出；只有计算着色器有内容）| answer table (decoded from the control sections by dmsh_from_dump.py; only compute shaders have entries)\n')
-    for key, code, ctl in recs['cs']:
-        x, y, z, shared = struct.unpack_from('<3I', ctl, 0x748) + struct.unpack_from('<I', ctl, 0x754)
-        f.write(key + '\t' + json.dumps({'attr': {}, 'fout': {}, 'img': {}, 'tex': {}, 'local': [x, y, z], 'shared': (shared + 15) // 16 * 16}, sort_keys=True, separators=(',', ':')) + '\n')
+    f.write('# 翻译查询的作答表（dmsh_from_dump.py：计算线程组 / 共享内存从控制段解出；贴图类型来自宿主 DM_NVN_TEXFACTS 记录）| answer table (dmsh_from_dump.py: compute threadgroup / shared memory decoded from the control sections; texture types from the host DM_NVN_TEXFACTS record)\n')
+    for st in ('vs', 'ps', 'cs'):
+        for key, code, ctl in recs[st]:
+            facts = {'attr': {}, 'fout': {}, 'img': {}, 'tex': texfacts.get(key, {})}
+            if st == 'cs':
+                x, y, z, shared = struct.unpack_from('<3I', ctl, 0x748) + struct.unpack_from('<I', ctl, 0x754)
+                facts.update({'local': [x, y, z], 'shared': (shared + 15) // 16 * 16})
+            elif not facts['tex']: continue
+            f.write(key + '\t' + json.dumps(facts, sort_keys=True, separators=(',', ':')) + '\n')
+print(f'贴图类型作答：{sum(1 for k in texfacts if any(k == r[0] for st in recs for r in recs[st]))} 个着色器有记录（{tf}）')
 open(os.path.join(NVN, 'shader_map.tsv.conflicts.tsv'), 'w').write('# 无键冲突（转储按键去重） | no key conflicts (the dump is deduplicated by key)\ndm_ctl_sha16\tchosen\treason\n')
 print(f'{game}: 顶点 {len(recs["vs"])} 像素 {len(recs["ps"])} 计算 {len(recs["cs"])}，跳过 {bad}；包在 {packdir}，映射表已写到 nvn/shader_map.tsv')
