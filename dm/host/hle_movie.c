@@ -212,11 +212,21 @@ static int ext_Read(void *self, void *buf) {
 }
 static int ext_Advance(void *self) { (void)self; return ST_OK; }
 static int ext_GetSampleTime(void *self, int64_t *us) { *us = M(self)->last_pts_us; return ST_OK; }
-TRAP(ext, 2, "SetDataSource(char const*)") TRAP(ext, 3, "SetDataSource(void const*, int)") TRAP(ext, 5, "GetTrackConfiguration")
+// UE4（Blade II）的播放器走槽 2 SetDataSource(路径)：没有读取器可读时长，一律按 MV_SKIP_NS 空播
+// UE4's (Blade II) player uses slot 2 SetDataSource(path): no reader to read the duration from, always play empty for MV_SKIP_NS
+static int ext_SetDataSourcePath(void *self, const char *path) {
+    // 先按「打不开」答（非 0 状态）：UE4 的播放器会记一条日志然后跳过这段视频，不走它后面依赖解码器对象的路径
+    // （按 ST_OK 走时它读了 0 轨后仍去碰解码器成员 → main+0x3a29f94 空指针写）。要真空播再把 Extractor / Decoder 的 UE4 调法补全
+    // Answer "cannot open" first (non-zero status): UE4's player logs a line and skips the movie instead of taking the later path that depends on the decoder object
+    // (with ST_OK it read 0 tracks and still touched decoder members → null pointer write at main+0x3a29f94). To really play empty, complete UE4's use of Extractor / Decoder
+    (void)self; LOG("movie：UE4 按路径打开 %s → 答打不开（跳过视频）", path ? path : "(null)");
+    return 1;
+}
+TRAP(ext, 3, "SetDataSource(void const*, int)") TRAP(ext, 5, "GetTrackConfiguration")
 TRAP(ext, 6, "SelectTrack") TRAP(ext, 7, "UnselectTrack") TRAP(ext, 9, "GetTrackIndexForAvailableData")
 TRAP(ext, 13, "GetSampleMetaData") TRAP(ext, 14, "GetBufferedRange")
 static void *const g_ext_vt[16] = {
-    mv_dtor, mv_delete, mv_trap_ext_2, mv_trap_ext_3, ext_GetTrackCount, mv_trap_ext_5, mv_trap_ext_6, mv_trap_ext_7,
+    mv_dtor, mv_delete, ext_SetDataSourcePath, mv_trap_ext_3, ext_GetTrackCount, mv_trap_ext_5, mv_trap_ext_6, mv_trap_ext_7,
     ext_SeekTo, mv_trap_ext_9, ext_Read, ext_Advance, ext_GetSampleTime, mv_trap_ext_13, mv_trap_ext_14,
     ext_SetDataSourceReader,
 };

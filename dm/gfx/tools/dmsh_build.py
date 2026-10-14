@@ -40,7 +40,7 @@ CAS = os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
 PRE_STATS = collections.Counter()
 MAC_RECORD = 'xcrun -sdk macosx metal -c; xcrun -sdk macosx metallib'
-TEX_BASE, SAMP_BASE, IMG_BASE = 0x168, 0x568, 0x120   # c[2]：图像句柄表 0x120 + 8 r（8 槽，紧接贴图表之前；cs_lut_combine_c 写 u4 = 0x140 反推，u5 = 0x148 核对） | c[2]: image handle table 0x120 + 8 r (8 slots, immediately before the texture table; inferred from cs_lut_combine_c writing u4 = 0x140, checked with u5 = 0x148)
+TEX_BASE, SAMP_BASE, IMG_BASE, COMB_BASE = 0x168, 0x568, 0x120, 0x20   # c[2]：图像句柄表 0x120 + 8 r（8 槽，紧接贴图表之前；cs_lut_combine_c 写 u4 = 0x140 反推，u5 = 0x148 核对） | c[2]: image handle table 0x120 + 8 r (8 slots, immediately before the texture table; inferred from cs_lut_combine_c writing u4 = 0x140, checked with u5 = 0x148)
 
 def records(d):
     r = [m.start() for m in re.finditer(b'BTCDBTCD', d)]
@@ -315,6 +315,9 @@ def decode_tex(name):
     if re.match(r'[a-z]+_i', name):   # 图像 | image
         return next((slot(x, IMG_BASE, tb) for x in words if IMG_BASE <= x * 4 < TEX_BASE and slot(x, IMG_BASE, tb) is not None), None), None, ty
     t = next((slot(x, TEX_BASE, tb) for x in words if slot(x, TEX_BASE, tb) is not None and x * 4 < SAMP_BASE), None)
+    # 组合句柄表（nvnCommandBufferBindTexture，UE4 的 NVN RHI 用）：c[2][0x20 + 8r]，32 槽，紧接图像表之前；句柄类型 0 ⇒ 采样器取同槽句柄高位（samp_tex）
+    # Combined handle table (nvnCommandBufferBindTexture, used by UE4's NVN RHI): c[2][0x20 + 8r], 32 slots, right before the image table; handle type 0 ⇒ the sampler comes from the same slot's high bits (samp_tex)
+    if t is None: t = next((slot(x, COMB_BASE, tb) for x in words if COMB_BASE <= x * 4 < IMG_BASE and slot(x, COMB_BASE, tb) is not None), None)
     s = next((slot(x, SAMP_BASE, sb) for x in words if x * 4 >= SAMP_BASE and slot(x, SAMP_BASE, sb) is not None), None)
     return t, s, ty
 

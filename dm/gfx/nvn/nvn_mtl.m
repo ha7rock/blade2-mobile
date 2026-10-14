@@ -2266,6 +2266,35 @@ static NvShader *builtin_get(const char *ctl) {
     }
     return nil;
 }
+// ---------- 按阶段分开绑定的程序（Blade II / UE4 的 NVN RHI）----------
+// 暗黑的每个 NVNprogram 含全部阶段，BindProgram 一次绑整套；UE4 给每个阶段各建一个只含一个着色器的 NVNprogram，
+// BindProgram(程序, 阶段位) 分别绑顶点 / 片元 / 计算。回放层的状态与管线缓存都按「一个程序对象」组织，所以这里把当前各阶段
+// 绑着的程序合成一个宿主自己的 prog_t（各阶段的着色器数据拼在一起、给新序号），同一组合只合成一次（按程序地址 + 序号查小表）。
+// 多阶段程序（暗黑式）原样返回。NULL（解绑）清掉对应阶段。
+// ---------- Programs bound per stage (Blade II / UE4's NVN RHI) ----------
+// Each of Diablo's NVNprograms holds all stages and BindProgram binds the whole set at once; UE4 builds one single-shader NVNprogram per stage and
+// binds vertex / fragment / compute separately with BindProgram(program, stage bits). The replay layer's state and pipeline cache are organised around
+// "one program object", so here the programs currently bound per stage are merged into a host-owned prog_t (the stages' shader data concatenated,
+// with a new serial); each combination is merged only once (looked up in a small table by program address + serial).
+// A multi-stage program (Diablo style) is returned as is. NULL (unbind) clears the corresponding stages.
+static const prog_t *g_stage_prog[6];
+static const prog_t *combine_prog(const prog_t *p, int stages) {
+    if (p && p->nstage > 1) { for (int i = 0; i < 6; i++) g_stage_prog[i] = NULL; return p; }
+    for (int i = 0; i < 6; i++) if (stages & (1 << i)) g_stage_prog[i] = p;
+    const prog_t *parts[6]; uint64_t sers[6]; int n = 0;
+    for (int i = 0; i < 6; i++) if (g_stage_prog[i] && g_stage_prog[i]->nstage == 1) { int dup = 0; for (int k = 0; k < n; k++) dup |= parts[k] == g_stage_prog[i]; if (!dup) { parts[n] = g_stage_prog[i]; sers[n] = g_stage_prog[i]->serial; n++; } }
+    if (!n) return NULL;
+    if (n == 1) return parts[0];
+    typedef struct { const prog_t *parts[6]; uint64_t sers[6]; int n; prog_t *combo; } combo_t;
+    static combo_t *tab; static int ntab, cap;
+    for (int i = 0; i < ntab; i++) if (tab[i].n == n && !memcmp(tab[i].parts, parts, n * sizeof *parts) && !memcmp(tab[i].sers, sers, n * sizeof *sers)) return tab[i].combo;
+    prog_t *c = calloc(1, sizeof *c); c->magic = MAGIC('P', 'R', 'O', 'G'); c->nstage = n;
+    for (int i = 0; i < n; i++) c->sd[i] = parts[i]->sd[0];
+    c->serial = nvn_new_serial();
+    if (ntab == cap) { cap = cap ? cap * 2 : 64; tab = realloc(tab, cap * sizeof *tab); }
+    tab[ntab] = (combo_t){{0}, {0}, n, c}; memcpy(tab[ntab].parts, parts, n * sizeof *parts); memcpy(tab[ntab].sers, sers, n * sizeof *sers); ntab++;
+    return c;
+}
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
@@ -2289,6 +2318,10 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
         if (sh) o->sh[st] = sh; else MLOG("【红】着色器 %s（%s）加载失败：先跑 dm/gfx/tools/dmsh_build.py 出包", k.UTF8String, zh.UTF8String);
     }
     if (p->serial) serial_put(p->serial, o);
+    // DM_NVN_PAIRS=文件：记下每个程序组合里各阶段的键（顶点 / 片元成对翻译要用：片元读的插值输出顶点必须写，Metal 建管线时核）
+    // DM_NVN_PAIRS=file: record the keys of each stage in every program combination (needed for paired vertex / fragment translation: every interpolant the fragment reads must be written by the vertex shader, checked by Metal at pipeline creation)
+    { static FILE *pf; static int tried; if (!tried) { tried = 1; const char *e = getenv("DM_NVN_PAIRS"); if (e) pf = fopen(e, "a"); }
+      if (pf) { char line[256] = ""; for (int st = 0; st < 6; st++) if (o->sh[st] && o->sh[st]->key[0]) { size_t l = strlen(line); snprintf(line + l, sizeof line - l, "%s%d:%.16s", l ? " " : "", st, o->sh[st]->key); } if (line[0]) { fprintf(pf, "%s\n", line); fflush(pf); } } }
     return o;
 }
 void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
@@ -3224,7 +3257,7 @@ static int first_draw_covers(int i, id<MTLTexture> t, NSUInteger level) {
 static int state_op(uint32_t op, const void *a) {
     switch (op) {
         case OP_SCISSOR: R.sc = *(const p_scissor *)a; R.has_sc = 1; break;
-        case OP_BIND_PROGRAM: { const prog_t *np = ((const p_bind_program *)a)->prog; if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_dirty_all(); } break; }
+        case OP_BIND_PROGRAM: { const p_bind_program *bp = a; const prog_t *np = combine_prog(bp->prog, bp->stages); if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_dirty_all(); } break; }
         case OP_BIND_STATE: {
             const p_bind_state *b = a; void *dst = NULL; size_t n = 0;
             blend_st bs;
@@ -4441,13 +4474,13 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     if (g_ruler_truth == 0) {   // 尺子负对照（DM_NVN_RULER_NEG=<片元键>）：被测模式下丢掉该着色器的绘制，尺子必须报不等价 | Ruler negative control (DM_NVN_RULER_NEG=<fragment key>): in the mode under test drop this shader's draws, and the ruler must report non-equivalence
         static const char *neg; static int ng = -1; if (ng < 0) { neg = getenv("DM_NVN_RULER_NEG"); ng = neg && *neg; }
-        if (ng && pr) for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (sh && sh->stage == 1 && !strncmp(sh->key, neg, strlen(neg))) { static int once; if (!once++) MLOG("DM_NVN_RULER_NEG：被测模式丢弃着色器 %s 的绘制", sh->key); return; } }
+        if (ng && pr) for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (sh && sh->stage == 1 && !strncmp(sh->key, neg, strlen(neg))) { static int once; if (!once++) MLOG("DM_NVN_RULER_NEG：被测模式丢弃着色器 %s 的绘制", sh->key); { PD("N %llu 绘制提前退出@L4444", g_stat_pass + 1); return; } } }
     }
     if (zskip_can_draw(pr)) {   // 零源跳过：输出恒为 0、写 0 盖 0，这次绘制不改变任何结果（见 zskip_can_draw） | Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("零源跳过：首例 通道 %llu", g_stat_pass + 1); }
         PD("N %llu 零源跳过", g_stat_pass + 1); return; }
     if (!g_defer_replaying) {
-        if (g_defer.active && g_defer.in_p && !g_defer.at_q) { if (defer_take(dw, di)) return; }
+        if (g_defer.active && g_defer.in_p && !g_defer.at_q) { if (defer_take(dw, di)) { PD("N %llu 绘制提前退出@L4450", g_stat_pass + 1); return; } }
     }
     // 什么都画不出的绘制（两面全剔、剪裁为空）在开通道之前就返回：否则通道已开，TBDR 上整张附件白读白写
     // （Mac 选角页：3 个通道只因此类绘制而开，全部读入、零绘制）
@@ -4458,13 +4491,13 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     { static char sk[16][20]; static int nsk = -1;
       if (nsk < 0) { nsk = 0; for (const char *q = getenv("DM_NVN_SKIP_FS"); q && *q && nsk < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 16) n = 16; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
                      if (nsk) MLOG("DM_NVN_SKIP_FS：丢弃 %d 个片元着色器的绘制（诊断，画面不对）", nsk); }
-      if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) return;   // 同进程交替测量：本相丢这一类 | In-process alternating measurement: this phase drops this class
-      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return; }
+      if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) { PD("N %llu 绘制提前退出@L4461", g_stat_pass + 1); return; }   // 同进程交替测量：本相丢这一类 | In-process alternating measurement: this phase drops this class
+      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) { PD("N %llu 绘制提前退出@L4462", g_stat_pass + 1); return; } }
     // 同类诊断 DM_NVN_SKIP_SMALL=<宽>：丢掉目标宽度（按所挂的级）≤ 该值的全部绘制——量「极小通道整批丢掉」在并行流水下值多少（每通道固定开销）
     // Similar diagnostic DM_NVN_SKIP_SMALL=<width>: drop all draws whose target width (by the attached level) is <= this value -- measures how much "dropping tiny render passes in bulk" is worth under the parallel pipeline (fixed per-pass overhead)
     { static int small = -1; if (small < 0) { const char *e = getenv("DM_NVN_SKIP_SMALL"); small = e ? atoi(e) : 0; if (small) MLOG("DM_NVN_SKIP_SMALL：丢弃目标宽度 ≤ %d 的绘制（诊断，画面不对）", small); }
       if (small > 0 && R.has_rt && !g_defer_replaying) { int k = R.rt.n && R.rt.color[0] ? 0 : R.rt.depth ? 8 : -1;
-        if (k >= 0) { uint64_t s_; int lv, sl; rt_sub(&R.rt, k, &s_, &lv, &sl); const tex_t *t = k == 8 ? R.rt.depth : R.rt.color[0]; if ((int)MAX(t->d.width >> lv, 1u) <= small) return; } } }
+        if (k >= 0) { uint64_t s_; int lv, sl; rt_sub(&R.rt, k, &s_, &lv, &sl); const tex_t *t = k == 8 ? R.rt.depth : R.rt.color[0]; if ((int)MAX(t->d.width >> lv, 1u) <= small) { PD("N %llu 绘制提前退出@L4467", g_stat_pass + 1); return; } } } }
     // 试验开关 DM_NVN_NOFXAA=1（缺省关，去留按视觉尺子 + 实机看图定）：跳过 FXAA 那次全屏绘制，后面的锐化 / 放大改读 FXAA 的输入（色调映射结果）
     // Experimental switch DM_NVN_NOFXAA=1 (off by default; keep or drop decided by the visual ruler + looking at the picture on a real machine): skips the FXAA full-screen draw, and the later sharpening / upscale reads FXAA's input instead (the tone mapping result)
     { static int nofxaa = -1; static uint64_t fx_from, fx_to; if (nofxaa < 0) { const char *e = getenv("DM_NVN_NOFXAA"); nofxaa = e && !strcmp(e, "1"); if (nofxaa) MLOG("DM_NVN_NOFXAA=1：跳过 FXAA"); }
@@ -4489,17 +4522,17 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
                 if (h && st && cbuf && f->rf.c1_len >= sizeof(float) * 2) {
                     float c1[2]; memcpy(c1, f->rf.c1, sizeof c1); g_bloomq.s_tex = st; g_bloomq.s_h = h; g_bloomq.s_ser = st->serial; g_bloomq.b0_ser = tgt; g_bloomq.coeff_g = c1[0]; g_bloomq.coeff_b = c1[1]; g_bloomq.state = 1;
                     { static int once; if (!once++) MLOG("泛光 1/4 起点：生效（S ser=%llu B0 ser=%llu）", (unsigned long long)g_bloomq.s_ser, (unsigned long long)g_bloomq.b0_ser); } PD("A %llu 泛光 1/4 起点 S=%llu B0=%llu", g_stat_pass, (unsigned long long)g_bloomq.s_ser, (unsigned long long)g_bloomq.b0_ser); R.clear_c[0] = 0;   // B0 整级不要了：挂起的清除也丢掉，否则会为它单开一个只清除的通道 | The whole B0 level is no longer needed: drop the pending clear too, otherwise a clear-only render pass would be opened just for it
-                    return;
+                    { PD("N %llu 绘制提前退出@L4492", g_stat_pass + 1); return; }
                 }
             }
         } else if (g_bloomq.state == 1 && !strncmp(f->key, "019ce2f82edbda84", 16)) {
             uint64_t src = 0; for (int i = 0; i < f->rf.nb; i++) if (f->rf.b[i].kind == NVN_RB_TEX && f->rf.b[i].reg < 128) { src = h_ser(S.tex[1][f->rf.b[i].reg]); break; }
-            if (src == g_bloomq.b0_ser && bloomq_target(&tgt, &lv, &sl) && bloomq_capture()) { R.clear_c[0] = 0; g_bloomq.b1_ser = tgt; g_bloomq.state = 2; PD("B %llu 泛光 1/4 原生截取 B0=%llu B1=%llu", g_stat_pass, (unsigned long long)g_bloomq.b0_ser, (unsigned long long)g_bloomq.b1_ser); return; }
+            if (src == g_bloomq.b0_ser && bloomq_target(&tgt, &lv, &sl) && bloomq_capture()) { R.clear_c[0] = 0; g_bloomq.b1_ser = tgt; g_bloomq.state = 2; PD("B %llu 泛光 1/4 原生截取 B0=%llu B1=%llu", g_stat_pass, (unsigned long long)g_bloomq.b0_ser, (unsigned long long)g_bloomq.b1_ser); { PD("N %llu 绘制提前退出@L4497", g_stat_pass + 1); return; } }
             RED_ONCE(62, "泛光 1/4 起点：截取已跳过但原生截取没画成，本帧缺泛光"); bloomq_reset();
         } else if (g_bloomq.state == 2 && !strncmp(f->key, "019ce2f82edbda84", 16)) {
             for (int i = 0; i < f->rf.nb; i++) if (f->rf.b[i].kind == NVN_RB_TEX && f->rf.b[i].reg < 128 && h_ser(S.tex[1][f->rf.b[i].reg]) == g_bloomq.b1_ser) { g_bloomq.b1_h = S.tex[1][f->rf.b[i].reg]; break; }
         } else if (g_bloomq.state == 2 && !strncmp(f->key, "cc264583f2000c81", 16)) {
-            if (bloomq_target(&tgt, &lv, &sl) && tgt == g_bloomq.b0_ser) { g_bloomq.state = 3; PD("C %llu 泛光 1/4 跳过 B0 上采样", g_stat_pass); return; }
+            if (bloomq_target(&tgt, &lv, &sl) && tgt == g_bloomq.b0_ser) { g_bloomq.state = 3; PD("C %llu 泛光 1/4 跳过 B0 上采样", g_stat_pass); { PD("N %llu 绘制提前退出@L4502", g_stat_pass + 1); return; } }
         } else if (g_bloomq.state == 3 && !strncmp(f->key, "2e2d6700a2569795", 16)) {
             if (g_bloomq.b1_h) { for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == g_bloomq.b0_ser) S.tex[1][r] = g_bloomq.b1_h; PD("D %llu 泛光 1/4 叠加改读 B1", g_stat_pass); g_bloomq_last_b0 = g_bloomq.b0_ser; g_bloomq_last_b1h = g_bloomq.b1_h; g_bloomq_last_b1s = g_bloomq.b1_ser; bloomq_reset(); }
             else { RED_ONCE(63, "泛光 1/4 状态缺少 B1 句柄"); bloomq_reset(); }
@@ -4513,7 +4546,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         } else if (g_bloomq.state) { RED_ONCE(61, "泛光 1/4 起点：链中途出现别的绘制，本帧泛光不完整"); bloomq_reset(); }
       }
     }
-    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) return;
+    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { PD("N %llu 绘制提前退出@L4516", g_stat_pass + 1); return; }
     // 续用的通道可能是少挂深度 / 模板开的（开法 2 / 3 / 4）：这次绘制要的平面没挂，就在它之前切开（重开时按新前瞻挂）
     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
     if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
@@ -4530,7 +4563,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         NSUInteger tw0 = 0, th0 = 0; rt_dims(&tw0, &th0);
         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
         if (x1 > (long)tw0) x1 = tw0; if (y1 > (long)th0) y1 = th0;
-        if (x1 <= x0 || y1 <= y0) return;
+        if (x1 <= x0 || y1 <= y0) { PD("N %llu 绘制提前退出@L4533", g_stat_pass + 1); return; }
     }
 #ifdef NVN_RT_RANGE_TEST
     if (!g_enc) rr_begin();
@@ -4540,7 +4573,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!g_enc && tbdr_on()) hoist_try();   // 先把夹在本通道与其续用之间的纯清除通道提前做掉（rp_begin_ex 之前，不占本通道） | First hoist and execute the pure-clear render passes sandwiched between this render pass and its continuation (before rp_begin_ex, not occupying this render pass)
     // 推迟判定在 hoist_try 之后：被提前的纯清除通道在前瞻里跳过，P 的同目标续段才认得出来
     // The deferral decision comes after hoist_try: hoisted pure-clear render passes are skipped in the lookahead, and only then can P's same-target continuation segment be recognized
-    if (!g_enc && tbdr_on() && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) return; }
+    if (!g_enc && tbdr_on() && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) { PD("N %llu 绘制提前退出@L4543", g_stat_pass + 1); return; } }
     if (!g_enc && tbdr_on() && !g_fz_checking) fuse_try();   // 可读 tile 通道合并缺省开；结构 / 本像素证明不成立仍退回普通通道，CHECK 重画时不重入 | Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
 frz_plain:;
     int need = g_enc || !tbdr_on() ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
@@ -4548,7 +4581,7 @@ frz_plain:;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
     g_fd_dw = NULL; g_fd_di = NULL;
-    if (!en) return;
+    if (!en) { PD("N %llu 绘制提前退出@L4551", g_stat_pass + 1); return; }
     if (defer_q_draw) defer_replay();
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // 管线只依赖（程序, 通道目标, 混合 / 颜色 / 写掩码 / 多重采样状态, 顶点布局）：这些没变就沿用上次的
@@ -4558,7 +4591,7 @@ frz_plain:;
     if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
-    if (!ps) return;
+    if (!ps) { PD("N %llu 绘制提前退出@L4561", g_stat_pass + 1); return; }
     if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
     if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
@@ -4589,11 +4622,11 @@ frz_plain:;
     if (R.has_sc) {
         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y <= 0 ? 0 : R.sc.y + so, x1 = (long)R.sc.x + R.sc.w, y1 = vs != 1 ? (long)th : (long)R.sc.y + R.sc.h + so;
         if (x1 > (long)tw) x1 = tw; if (y1 > (long)th) y1 = th;
-        if (x1 <= x0 || y1 <= y0) return;
+        if (x1 <= x0 || y1 <= y0) { PD("N %llu 绘制提前退出@L4592", g_stat_pass + 1); return; }
         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
     }
     enc_r_scissor(en, sc);
-    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) return;
+    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { PD("N %llu 绘制提前退出@L4596", g_stat_pass + 1); return; }
     enc_r_cull(en, S.poly.cull == NVN_FACE_FRONT ? MTLCullModeFront : S.poly.cull == NVN_FACE_BACK ? MTLCullModeBack : MTLCullModeNone);
     enc_r_winding(en, S.poly.front == NVN_FRONT_FACE_CCW ? MTLWindingCounterClockwise : MTLWindingClockwise);
     enc_r_fill(en, S.poly.mode == NVN_POLYGON_MODE_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill);
@@ -4612,7 +4645,7 @@ frz_plain:;
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
     // 参数绑定在登记表锁内捕获实际资源；资格判断到绑定期间有版本变化，则在任何GPU draw前切开重试。
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
-    if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
+    if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); { PD("N %llu 绘制提前退出@L4615", g_stat_pass + 1); return; } }
     int prim = dw ? dw->prim : di->prim;
     MTLPrimitiveType mp;
     switch (prim) {

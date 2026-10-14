@@ -332,6 +332,30 @@ NVN(nvnSamplerFinalize, void, NVNsampler *s) { ((samp_t *)s)->magic = 0; }
 
 // ---------- 程序 ----------
 // ---------- Programs ----------
+// ---------- 着色器转储（DM_NVN_SHDUMP=目录）：给没有着色器包的游戏（Blade II：着色器内联在 UE4 的 pak 里）离线翻译用 ----------
+// 每个阶段写两个文件：<键>.ctl = 控制段 0x880 字节（键 = 其 sha256 前 16 位，与回放层同算法）、<键>.code = 代码区（data 指针起，
+// 长度 = 控制段 +0x704 的「指令区总长」，含 0x30 NVN 头 / SPH / 指令 / c1，与着色器包记录 +0x38 起的布局相同）。同键只写一次。
+// ---------- Shader dump (DM_NVN_SHDUMP=dir): for games without a shader package (Blade II: shaders are inlined in UE4's paks), for offline translation ----------
+// Two files per stage: <key>.ctl = the 0x880-byte control section (key = first 16 hex digits of its sha256, same algorithm as the replay layer), <key>.code = the code area
+// (from the data pointer, length = the "instruction area total length" at control +0x704, including the 0x30 NVN header / SPH / instructions / c1, same layout as a package record from +0x38). Each key is written once.
+#include <CommonCrypto/CommonDigest.h>
+#include <sys/stat.h>
+static void shader_dump(const NVNshaderData *sd, int n) {
+    static const char *dir; static int inited, count; if (!inited) { inited = 1; dir = getenv("DM_NVN_SHDUMP"); if (dir) { mkdir(dir, 0755); LOG("[nvn] 着色器转储到 %s", dir); } }
+    if (!dir) return;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *ctl = sd[i].control, *code = (const uint8_t *)(uintptr_t)sd[i].data;
+        if (!ctl || !code) { LOG("【红】转储：阶段 %d 控制段 %p / 代码 %p 为空", i, (const void *)ctl, (const void *)code); continue; }
+        uint8_t md[32]; CC_SHA256(ctl, 0x880, md); char key[17]; for (int k = 0; k < 8; k++) snprintf(key + 2 * k, 3, "%02x", md[k]);
+        char path[1024]; snprintf(path, sizeof path, "%s/%s.ctl", dir, key); struct stat st; if (!stat(path, &st)) continue;
+        uint32_t magic = *(const uint32_t *)ctl, total = *(const uint32_t *)(ctl + 0x704), cmagic = *(const uint32_t *)code;
+        if (magic != 0x98761234u) LOG("【红】转储 %s：控制段魔数 %#x ≠ 0x98761234", key, magic);
+        if (!total || total > 0x400000) { LOG("【红】转储 %s：指令区总长 %#x 不合理", key, total); continue; }
+        FILE *f = fopen(path, "wb"); if (f) { fwrite(ctl, 1, 0x880, f); fclose(f); }
+        snprintf(path, sizeof path, "%s/%s.code", dir, key); f = fopen(path, "wb"); if (f) { fwrite(code, 1, total, f); fclose(f); }
+        count++; if (count <= 8 || count % 100 == 0) LOG("[nvn] 转储着色器 #%d %s 代码 %#x 字节 代码头 %#x", count, key, total, cmagic);
+    }
+}
 NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
@@ -341,6 +365,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
+    shader_dump(sd, n);
     return 1;
 }
 
@@ -1233,7 +1258,9 @@ NVN(nvnDeviceGetTextureHandle, NVNtextureHandle, const NVNdevice *d, int tex, in
 NVN(nvnDeviceRegisterFastClearColor, NVNboolean, NVNdevice *d, const float *c, NVNformat f) { (void)d; (void)c; (void)f; return 1; }
 NVN(nvnDeviceRegisterFastClearDepth, NVNboolean, NVNdevice *d, float v) { (void)d; (void)v; return 1; }
 NVN(nvnCommandBufferBindTexture, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNtextureHandle h) {
-    uint64_t tv = (uint64_t)h & 0xFFFFF, sv = (uint64_t)h & ~0xFFFFFull;
+    // 贴图槽存整个组合句柄：回放层 NVN_RB_TEX 取低 20 位、NVN_RB_SAMPT（采样器取自贴图槽的合并句柄）取 >> 20；采样器槽另存高位，供分离采样器反射用
+    // The texture slot stores the whole combined handle: the replay's NVN_RB_TEX takes the low 20 bits and NVN_RB_SAMPT (sampler from the texture slot's combined handle) takes >> 20; the sampler slot also gets the high part for separate-sampler reflection
+    uint64_t tv = (uint64_t)h, sv = (uint64_t)h & ~0xFFFFFull;
     bind_handles(c, OP_BIND_TEX, st, i, 1, &tv); bind_handles(c, OP_BIND_SAMP, st, i, 1, &sv);
 }
 NVN(nvnCommandBufferBindImage, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNimageHandle h) { uint64_t v = (uint64_t)h; bind_handles(c, OP_BIND_IMG, st, i, 1, &v); }

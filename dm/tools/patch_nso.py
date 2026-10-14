@@ -50,7 +50,17 @@ PATCH_OFF = (len(IMG) + 0xFFFF) & ~0xFFFF
 # ---- Registered cuts: {NSO build ID: [(offset, original bytes, new bytes, reason)]} ----
 # Networking cuts (excluded scope: Battle.net / online play): taken from a community offline fix (LFS Mod Offline Fix for v2228224, which differs from the official 94012 main in only these 7 words).
 # Measured: the system service layer (nifm offline / DNS black hole / account service) cannot get around it: the game itself sends Battle.net requests directly and allows offline play according to the "last online" time.
-CUTS = {'db0507f36b84200ac05f75d76ed5026f': [
+CUTS = {
+    # Blade II（UE4 4.17，更新 v131072）main：开场视频播放器的 Tick（虚表 0x6aad850 第 2 槽，函数 0x3a29e40）→ 直接 ret。
+    # 该 Tick 无条件解引用播放器子对象 +0x10 的 RHI 流对象（0x3a29f94 / 0x3a2d390），而这个对象在宿主下从未建立（视频在复刻排除范围内，
+    # movie 库只空播）；跳过整个 Tick 后视频播放器不推进，由上层按「没有视频」继续。产品剪口，待 movie 协议补全后撤销
+    # Blade II (UE4 4.17, update v131072) main: the startup movie player's Tick (vtable 0x6aad850 slot 2, function 0x3a29e40) → return immediately.
+    # That Tick unconditionally dereferences the RHI stream object at +0x10 of the player sub-object (0x3a29f94 / 0x3a2d390), which is never created under the host
+    # (video is out of the reimplementation scope, the movie library only plays empty); with the whole Tick skipped the player does not advance and the layer above carries on as "no video". Product cut, to be reverted once the movie protocol is completed
+    '0379ac316b16fbc1a00d2f0dc139ffa9': [
+        (0x3a29e40, 'f70f1cf8', 'c0035fd6', '开场视频播放器 Tick（0x3a29e40 入口 str x23,[sp,#-0x40]!）→ ret：跳过视频播放器的每帧推进'),
+    ],
+    'db0507f36b84200ac05f75d76ed5026f': [
     # （放进所有产物共用的基础改写）：游戏显存分配器预算 260 MB → 512 MB
     # (Placed in the base rewrite shared by all build outputs): game video memory allocator budget 260 MB → 512 MB
     (0x8524c4, '0808a2d2', '0800a4d2', '显存分配器初始化配置：mov x8,#0x10400000（260 MB）→ mov x8,#0x20000000（512 MB），随后 movk #0xa0,lsl48 与 str [sp,#0x238] 不变；'
