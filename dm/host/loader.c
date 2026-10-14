@@ -108,8 +108,10 @@ void *guest_sym(const char *name) {
     return NULL;
 }
 module_t *module_of(const void *p) {
-    for (int i = 0; i < g_nmod; i++)
-        if ((const uint8_t *)p >= g_mod[i].base && (const uint8_t *)p < g_mod[i].base + g_mod[i].size) return &g_mod[i];
+    for (int i = 0; i < g_nmod; i++) {
+        const uint8_t *lo = g_mod[i].base + (g_mod[i].patch_off < 0 ? g_mod[i].patch_off : 0);   // 补丁区在映像前面时也算本模块（崩溃回溯 / Break 定位） | a patch area below the image counts as this module too (crash backtrace / Break location)
+        if ((const uint8_t *)p >= lo && (const uint8_t *)p < g_mod[i].base + g_mod[i].size) return &g_mod[i];
+    }
     return NULL;
 }
 
@@ -154,10 +156,11 @@ static void read_layout(module_t *m, const char *dir) {
     FILE *f = fopen(path, "r");
     if (!f) die("open %s", path);
     static const char *kn[8] = {"K18", "KTLS", "KTLR", "KGATE", "KRES0", "KRES1", "KASPECT", "KASPECTUI"};
-    char line[256], key[32]; unsigned long v; unsigned seen = 0;
+    char line[256], key[32], vs[40]; unsigned long v; unsigned seen = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: 产物是旧改写器出的，换成当前代号（dm/PRODUCT）的产物", path);
-        if (!strcmp(key, "PATCH_OFF")) m->patch_off = v;
+        if (sscanf(line, "# %31s %39s", key, vs) != 2) die("%s: 产物是旧改写器出的，换成当前代号（dm/PRODUCT）的产物", path);
+        v = (unsigned long)strtoll(vs, NULL, 0);   // PATCH_OFF 可为负（-0x…，补丁区在映像前面） | PATCH_OFF may be negative (-0x..., patch area before the image)
+        if (!strcmp(key, "PATCH_OFF")) m->patch_off = (int64_t)v;
         else if (!strcmp(key, "KEY_PAGE_OFF")) m->key_page_off = v;
         else if (!strcmp(key, "KEY_PAGE_SIZE")) m->key_page_size = v;
         else if (!strcmp(key, "TEXT_END")) m->text_end = v;
@@ -191,9 +194,9 @@ static void register_gates(module_t *m, const char *dir) {
     FILE *f = fopen(path, "r");
     int ng = 0;
     if (f) {
-        unsigned long ret, orig; char kind[16]; int arg;
+        long long ret, orig; char kind[16], rs[40], os[40]; int arg;
         while (fgets(line, sizeof line, f))
-            if (sscanf(line, "%lx %15s %d %lx", &ret, kind, &arg, &orig) == 4) { gate_register((uint64_t)m->base + ret, kind, arg, orig); ng++; }
+            if (sscanf(line, "%39s %15s %d %39s", rs, kind, &arg, os) == 4) { ret = strtoll(rs, NULL, 0); orig = strtoll(os, NULL, 0); gate_register((uint64_t)((int64_t)(uintptr_t)m->base + ret), kind, arg, (uint64_t)orig); ng++; }   // 返回点可为负偏移（补丁区在映像前面） | the return point may be a negative offset (patch area before the image)
         fclose(f);
     }
     LOG("%s: gates %d patch_off %#llx keys %lu/%lu/%lu/%lu", m->name, ng, m->patch_off, g_key18, g_keytls, g_keytlr, g_keygate);
@@ -341,13 +344,27 @@ static uint8_t *slurp(const char *path, size_t *n) {
 static void map_image(module_t *m, const char *dir) {
     char path[1024]; snprintf(path, sizeof path, "%s/%s.patched.bin", dir, m->name);
     size_t sz; uint8_t *raw = slurp(path, &sz);
+    if (m->patch_off < 0) {
+        // 补丁区在映像前面：文件 = 补丁区（-patch_off 字节，64 KB 对齐）+ 映像。一块连续地址，映像基址 = 块首 + 补丁区长；补丁区整块只读+执行
+        // Patch area before the image: file = patch area (-patch_off bytes, 64 KB aligned) + image. One contiguous block; image base = block start + patch size; the whole patch area read-only+execute
+        size_t pre = (size_t)-m->patch_off; if (pre & 0x3FFF || sz <= pre) die("%s: 补丁区布局不对（%#zx / %#zx）", m->name, pre, sz);
+        m->size = (sz - pre + 0x3FFF) & ~0x3FFFull;
+        uint8_t *blk = mmap(NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (blk == MAP_FAILED) die("%s mmap", m->name);
+        memcpy(blk, raw, sz); free(raw); m->base = blk + pre; install_key_page(m);
+        uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+        if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+        if (mprotect(blk, pre, PROT_READ | PROT_EXEC)) die("%s mprotect patch(below)", m->name);
+        LOG("%s: 补丁区在映像前面 %#zx 字节（映像 %#zx） | patch area below the image", m->name, pre, m->size);
+        return;
+    }
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
-    uint64_t po = m->patch_off & ~0x3FFFull;
+    uint64_t po = (uint64_t)m->patch_off & ~0x3FFFull;
     if (mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
 }
 #endif

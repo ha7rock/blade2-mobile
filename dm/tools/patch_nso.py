@@ -24,6 +24,7 @@ import struct, re, sys, os
 from itertools import combinations
 import lz4.block
 from capstone import *
+from capstone.arm64_const import ARM64_OP_REG, ARM64_OP_IMM
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
 d = open(src, 'rb').read()
@@ -245,6 +246,7 @@ for off, ob, nb, why, scope in cuts:
 KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511, 'KRES0': 506, 'KRES1': 507, 'KASPECT': 505, 'KASPECTUI': 504}   # KRES*：分辨率参数位；KASPECT：画面宽高比上限（见 PARAMS） | KRES*: resolution parameter slots; KASPECT: picture aspect ratio cap (see PARAMS)
 KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'))}
 
+MEASURING = False
 md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
 patch = bytearray(); fix = []; gates = []; stats = {}
 def stat(k): stats[k] = stats.get(k, 0) + 1
@@ -262,7 +264,7 @@ def emit_slot_addr(base, key_reg, kind):
 # ---- 编码器 ----
 # ---- Encoders ----
 def B(frm, to):
-    off = to - frm; assert -(1 << 27) <= off < (1 << 27) and off % 4 == 0
+    off = to - frm; assert (MEASURING or -(1 << 27) <= off < (1 << 27)) and off % 4 == 0
     return 0x14000000 | ((off >> 2) & 0x3FFFFFF)
 def STP(t, t2, n, off): return 0xA9000000 | (((off // 8) & 0x7F) << 15) | (t2 << 10) | (n << 5) | t
 def LDP(t, t2, n, off): return 0xA9400000 | (((off // 8) & 0x7F) << 15) | (t2 << 10) | (n << 5) | t
@@ -386,6 +388,54 @@ def site_br(ins, base, count):
     for i in range(count):
         emit(0xF85F0000 | (31 << 5) | 16)      # ldur x16,[sp,#-16]
         emit(B(here(), base + 4 * i))
+    return start
+
+def site_blr(ins):
+    """blr x18（Blade II main 0x38d2134 等）：目标在槽里。调用点上 x16 / x17 本来就可被破坏（AAPCS64 的 IP0 / IP1，
+    编译器不会让值跨调用活在里面；真机的 PLT / veneer 也这么用），直接借用，不存不恢复。调用返回到补丁块后跳回原处 +4。
+    blr x18 (Blade II main 0x38d2134 etc.): the target is in the slot. At a call site x16 / x17 are clobberable anyway (AAPCS64 IP0 / IP1;
+    compilers never keep values live across a call in them, and the real device's PLT / veneers use them the same way), so they are borrowed
+    without save / restore. After the call returns into the patch block, jump back to the original site +4."""
+    start = here()
+    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16)); emit(BLR(16)); emit(B(here(), ins.address + 4))
+    return start
+
+def site_ldr_lit(ins):
+    """ldr x18, <literal>（PC 相对字面量装入 x18）：装入槽。 | ldr x18, <literal> (PC-relative literal load into x18): load into the slot."""
+    assert ins.op_str.startswith('x18,'), f'{ins.address:x} {ins.mnemonic} {ins.op_str}'
+    tgt = ins.operands[1].imm; assert tgt % 8 == 0
+    S, T = pick(set())
+    start = here()
+    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18')
+    pc = here(); emit(ADRP(S, pc, tgt)); emit(LDRX(S, S, (tgt & 0xFFF) >> 3))
+    emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), ins.address + 4))
+    return start
+
+def CMP_XX(n, m): return 0xEB00001F | (m << 16) | (n << 5)        # cmp xn, xm  (subs xzr, xn, xm)
+def BCOND(frm, to, cond):
+    off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
+    return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5) | cond
+BRK0 = 0xD4200000
+
+def site_br_abs(ins, tbase, targets):
+    """跳转表 br x18，第二种写法：槽里已是绝对目标。x16/x17 暂存红区 → x16 = 槽值 → 逐个目标 adrp/add 进 x17 比对，
+    相等落到该目标的尾块（恢复 x17、x16，b 原目标）；都不等（表外值，原版也是未定义）→ brk。
+    Jump table br x18, second idiom: the slot already holds the absolute target. Stash x16/x17 in the red zone → x16 = slot value →
+    materialise each target into x17 (adrp/add) and compare; on a match land on that target's tail (restore x17, x16, b target);
+    no match (a value outside the table, undefined in the original too) → brk."""
+    uniq = sorted(set(targets))
+    start = here()
+    emit(STUR(16, 31, -16)); emit(STUR(17, 31, -24))
+    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16))
+    chain = here()
+    tails = chain + 4 * (4 * len(uniq) + 1)
+    for i, t in enumerate(uniq):
+        pc = here(); emit(ADRP(17, pc, t)); emit(ADDI(17, 17, t & 0xFFF)); emit(CMP_XX(16, 17))
+        emit(BCOND(here(), tails + 12 * i, 0))                   # b.eq tail_i
+    emit(BRK0)
+    assert here() == tails
+    for t in uniq:
+        emit(LDUR(17, 31, -24)); emit(LDUR(16, 31, -16)); emit(B(here(), t))
     return start
 
 def site_sysreg_read(ins, kind):
@@ -568,8 +618,41 @@ for fa, fb in funcs:
                         if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = 65536
                         if width: break
                     break
-            assert base and width, f'jump table {ins.address:x}'
-            jumps[ins.address] = (base, width)
+            if base and width:
+                jumps[ins.address] = (base, width)
+                continue
+            # 第二种跳转表写法（UE4 4.17 / 较新 clang；Blade II main 0x29329c8、0x2932fec，subsdk0 0xae9a4）：
+            #   adrp xB,页; add xB,xB,#低12  ; ldrsw xT,[xB, xI, lsl #2] ; add x18, xT, xB ; br x18
+            # 表项是相对表首的 32 位偏移，到 br 时 x18（即线程槽）里已经是绝对目标；项数 = 守门的「cmp wI,#K ; b.hi」的 K+1。
+            # 目标在离线按表读出，改写块按槽值逐个比对后落到对应尾块（恢复 x16/x17 再跳）：site_br_abs。
+            # Second jump-table idiom (UE4 4.17 / newer clang; Blade II main 0x29329c8, 0x2932fec, subsdk0 0xae9a4):
+            #   adrp xB,page; add xB,xB,#lo12 ; ldrsw xT,[xB, xI, lsl #2] ; add x18, xT, xB ; br x18
+            # Entries are 32-bit offsets from the table base; at the br, x18 (i.e. the thread slot) already holds the absolute target;
+            # entry count = K+1 from the guarding "cmp wI,#K ; b.hi". Targets are read from the table offline, and the rewrite block
+            # compares the slot value against each one and lands on the matching tail (restores x16/x17, then jumps): site_br_abs.
+            prev = insl[max(0, j - 24):j]; whole = insl[:j]   # add/cmp 在 br 附近；表首的 adrp/add 可以在函数更前面（0x29329c8 距 38 条） | add/cmp are near the br; the table base adrp/add may be much earlier in the function (38 instructions at 0x29329c8)
+            breg = None
+            for p in reversed(prev):
+                if p.mnemonic == 'add' and p.op_str.startswith('x18,') and len(p.operands) == 3 and p.operands[2].type == ARM64_OP_REG:
+                    breg = p.reg_name(p.operands[2].reg); break
+            assert breg and breg.startswith('x'), f'jump table {ins.address:x}: no "add x18, xT, xB"'
+            tbase = None
+            for k in range(len(whole) - 1, -1, -1):
+                p = whole[k]
+                if p.mnemonic == 'add' and p.op_str.startswith(f'{breg}, {breg}, #') and k > 0 and whole[k - 1].mnemonic == 'adrp' and whole[k - 1].op_str.startswith(f'{breg},'):
+                    tbase = whole[k - 1].operands[1].imm + p.operands[2].imm; break
+            assert tbase is not None, f'jump table {ins.address:x}: no adrp/add for table base {breg}'
+            cnt = None
+            for p in reversed(prev):
+                if p.mnemonic == 'cmp' and p.operands[1].type == ARM64_OP_IMM: cnt = p.operands[1].imm + 1; break
+            assert cnt and 1 < cnt <= 64, f'jump table {ins.address:x}: no guarding cmp (count {cnt})'
+            assert RO_OFF <= tbase and tbase + 4 * cnt <= DATA_OFF, f'jump table {ins.address:x}: table {tbase:#x} not in rodata'
+            targets = []
+            for i in range(cnt):
+                t = tbase + struct.unpack_from('<i', IMG, tbase + 4 * i)[0]
+                assert fa <= t < fb and t % 4 == 0, f'jump table {ins.address:x}: entry {i} -> {t:#x} outside function {fa:#x}..{fb:#x}'
+                targets.append(t)
+            jumps[ins.address] = ('abs', tbase, tuple(targets))
     # 不许有跳转落进窗口中间
     # No jump may land in the middle of a window
     inwin = {x.address for wseg in ws for x in wseg}; heads = {wseg[0].address for wseg in ws}
@@ -578,266 +661,290 @@ for fa, fb in funcs:
             t = x.operands[-1].imm
             assert not (t in inwin and t not in heads), f'branch into window {x.address:x}'
 
-def put_branch(at, to): struct.pack_into('<I', IMG, at, B(at, to))
-for wseg in windows:
-    st, lo, hi = site_window(wseg); stat('window'); put_branch(lo, st)
-for a in sorted(kinds):
-    if a in done: continue
-    k, arg = kinds[a]
-    ins = dis(struct.unpack_from('<I', IMG, a)[0], a)
-    if k == 'x18':
-        m = ins.mnemonic
-        if m == 'br': st = site_br(ins, *jumps[a]); stat('br')
-        elif m in ('cbz', 'cbnz', 'tbz', 'tbnz'): st = site_cond(ins); stat('cond')
-        elif m in ('adr', 'adrp'): st = site_pcrel(ins); stat('pcrel')
-        elif m in ('blr', 'ret', 'b', 'bl') or (m == 'ldr' and '[' not in ins.op_str): raise RuntimeError(f'{a:x} {m} {ins.op_str}')
-        else: st = site_plain(ins); stat('plain')
-    elif k == 'tpidr_r': st = site_sysreg_read(ins, 'KTLS'); stat(k)
-    elif k == 'tpidrro_r': st = site_sysreg_read(ins, 'KTLR'); stat(k)
-    elif k == 'tpidr_w': st = site_tpidr_write(ins); stat(k)
-    elif k == 'svc': st = site_gate(ins, 'svc', arg); stat(k)
-    elif k in ('cntpct', 'cntvct'): st = site_gate(ins, k, arg); stat(k)
-    put_branch(a, st)
+# ---- 补丁区位置 ----
+# 发射两遍：第一遍只量补丁区长度（MEASURING：不核 b 的射程），第二遍按定下的 PATCH_OFF 真发射。
+# 补丁区缺省接在映像后面；映像太大（Blade II main：text 70 MB + 只读 + 数据 + bss = 131 MB）时，text 开头的跳转点够不到映像后面
+# （b 的射程 ±128 MB），就把补丁区放到映像**前面**（PATCH_OFF < 0，产物文件 = 补丁区 + 映像；装载器把映像基址放在补丁区之后）。
+# ---- Patch area placement ----
+# Emit twice: pass 1 only measures the patch area (MEASURING: b range not checked), pass 2 emits for real at the chosen PATCH_OFF.
+# The patch area goes after the image by default; when the image is too large (Blade II main: 70 MB text + ro + data + bss = 131 MB) the rewrite
+# points at the start of text cannot reach past the image (b range is ±128 MB), so the patch area is placed BEFORE the image
+# (PATCH_OFF < 0, build output file = patch area + image; the loader puts the image base right after the patch area).
+IMG_PRE = bytes(IMG); CUTS_PRE = list(cuts)
+MEASURING = False
+def emit_all():
+    global rule_blocks, params, obs
+    def put_branch(at, to): struct.pack_into('<I', IMG, at, B(at, to))
+    for wseg in windows:
+        st, lo, hi = site_window(wseg); stat('window'); put_branch(lo, st)
+    for a in sorted(kinds):
+        if a in done: continue
+        k, arg = kinds[a]
+        ins = dis(struct.unpack_from('<I', IMG, a)[0], a)
+        if k == 'x18':
+            m = ins.mnemonic
+            if m == 'br': st = (site_br_abs(ins, *jumps[a][1:]) if jumps[a][0] == 'abs' else site_br(ins, *jumps[a])); stat('br_abs' if jumps[a][0] == 'abs' else 'br')
+            elif m in ('cbz', 'cbnz', 'tbz', 'tbnz'): st = site_cond(ins); stat('cond')
+            elif m in ('adr', 'adrp'): st = site_pcrel(ins); stat('pcrel')
+            elif m == 'blr': st = site_blr(ins); stat('blr')
+            elif m == 'ldr' and '[' not in ins.op_str: st = site_ldr_lit(ins); stat('ldr_lit')
+            elif m in ('ret', 'b', 'bl'): raise RuntimeError(f'{a:x} {m} {ins.op_str}')
+            else: st = site_plain(ins); stat('plain')
+        elif k == 'tpidr_r': st = site_sysreg_read(ins, 'KTLS'); stat(k)
+        elif k == 'tpidrro_r': st = site_sysreg_read(ins, 'KTLR'); stat(k)
+        elif k == 'tpidr_w': st = site_tpidr_write(ins); stat(k)
+        elif k == 'svc': st = site_gate(ins, 'svc', arg); stat(k)
+        elif k in ('cntpct', 'cntvct'): st = site_gate(ins, k, arg); stat(k)
+        put_branch(a, st)
 
-# 私有视觉分支；非OBS，0x85只读查询。只有本实验构建显式opt-in；原Qty/children和Update不变。
-# Private visual branch; not OBS, 0x85 is a read-only query. Only this experimental build explicitly opts in; the original Qty/children and Update are unchanged.
-if RULE_RUN and PRIVATE_GATES:
-    off, word = 0x3e443c, 0x3969c268
-    assert struct.unpack_from('<I', IMG, off)[0] == word
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))  # w8查询结果仅用于cbz；两路恢复原x8。 | The w8 query result is used only for cbz; both paths restore the original x8.
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    # cbz w8, nonmatch；不改NZCV。match恢复寄存器后保children。
-    # cbz w8, nonmatch; NZCV is not changed. On match, restore the registers and then preserve children.
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), 0x3e4460))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), 0x3e4440))
-    gates.append((ret, 'svc', 0x85, off))
-    put_branch(off, start); stat('private_skill_render')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off,start)).hex(),
-                 'private confirmed six HUD only: own image/text skip ->4460; unknown original ->4440; svc85 full800', '仅宿主'))
-elif RULE_RUN:
-    patch.extend(bytes(0x80))
-    stat('private_gates_reserved')
-
-obs = list(OBS.get(BUILD_ID, []))
-if RULE_RUN and PRIVATE_GATES:
-    obs.append((0x43ecc8, 6, "b8686953", "private touch-run-v4 PRE-ldr; full800 host ABI"))
-    obs.append((0x1237c60, 8, "d10143ff", "ui world anchor: camera world->screen entry (camera, point, out); host swaps x0 to a copy whose projection is shifted by the UI rect y (iPad UI kept 16:9 inside a taller screen), game camera untouched"))
-    # 面板开着时冻结世界（宿主 diag.c freeze_tick，缺省关，DM_PANEL_FREEZE=1 开）。四个入口门，都只换入口参数。
-    # Freeze the world while a panel is open (host diag.c freeze_tick, off by default, DM_PANEL_FREEZE=1 turns it on). Four entry gates, all of which only swap entry arguments.
-    obs.append((0x5eb2c0, 10, "a9bc5ff8", "server world-sim entry (game G): while frozen the host swaps x0 to a stand-in whose event queue is empty, so no unit / timer callback runs this tick; the real queue is left untouched"))
-    obs.append((0x4b7230, 11, "d10183ff", "client per-unit tick update entry (unit): while frozen the host swaps x0 to a stand-in unit carrying only the skip flag ([+0x124] bit 23), so the function takes its own early-out to the epilogue; all six call sites are inside the client tick simulation 0x461b80 / 0x461e60"))
-    obs.append((0x4b74d0, 12, "f81e0ff3", "client per-unit per-frame update entry (unit): drives model animation / interpolation from the tick fraction; while frozen the host swaps x0 to a stand-in unit (type 9, no render component) so both the callee 0x2a18d0 and this function take their own early-outs"))
-    obs.append((0x2c3c90, 13, "f81c0ff7", "render per-frame entry, called right after the main loop writes the world frame step [0x20cebb8] and world time [0x3114208]: while frozen the host rewrites the step to 0 and the world time to its value at freeze, the same thing the game's own pause path does at 0x2c1574"))
-    obs.append((0xadc434, 14, "d10143ff", "TextBoxWidget text-changed entry (widget): reads the raw text at +0x88 and rebuilds the display; host rewrites +0x88 for strings our item-notes generator annotated with colour codes (TextBoxWidget draws U+E07E as '*'), exact-match table only, everything else untouched"))
-    obs.append((0x442bc0, 15, "a9ba6ffc", "client event-message entry (x0 = packet; byte 1 = event subtype, jump table 0x1da6752): subtype 0x17 = offline difficulty scale changed -> 0x20f91c chat line + system notification; host rewrites byte 1 past the table (default branch, nothing shown) only for 0x17 and only in a rift game (dm_rift.c); otherwise untouched. orig stp x28, x27, [sp, #-0x60]!"))
-    obs.append((0x634000, 16, "d10143ff", "server level change by level number (game, player, level, kind), used by waypoints / portals / quest moves: in a rift game, when the player leaves a rift map for a level that is neither town nor a rift map, the host swaps w2 to the rift's next map so the destination is replaced inside the single native transition"))
-    obs.append((0x711040, 17, "d101c3ff", "server quest event 'monster killed' entry (game, monster, attacker), the only entry (callers 0x7d8550 kill, 0x7ab8dc); in a rift game, for a monster that died on a rift map, the host swaps x1 to a stand-in whose +0xc0 is null so the function takes its own early return (0x711064): bosses in the rift are combat only, no quest state / quest notifications"))
-    obs.append((0x3d84a0, 18, "d10143ff", "NotificationPanel message handler entry (panel, message): on InputMessage / ControllerActionBegin with action id 9 (the menu key) the native handler re-sends the notice callback and marks the message bus consumed, so the first menu press only dismisses the notice. In touch mode the host swaps x1 to a copy of the message whose action id is not 9: the notice stays until it times out and the menu key opens the menu; controller mode keeps the native behaviour"))
-    obs.append((0x463f40, 19, "f81c0ff7", "client per-frame position-error smoothing entry (s0 = frame length in ticks), called by the main loop right after all units were extrapolated in place and before the per-unit error is added back: the native error is only computed on start / stop (0x4639c0, which runs before the tick loop), so a sharp turn inside a tick snaps the extrapolated position back in one frame; the host adds that frame's jump to the local player's error fields (path +0x2a8 / +0x2ac, same clamp as native) and the native code decays it"))
-    obs.append((0x9da5b0, 20, "d104c3ff", "model yaw component per-frame update entry (x1 = argument block: +8 component, +0x20 -> +8 unit): the body turn speed is instance data on the component (+0x10..+0x2c min / max degrees per second for controller / mouse, +0x34 spring parameter); the host only reads them for the local player when a test switch is set"))
-    obs.append((0x2f7664, 7, "6dbb23e9", "touch target rank: candidate compare entry (closure, unit, kind, s0=score); host raises Boss/elite score, native eligibility unchanged"))
-    obs.append((0xb0d560, 21, "fc1a0fe8", "TooltipsPanel add-tooltip entry (panel, text, target position x2 / x3, style, text2): tooltips are immediate-mode (re-submitted by the hovered widget every frame and cleared after drawing, so the host cannot reach the record at its own time); on touch, in panel state, for an item the player just tapped, the host swaps the target position so the game lays the tooltip out beside the panel instead of over the item grid; everything else passes through unchanged"))
-    obs.append((0x7ce800, 22, "d100c3ff", "server place-one-preset-unit entry (game, room, record), only called by the room-activation preset loop 0x7ce930 (8 sites): in a rift game at tier 90+ on a rift map, for a monster record that is not a superunique and not scenery / NPC, the host swaps x2 to a copy whose class is -1 so 0x6910d0 takes its own early return (tbnz w2, #31) and nothing is spawned; the real record is untouched; rift guardian / invader / superunique spawns call 0x7ce630 / 0x69b310 directly and never pass here"))
-for off, oid, ow, why in obs:
-    w = struct.unpack_from('<I', IMG, off)[0]
-    assert f'{w:08x}' == ow, f'观测门原指令不符 {off:#x}：{w:08x}'
-    # 只许函数入口：dm_gate 只回写 x0–x8 / x30，宿主 C 代码可能改 x9–x17；入口处这些按 AAPCS64 不承载值（参数只在 x0–x7 / x8）
-    # Function entries only: dm_gate writes back only x0–x8 / x30, and host C code may modify x9–x17; at entry these carry no values under AAPCS64 (arguments are only in x0–x7 / x8)
-    assert off in set(starts) or (oid == 6 and off == 0x43ecc8), f'private obs point not approved {off:#x}'
-    assert off < TEXT_END and off not in kinds and not any(lo <= off < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'观测门与改写点冲突 {off:#x}'
-    put_branch(off, site_obs(off, oid, w)); stat('obs')
-
-# 秘境出口改道（r36 起）：分支门 0x89，挂在「按出口砖的连接换关」main+0x7cc1e0(游戏, 玩家, 砖) 的入口。它的四个调用者（点出口砖 0x6dbea0、
-# 入口物件 0x6aeaa0 / 0x6b0500、任务 0x7314c0）都在各自的判定通过之后才调它；目的地不是关卡号而是砖的对端房间（同一幕已生成的地图里），换不成别的幕。
-# 宿主在秘境局里把 w2 / w3 换成（秘境下一张图, 11）并让 x8≠0 → 门块直接跳去「按关卡号换关」0x634000，同一个调用者、只发生一次换关；其余情形执行原指令回 0x7cc1e4。
-# 门块与 0x85 分支门逐字同构（structck ⑪ 按 hle.h 登记表核）；与观测门 15 / 16 一样只在带宿主私有门的产物里（touch）
-# Rift exit rerouting (since r36): branch gate 0x89, hooked at the entry of "change level by the exit tile's connection" main+0x7cc1e0(game, player, tile). Its four callers (clicking an exit tile 0x6dbea0,
-# entrance objects 0x6aeaa0 / 0x6b0500, quest 0x7314c0) all call it only after their own checks have passed; the destination is not a level id but the tile's peer room (in the already generated map of the same act), so it cannot be switched to another act.
-# In a rift run the host replaces w2 / w3 with (the rift's next map, 11) and makes x8≠0 → the gate block jumps straight to "change level by level id" 0x634000, same caller, exactly one level change; in all other cases the original instruction is executed and control returns to 0x7cc1e4.
-# The gate block is word-for-word isomorphic with the 0x85 branch gate (structck ⑪ checks it against the hle.h registry); like observation gates 15 / 16 it exists only in build outputs with host-private gates (touch)
-if RULE_RUN and PRIVATE_GATES:
-    off, word, tgt = 0x7cc1e0, 0xd10183ff, 0x634000
-    assert struct.unpack_from('<I', IMG, off)[0] == word and off in set(starts) and tgt in set(starts)
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
-    gates.append((ret, 'svc', 0x89, off))
-    put_branch(off, start); stat('rift_exit')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
-                 'rift exit redirect: tile-link level change entry -> host swaps (level, kind) and x8!=0 takes the branch to level-number change 0x634000; otherwise original ->0x7cc1e4; svc89', '仅宿主'))
-
-# 秘境里存档时的当前幕（r38 起）：分支门 0x8c，挂在原版写存档头函数 0x6fa3e0 里「取难度」那条 main+0x6fa9d0（ldrb w10, [x21, #0x104]）。
-# 它的上一条 0x6fa9cc 刚把「玩家当前在第几幕」读进 w9（ldrb w9, [x24, #0x2e8]），下面 0x6fa9e4 / 0x6fa9e8 写成难度字节 0x80 | 幕号（.d2s 0x98–0x9a），
-# 下次进局落哪个城由它定。宿主在人处于秘境图里时把 w9 换成 4（第五幕 → 重进落哈洛加斯），只动写进存档的这一个值，运行中的幕号不碰。
-# 用分支门而不是「替换一条指令」：structck 只认「bl 调用点」「入口」「分支门」三种登记形态。宿主永远让 x8 = 0（不走跳转那一路），
-# 门块恢复 x8、执行原指令、回 0x6fa9d4；跳转目标填回点本身只为满足模板（走不到）。门块与 0x85 / 0x89 逐字同构
-# Current act written to the save while in a Rift (since r38): branch gate 0x8c, hooked at the "read difficulty" instruction main+0x6fa9d0 (ldrb w10,
-# [x21, #0x104]) inside the original save-header writer 0x6fa3e0.
-# The preceding instruction 0x6fa9cc has just loaded "which act the player is currently in" into w9 (ldrb w9, [x24, #0x2e8]); below, 0x6fa9e4 / 0x6fa9e8
-# write it as the difficulty byte 0x80 | act number (.d2s 0x98–0x9a),
-# which decides which town the next session starts in. While the player is in a Rift map the host replaces w9 with 4 (Act 5 → re-enter in Harrogath);
-# only this one value written to the save is changed, the running act number is untouched.
-# A branch gate is used rather than "replace one instruction": structck only recognizes three registered forms, "bl call site", "entry" and "branch
-# gate". The host always sets x8 = 0 (the jump path is never taken);
-# the gate block restores x8, executes the original instruction and returns to 0x6fa9d4; the jump target is set to the return point itself only to
-# satisfy the template (never reached). The gate block is word-for-word identical in structure to 0x85 / 0x89
-if RULE_RUN and PRIVATE_GATES:
-    off, word, tgt = 0x6fa9d0, 0x394412aa, 0x6fa9d4   # 函数中间的一条指令（同 0x85 那扇门），不要求是函数入口；原指令不依赖 pc | An instruction in the middle of a function (same as gate 0x85); it need not be a function entry; the original instruction does not depend on pc
-    assert struct.unpack_from('<I', IMG, off)[0] == word
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
-    gates.append((ret, 'svc', 0x8c, off))
-    put_branch(off, start); stat('rift_save_act')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
-                 'rift save act: save-header writer, right after it loads the current act into w9 -> host swaps w9 to 4 (act V) while the player is in a rift map; x8 stays 0, original insn runs ->0x6fa9d4; svc8c', '仅宿主'))
-# 佣兵加装备位（r39 起）：分支门 0x8d，挂在原版通用放置校验 main+0x6493a8 的怪物主人分支里 main+0x64a34c（mov w9, w25）。
-# 这一段（0x64a314–0x64a354）对怪物类主人只放行两类物品：0x574bc0(物品, 3 护甲)、0x574bc0(物品, 0x25 头盔)，都不是就走武器那条（按 monstats 的左右手类型），再不中就拒。
-# 门挂在「是不是头盔」返回之后、cbnz w0 之前：宿主在「主人是玩家的佣兵 + 秘境最高通关 ≥ 10 层 + 物品是腰带 / 鞋 / 手套 / 戒指 / 项链」时把 w0 改成 1，
-# 走头盔同一条放行路径（后面的部位格子、部位空不空等通用检查照常）。宿主永远让 x8 = 0；门块与 0x85 / 0x89 / 0x8c 逐字同构
-# Extra mercenary equipment slots (since r39): branch gate 0x8d, hooked in the monster-owner branch of the original game's generic placement check main+0x6493a8 at main+0x64a34c (mov w9, w25).
-# This section (0x64a314–0x64a354) lets through only two kinds of items for monster-type owners: 0x574bc0(item, 3 armor) and 0x574bc0(item, 0x25 helm); if neither, it takes the weapon path (by the left / right hand types in monstats), and if that fails too it rejects.
-# The gate is hooked after the "is it a helm" call returns and before cbnz w0: when "the owner is the player's mercenary + highest rift level cleared ≥ 10 + the item is a belt / boots / gloves / ring / amulet", the host changes w0 to 1,
-# taking the same pass path as the helm (the generic checks that follow, such as the body location cell and whether the location is empty, run as usual). The host always sets x8 = 0; the gate block is word-for-word isomorphic with 0x85 / 0x89 / 0x8c
-if RULE_RUN and PRIVATE_GATES:
-    off, word, tgt = 0x64a34c, 0x2a1903e9, 0x64a350   # 原指令不依赖 pc | The original instruction does not depend on pc
-    assert struct.unpack_from('<I', IMG, off)[0] == word
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
-    gates.append((ret, 'svc', 0x8d, off))
-    put_branch(off, start); stat('merc_slot')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
-                 'merc slots: placement check, monster-owner branch right after the helm type test -> host sets w0=1 for ring/amulet/boots/gloves/belt on a hireling (rift best >= 10 for new equips; always on load); x8 stays 0, original insn runs ->0x64a350; svc8d', '仅宿主'))
-# 佣兵加装备位的客户端那一半（r39 同代）：分支门 0x8e，挂在客户端「佣兵能不能穿这件」函数 main+0x3bea44(佣兵, 物品) 里 main+0x3beb58（mov x0, x19）。
-# 这个函数和服务端那段同一个规则：0x574bc0(物品, 3 护甲)、0x574bc0(物品, 0x25 头盔) 中一个就返回 1，都不是走武器那条。物品格控件拿它的结果画「不可放置」的红色、
-# 决定松手时放不放——不改它，已解锁的新格拖着对的物品悬停也是红的、原版放下不成（原先靠触摸层兜底直接调 0x3bed60）。
-# 门挂在「mov w1, #0x25」之后、这次类型判断的 bl 之前：宿主在「秘境最高通关 ≥ 10 层 + 物品是腰带 / 鞋 / 手套 / 戒指 / 项链」时把 w1 换成该物品自己的类型号，
-# 类型判断自然成立、走头盔同一条返回 1 的路。宿主永远让 x8 = 0；门块与 0x8d 逐字同构
-# Client half of the extra mercenary equipment slots (same generation as r39): branch gate 0x8e, hooked inside the client's "can the mercenary wear this" function main+0x3bea44(mercenary, item) at main+0x3beb58 (mov x0, x19).
-# This function follows the same rule as the server-side section: if either 0x574bc0(item, 3 armor) or 0x574bc0(item, 0x25 helm) matches it returns 1, and if neither does it takes the weapon path. The item cell widget uses its result to draw the "cannot place" red and
-# to decide whether to place on release -- without changing it, an unlocked new cell still shows red when the right item is dragged over it, and the original game's drop fails (previously the touch layer's fallback called 0x3bed60 directly).
-# The gate is hooked after "mov w1, #0x25" and before the bl of this type check: when "highest rift level cleared ≥ 10 + the item is a belt / boots / gloves / ring / amulet", the host replaces w1 with the item's own type number,
-# so the type check passes naturally and takes the same return-1 path as the helm. The host always sets x8 = 0; the gate block is word-for-word isomorphic with 0x8d
-if RULE_RUN and PRIVATE_GATES:
-    off, word, tgt = 0x3beb58, 0xaa1303e0, 0x3beb5c   # 原指令不依赖 pc | The original instruction does not depend on pc
-    assert struct.unpack_from('<I', IMG, off)[0] == word
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
-    gates.append((ret, 'svc', 0x8e, off))
-    put_branch(off, start); stat('merc_slot_client')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
-                 'merc slots (client): hireling can-equip check, between "mov w1,#0x25" and the type test -> host swaps w1 to the item\'s own type for ring/amulet/boots/gloves/belt (rift best >= 10); x8 stays 0, original insn runs ->0x3beb5c; svc8e', '仅宿主'))
-
-# ---- 参数位（仅宿主）：{NSO 构建号: [(偏移 A, 原字 A, 偏移 B, 原字 B, 寄存器, 键, 理由)]}。
-# 原处两条造常数指令改成第一条跳补丁区参数跳板、第二条 nop；跳板间接取键页值后跳回第一条之后（A+4）：A、B 不相邻时中间的原指令照常执行
-# （曾跳回 B+4，运行模式通知处理 0xe10d5c/0xe10d60 越过 adrp x19.. 与另一跳板，切掌机即崩；structck ⑩ 核跳板出口）。
-# A、B 之间不得读写 xR（离线断言：中间指令不含 xR）。宿主按前端给值，Mac 给原常数 → 行为不变 ----
-# ---- Parameter slots (host only): {NSO build ID: [(offset A, original word A, offset B, original word B, register, key, reason)]}.
-# The two constant-building instructions at the original site are changed so that the first jumps to a parameter trampoline in the patch area and the second is a nop; the trampoline fetches the key page value indirectly and jumps back to just after the first (A+4): when A and B are not adjacent, the original instructions in between execute as usual
-# (it used to jump back to B+4; in the operation-mode notification handler 0xe10d5c/0xe10d60 that skipped adrp x19.. and another trampoline, and switching to handheld crashed immediately; structck ⑩ checks the trampoline exit).
-# xR must not be read or written between A and B (offline assertion: the instructions in between do not contain xR). The host supplies values according to the front end, Mac supplies the original constants → behavior unchanged ----
-PARAMS = {'db0507f36b84200ac05f75d76ed5026f': [
-    (0xe12d8c, 'd280c813', 0xe12d90, 'f2c07093', 19, 'KRES1', '启动初始化：主机模式输出分辨率 1600x900（{u32 宽, u32 高} 打包）'),
-    (0xe12e1c, 'd280a008', 0xe12e20, 'f2c05a08', 8, 'KRES0', '启动初始化：掌机模式输出分辨率 1280x720'),
-    (0xe10d60, 'd280c818', 0xe10d80, 'f2c07098', 24, 'KRES1', '运行模式变化通知（0x1f）处理：主机模式 1600x900'),
-    (0xe10d5c, 'd280a016', 0xe10d74, 'f2c05a16', 22, 'KRES0', '运行模式变化通知（0x1f）处理：掌机模式 1280x720'),
-    # 宽高比上限 19:9（float 0x40071c72）：宽于 19:9 的屏幕两侧留黑柱。宿主给 max(19/9, 输出宽 / 高) 的浮点位模式（低 32 位）；
-    # 原版输出 16:9（1600x900 / 1280x720）⇒ 仍为 19/9，行为不变；iPhone 1952x900（2.17:1）⇒ 2.169，黑柱宽 0
-    # Aspect ratio cap 19:9 (float 0x40071c72): screens wider than 19:9 get black bars on both sides. The host supplies the float bit pattern (low 32 bits) of max(19/9, output width / height);
-    # the original game outputs 16:9 (1600x900 / 1280x720) ⇒ still 19/9, behavior unchanged; iPhone 1952x900 (2.17:1) ⇒ 2.169, black bar width 0
-    (0x1663ee8, '52838e49', 0x1663eec, '72a800e9', 9, 'KASPECTUI', '界面常量缓冲 0x15 号槽 [屏宽, 屏高, 宽高比上限]：界面精灵着色器按它在上限以外画两侧黑柱（带约 20–30 像素向内的柔边，宿主另加余量把柔边推出屏幕）'),
-    (0xb152bc, '52838e48', 0xb152c0, '72a800e8', 8, 'KASPECT', '新画面模式视口：边距 = (屏宽 − 屏高 × 上限) / 2，经 0x85bc90 设居中视口'),
-    (0x23e888, '52838e48', 0x23e88c, '72a800e8', 8, 'KASPECT', '新画面模式坐标钳制（0x23e760）：x 夹进 [边距, 边距 + 屏高 × 上限]，宽屏两侧的指针 / 触摸不再被夹回中间'),
-]}
-params = PARAMS.get(BUILD_ID, [])
-for oa, wa, ob_, wb, r, key, why in params:
-    for o, w0 in ((oa, wa), (ob_, wb)):
-        w = struct.unpack_from('<I', IMG, o)[0]
-        assert f'{w:08x}' == w0, f'参数位原指令不符 {o:#x}：{w:08x}'
-        assert o not in kinds and not any(lo <= o < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'参数位与改写点冲突 {o:#x}'
-    for o in range(oa + 4, ob_, 4):
-        ins = dis(struct.unpack_from('<I', IMG, o)[0], o)
-        assert r not in regs_in(ins), f'参数位中间用到 x{r}：{o:#x} {ins.mnemonic} {ins.op_str}'
-    start = here()
-    tmp = 16 if r != 16 else 17
-    emit(STUR(tmp, 31, -16)); emit(MRS_TPIDRRO(r)); emit_slot_addr(r, tmp, key); emit(LDRX(r, r)); emit(LDUR(tmp, 31, -16)); emit(B(here(), oa + 4))
-    struct.pack_into('<I', IMG, oa, B(oa, start)); struct.pack_into('<I', IMG, ob_, NOP); stat('param')
-
-# 既有三块原生规则跳板均只使用后继覆盖的死临时w8，不改w0/stat返回、sp或NZCV。
-# 6c6290位于原mode3门后；前方Blaze/引用计数与数据失效6c62dc分支、后方状态更新不动。
-# The three existing native rule trampolines all use only the dead temporary w8 that is overwritten afterwards, and do not change the w0/stat return, sp or NZCV.
-# 6c6290 is after the original mode3 gate; the Blaze / reference count and data invalidation 6c62dc branches before it and the state update after it are untouched.
-rule_blocks = []
-if RULE_RUN:
-    def run_branch(off, old, body, why):
-        assert struct.unpack_from('<I', IMG, off)[0] == old, f'Run跳板原字不符 {off:#x}'
+    # 私有视觉分支；非OBS，0x85只读查询。只有本实验构建显式opt-in；原Qty/children和Update不变。
+    # Private visual branch; not OBS, 0x85 is a read-only query. Only this experimental build explicitly opts in; the original Qty/children and Update are unchanged.
+    if RULE_RUN and PRIVATE_GATES:
+        off, word = 0x3e443c, 0x3969c268
+        assert struct.unpack_from('<I', IMG, off)[0] == word
+        assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
         start = here()
-        for word in body(start): emit(word)
-        new = B(off, start)
-        struct.pack_into('<I', IMG, off, new)
-        cuts.append((off, struct.pack('<I', old).hex(), struct.pack('<I', new).hex(), why, '全'))
-        rule_blocks.append((start, bytes(patch[start - PATCH_OFF:]).hex(), why))
-    def cbz(at, target, r, nonzero=False):
-        delta = target-at; assert delta%4==0 and -(1<<20)<=delta<(1<<20)
-        return (0x35000000 if nonzero else 0x34000000) | (((delta>>2)&0x7ffff)<<5) | r
-    run_branch(0x6c6648, 0x34000060, lambda a: [
-        0xb9400268, cbz(a+4,a+12,8,True), B(a+8,0x6c664c),
-        cbz(a+12,a+20,0), B(a+16,0x6c664c), B(a+20,0x6c6654)],
-        'touch-run-v4：Run选择仅player0忽略精力门，非player按原stat返回；w8后继覆盖')
-    run_branch(0x6c6290, 0x710006df, lambda a: [
-        0xb9400268, cbz(a+4,a+12,8,True), B(a+8,0x6c62ec), 0x710006df, B(a+16,0x6c6294)],
-        'touch-run-v4：原合法Run成本段仅player0跳stat10扣除/耗尽降走；非player保持原cmp')
+        emit(STP_PRE(8, 31, 31, -16))  # w8查询结果仅用于cbz；两路恢复原x8。 | The w8 query result is used only for cbz; both paths restore the original x8.
+        emit(STP_PRE(29, 30, 31, -16))
+        emit_gate_call(); emit(BLR(30))
+        ret = here(); emit(LDP_POST(29, 30, 31, 16))
+        # cbz w8, nonmatch；不改NZCV。match恢复寄存器后保children。
+        # cbz w8, nonmatch; NZCV is not changed. On match, restore the registers and then preserve children.
+        emit(0x34000068)
+        emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), 0x3e4460))
+        emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), 0x3e4440))
+        gates.append((ret, 'svc', 0x85, off))
+        put_branch(off, start); stat('private_skill_render')
+        cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off,start)).hex(),
+                     'private confirmed six HUD only: own image/text skip ->4460; unknown original ->4440; svc85 full800', '仅宿主'))
+    elif RULE_RUN:
+        patch.extend(bytes(0x80))
+        stat('private_gates_reserved')
+
+    obs = list(OBS.get(BUILD_ID, []))
+    if RULE_RUN and PRIVATE_GATES:
+        obs.append((0x43ecc8, 6, "b8686953", "private touch-run-v4 PRE-ldr; full800 host ABI"))
+        obs.append((0x1237c60, 8, "d10143ff", "ui world anchor: camera world->screen entry (camera, point, out); host swaps x0 to a copy whose projection is shifted by the UI rect y (iPad UI kept 16:9 inside a taller screen), game camera untouched"))
+        # 面板开着时冻结世界（宿主 diag.c freeze_tick，缺省关，DM_PANEL_FREEZE=1 开）。四个入口门，都只换入口参数。
+        # Freeze the world while a panel is open (host diag.c freeze_tick, off by default, DM_PANEL_FREEZE=1 turns it on). Four entry gates, all of which only swap entry arguments.
+        obs.append((0x5eb2c0, 10, "a9bc5ff8", "server world-sim entry (game G): while frozen the host swaps x0 to a stand-in whose event queue is empty, so no unit / timer callback runs this tick; the real queue is left untouched"))
+        obs.append((0x4b7230, 11, "d10183ff", "client per-unit tick update entry (unit): while frozen the host swaps x0 to a stand-in unit carrying only the skip flag ([+0x124] bit 23), so the function takes its own early-out to the epilogue; all six call sites are inside the client tick simulation 0x461b80 / 0x461e60"))
+        obs.append((0x4b74d0, 12, "f81e0ff3", "client per-unit per-frame update entry (unit): drives model animation / interpolation from the tick fraction; while frozen the host swaps x0 to a stand-in unit (type 9, no render component) so both the callee 0x2a18d0 and this function take their own early-outs"))
+        obs.append((0x2c3c90, 13, "f81c0ff7", "render per-frame entry, called right after the main loop writes the world frame step [0x20cebb8] and world time [0x3114208]: while frozen the host rewrites the step to 0 and the world time to its value at freeze, the same thing the game's own pause path does at 0x2c1574"))
+        obs.append((0xadc434, 14, "d10143ff", "TextBoxWidget text-changed entry (widget): reads the raw text at +0x88 and rebuilds the display; host rewrites +0x88 for strings our item-notes generator annotated with colour codes (TextBoxWidget draws U+E07E as '*'), exact-match table only, everything else untouched"))
+        obs.append((0x442bc0, 15, "a9ba6ffc", "client event-message entry (x0 = packet; byte 1 = event subtype, jump table 0x1da6752): subtype 0x17 = offline difficulty scale changed -> 0x20f91c chat line + system notification; host rewrites byte 1 past the table (default branch, nothing shown) only for 0x17 and only in a rift game (dm_rift.c); otherwise untouched. orig stp x28, x27, [sp, #-0x60]!"))
+        obs.append((0x634000, 16, "d10143ff", "server level change by level number (game, player, level, kind), used by waypoints / portals / quest moves: in a rift game, when the player leaves a rift map for a level that is neither town nor a rift map, the host swaps w2 to the rift's next map so the destination is replaced inside the single native transition"))
+        obs.append((0x711040, 17, "d101c3ff", "server quest event 'monster killed' entry (game, monster, attacker), the only entry (callers 0x7d8550 kill, 0x7ab8dc); in a rift game, for a monster that died on a rift map, the host swaps x1 to a stand-in whose +0xc0 is null so the function takes its own early return (0x711064): bosses in the rift are combat only, no quest state / quest notifications"))
+        obs.append((0x3d84a0, 18, "d10143ff", "NotificationPanel message handler entry (panel, message): on InputMessage / ControllerActionBegin with action id 9 (the menu key) the native handler re-sends the notice callback and marks the message bus consumed, so the first menu press only dismisses the notice. In touch mode the host swaps x1 to a copy of the message whose action id is not 9: the notice stays until it times out and the menu key opens the menu; controller mode keeps the native behaviour"))
+        obs.append((0x463f40, 19, "f81c0ff7", "client per-frame position-error smoothing entry (s0 = frame length in ticks), called by the main loop right after all units were extrapolated in place and before the per-unit error is added back: the native error is only computed on start / stop (0x4639c0, which runs before the tick loop), so a sharp turn inside a tick snaps the extrapolated position back in one frame; the host adds that frame's jump to the local player's error fields (path +0x2a8 / +0x2ac, same clamp as native) and the native code decays it"))
+        obs.append((0x9da5b0, 20, "d104c3ff", "model yaw component per-frame update entry (x1 = argument block: +8 component, +0x20 -> +8 unit): the body turn speed is instance data on the component (+0x10..+0x2c min / max degrees per second for controller / mouse, +0x34 spring parameter); the host only reads them for the local player when a test switch is set"))
+        obs.append((0x2f7664, 7, "6dbb23e9", "touch target rank: candidate compare entry (closure, unit, kind, s0=score); host raises Boss/elite score, native eligibility unchanged"))
+        obs.append((0xb0d560, 21, "fc1a0fe8", "TooltipsPanel add-tooltip entry (panel, text, target position x2 / x3, style, text2): tooltips are immediate-mode (re-submitted by the hovered widget every frame and cleared after drawing, so the host cannot reach the record at its own time); on touch, in panel state, for an item the player just tapped, the host swaps the target position so the game lays the tooltip out beside the panel instead of over the item grid; everything else passes through unchanged"))
+        obs.append((0x7ce800, 22, "d100c3ff", "server place-one-preset-unit entry (game, room, record), only called by the room-activation preset loop 0x7ce930 (8 sites): in a rift game at tier 90+ on a rift map, for a monster record that is not a superunique and not scenery / NPC, the host swaps x2 to a copy whose class is -1 so 0x6910d0 takes its own early return (tbnz w2, #31) and nothing is spawned; the real record is untouched; rift guardian / invader / superunique spawns call 0x7ce630 / 0x69b310 directly and never pass here"))
+    for off, oid, ow, why in obs:
+        w = struct.unpack_from('<I', IMG, off)[0]
+        assert f'{w:08x}' == ow, f'观测门原指令不符 {off:#x}：{w:08x}'
+        # 只许函数入口：dm_gate 只回写 x0–x8 / x30，宿主 C 代码可能改 x9–x17；入口处这些按 AAPCS64 不承载值（参数只在 x0–x7 / x8）
+        # Function entries only: dm_gate writes back only x0–x8 / x30, and host C code may modify x9–x17; at entry these carry no values under AAPCS64 (arguments are only in x0–x7 / x8)
+        assert off in set(starts) or (oid == 6 and off == 0x43ecc8), f'private obs point not approved {off:#x}'
+        assert off < TEXT_END and off not in kinds and not any(lo <= off < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'观测门与改写点冲突 {off:#x}'
+        put_branch(off, site_obs(off, oid, w)); stat('obs')
+
+    # 秘境出口改道（r36 起）：分支门 0x89，挂在「按出口砖的连接换关」main+0x7cc1e0(游戏, 玩家, 砖) 的入口。它的四个调用者（点出口砖 0x6dbea0、
+    # 入口物件 0x6aeaa0 / 0x6b0500、任务 0x7314c0）都在各自的判定通过之后才调它；目的地不是关卡号而是砖的对端房间（同一幕已生成的地图里），换不成别的幕。
+    # 宿主在秘境局里把 w2 / w3 换成（秘境下一张图, 11）并让 x8≠0 → 门块直接跳去「按关卡号换关」0x634000，同一个调用者、只发生一次换关；其余情形执行原指令回 0x7cc1e4。
+    # 门块与 0x85 分支门逐字同构（structck ⑪ 按 hle.h 登记表核）；与观测门 15 / 16 一样只在带宿主私有门的产物里（touch）
+    # Rift exit rerouting (since r36): branch gate 0x89, hooked at the entry of "change level by the exit tile's connection" main+0x7cc1e0(game, player, tile). Its four callers (clicking an exit tile 0x6dbea0,
+    # entrance objects 0x6aeaa0 / 0x6b0500, quest 0x7314c0) all call it only after their own checks have passed; the destination is not a level id but the tile's peer room (in the already generated map of the same act), so it cannot be switched to another act.
+    # In a rift run the host replaces w2 / w3 with (the rift's next map, 11) and makes x8≠0 → the gate block jumps straight to "change level by level id" 0x634000, same caller, exactly one level change; in all other cases the original instruction is executed and control returns to 0x7cc1e4.
+    # The gate block is word-for-word isomorphic with the 0x85 branch gate (structck ⑪ checks it against the hle.h registry); like observation gates 15 / 16 it exists only in build outputs with host-private gates (touch)
+    if RULE_RUN and PRIVATE_GATES:
+        off, word, tgt = 0x7cc1e0, 0xd10183ff, 0x634000
+        assert struct.unpack_from('<I', IMG, off)[0] == word and off in set(starts) and tgt in set(starts)
+        assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
+        start = here()
+        emit(STP_PRE(8, 31, 31, -16))
+        emit(STP_PRE(29, 30, 31, -16))
+        emit_gate_call(); emit(BLR(30))
+        ret = here(); emit(LDP_POST(29, 30, 31, 16))
+        emit(0x34000068)
+        emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
+        emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
+        gates.append((ret, 'svc', 0x89, off))
+        put_branch(off, start); stat('rift_exit')
+        cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
+                     'rift exit redirect: tile-link level change entry -> host swaps (level, kind) and x8!=0 takes the branch to level-number change 0x634000; otherwise original ->0x7cc1e4; svc89', '仅宿主'))
+
+    # 秘境里存档时的当前幕（r38 起）：分支门 0x8c，挂在原版写存档头函数 0x6fa3e0 里「取难度」那条 main+0x6fa9d0（ldrb w10, [x21, #0x104]）。
+    # 它的上一条 0x6fa9cc 刚把「玩家当前在第几幕」读进 w9（ldrb w9, [x24, #0x2e8]），下面 0x6fa9e4 / 0x6fa9e8 写成难度字节 0x80 | 幕号（.d2s 0x98–0x9a），
+    # 下次进局落哪个城由它定。宿主在人处于秘境图里时把 w9 换成 4（第五幕 → 重进落哈洛加斯），只动写进存档的这一个值，运行中的幕号不碰。
+    # 用分支门而不是「替换一条指令」：structck 只认「bl 调用点」「入口」「分支门」三种登记形态。宿主永远让 x8 = 0（不走跳转那一路），
+    # 门块恢复 x8、执行原指令、回 0x6fa9d4；跳转目标填回点本身只为满足模板（走不到）。门块与 0x85 / 0x89 逐字同构
+    # Current act written to the save while in a Rift (since r38): branch gate 0x8c, hooked at the "read difficulty" instruction main+0x6fa9d0 (ldrb w10,
+    # [x21, #0x104]) inside the original save-header writer 0x6fa3e0.
+    # The preceding instruction 0x6fa9cc has just loaded "which act the player is currently in" into w9 (ldrb w9, [x24, #0x2e8]); below, 0x6fa9e4 / 0x6fa9e8
+    # write it as the difficulty byte 0x80 | act number (.d2s 0x98–0x9a),
+    # which decides which town the next session starts in. While the player is in a Rift map the host replaces w9 with 4 (Act 5 → re-enter in Harrogath);
+    # only this one value written to the save is changed, the running act number is untouched.
+    # A branch gate is used rather than "replace one instruction": structck only recognizes three registered forms, "bl call site", "entry" and "branch
+    # gate". The host always sets x8 = 0 (the jump path is never taken);
+    # the gate block restores x8, executes the original instruction and returns to 0x6fa9d4; the jump target is set to the return point itself only to
+    # satisfy the template (never reached). The gate block is word-for-word identical in structure to 0x85 / 0x89
+    if RULE_RUN and PRIVATE_GATES:
+        off, word, tgt = 0x6fa9d0, 0x394412aa, 0x6fa9d4   # 函数中间的一条指令（同 0x85 那扇门），不要求是函数入口；原指令不依赖 pc | An instruction in the middle of a function (same as gate 0x85); it need not be a function entry; the original instruction does not depend on pc
+        assert struct.unpack_from('<I', IMG, off)[0] == word
+        assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
+        start = here()
+        emit(STP_PRE(8, 31, 31, -16))
+        emit(STP_PRE(29, 30, 31, -16))
+        emit_gate_call(); emit(BLR(30))
+        ret = here(); emit(LDP_POST(29, 30, 31, 16))
+        emit(0x34000068)
+        emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
+        emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
+        gates.append((ret, 'svc', 0x8c, off))
+        put_branch(off, start); stat('rift_save_act')
+        cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
+                     'rift save act: save-header writer, right after it loads the current act into w9 -> host swaps w9 to 4 (act V) while the player is in a rift map; x8 stays 0, original insn runs ->0x6fa9d4; svc8c', '仅宿主'))
+    # 佣兵加装备位（r39 起）：分支门 0x8d，挂在原版通用放置校验 main+0x6493a8 的怪物主人分支里 main+0x64a34c（mov w9, w25）。
+    # 这一段（0x64a314–0x64a354）对怪物类主人只放行两类物品：0x574bc0(物品, 3 护甲)、0x574bc0(物品, 0x25 头盔)，都不是就走武器那条（按 monstats 的左右手类型），再不中就拒。
+    # 门挂在「是不是头盔」返回之后、cbnz w0 之前：宿主在「主人是玩家的佣兵 + 秘境最高通关 ≥ 10 层 + 物品是腰带 / 鞋 / 手套 / 戒指 / 项链」时把 w0 改成 1，
+    # 走头盔同一条放行路径（后面的部位格子、部位空不空等通用检查照常）。宿主永远让 x8 = 0；门块与 0x85 / 0x89 / 0x8c 逐字同构
+    # Extra mercenary equipment slots (since r39): branch gate 0x8d, hooked in the monster-owner branch of the original game's generic placement check main+0x6493a8 at main+0x64a34c (mov w9, w25).
+    # This section (0x64a314–0x64a354) lets through only two kinds of items for monster-type owners: 0x574bc0(item, 3 armor) and 0x574bc0(item, 0x25 helm); if neither, it takes the weapon path (by the left / right hand types in monstats), and if that fails too it rejects.
+    # The gate is hooked after the "is it a helm" call returns and before cbnz w0: when "the owner is the player's mercenary + highest rift level cleared ≥ 10 + the item is a belt / boots / gloves / ring / amulet", the host changes w0 to 1,
+    # taking the same pass path as the helm (the generic checks that follow, such as the body location cell and whether the location is empty, run as usual). The host always sets x8 = 0; the gate block is word-for-word isomorphic with 0x85 / 0x89 / 0x8c
+    if RULE_RUN and PRIVATE_GATES:
+        off, word, tgt = 0x64a34c, 0x2a1903e9, 0x64a350   # 原指令不依赖 pc | The original instruction does not depend on pc
+        assert struct.unpack_from('<I', IMG, off)[0] == word
+        assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
+        start = here()
+        emit(STP_PRE(8, 31, 31, -16))
+        emit(STP_PRE(29, 30, 31, -16))
+        emit_gate_call(); emit(BLR(30))
+        ret = here(); emit(LDP_POST(29, 30, 31, 16))
+        emit(0x34000068)
+        emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
+        emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
+        gates.append((ret, 'svc', 0x8d, off))
+        put_branch(off, start); stat('merc_slot')
+        cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
+                     'merc slots: placement check, monster-owner branch right after the helm type test -> host sets w0=1 for ring/amulet/boots/gloves/belt on a hireling (rift best >= 10 for new equips; always on load); x8 stays 0, original insn runs ->0x64a350; svc8d', '仅宿主'))
+    # 佣兵加装备位的客户端那一半（r39 同代）：分支门 0x8e，挂在客户端「佣兵能不能穿这件」函数 main+0x3bea44(佣兵, 物品) 里 main+0x3beb58（mov x0, x19）。
+    # 这个函数和服务端那段同一个规则：0x574bc0(物品, 3 护甲)、0x574bc0(物品, 0x25 头盔) 中一个就返回 1，都不是走武器那条。物品格控件拿它的结果画「不可放置」的红色、
+    # 决定松手时放不放——不改它，已解锁的新格拖着对的物品悬停也是红的、原版放下不成（原先靠触摸层兜底直接调 0x3bed60）。
+    # 门挂在「mov w1, #0x25」之后、这次类型判断的 bl 之前：宿主在「秘境最高通关 ≥ 10 层 + 物品是腰带 / 鞋 / 手套 / 戒指 / 项链」时把 w1 换成该物品自己的类型号，
+    # 类型判断自然成立、走头盔同一条返回 1 的路。宿主永远让 x8 = 0；门块与 0x8d 逐字同构
+    # Client half of the extra mercenary equipment slots (same generation as r39): branch gate 0x8e, hooked inside the client's "can the mercenary wear this" function main+0x3bea44(mercenary, item) at main+0x3beb58 (mov x0, x19).
+    # This function follows the same rule as the server-side section: if either 0x574bc0(item, 3 armor) or 0x574bc0(item, 0x25 helm) matches it returns 1, and if neither does it takes the weapon path. The item cell widget uses its result to draw the "cannot place" red and
+    # to decide whether to place on release -- without changing it, an unlocked new cell still shows red when the right item is dragged over it, and the original game's drop fails (previously the touch layer's fallback called 0x3bed60 directly).
+    # The gate is hooked after "mov w1, #0x25" and before the bl of this type check: when "highest rift level cleared ≥ 10 + the item is a belt / boots / gloves / ring / amulet", the host replaces w1 with the item's own type number,
+    # so the type check passes naturally and takes the same return-1 path as the helm. The host always sets x8 = 0; the gate block is word-for-word isomorphic with 0x8d
+    if RULE_RUN and PRIVATE_GATES:
+        off, word, tgt = 0x3beb58, 0xaa1303e0, 0x3beb5c   # 原指令不依赖 pc | The original instruction does not depend on pc
+        assert struct.unpack_from('<I', IMG, off)[0] == word
+        assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
+        start = here()
+        emit(STP_PRE(8, 31, 31, -16))
+        emit(STP_PRE(29, 30, 31, -16))
+        emit_gate_call(); emit(BLR(30))
+        ret = here(); emit(LDP_POST(29, 30, 31, 16))
+        emit(0x34000068)
+        emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
+        emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
+        gates.append((ret, 'svc', 0x8e, off))
+        put_branch(off, start); stat('merc_slot_client')
+        cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
+                     'merc slots (client): hireling can-equip check, between "mov w1,#0x25" and the type test -> host swaps w1 to the item\'s own type for ring/amulet/boots/gloves/belt (rift best >= 10); x8 stays 0, original insn runs ->0x3beb5c; svc8e', '仅宿主'))
+
+    # ---- 参数位（仅宿主）：{NSO 构建号: [(偏移 A, 原字 A, 偏移 B, 原字 B, 寄存器, 键, 理由)]}。
+    # 原处两条造常数指令改成第一条跳补丁区参数跳板、第二条 nop；跳板间接取键页值后跳回第一条之后（A+4）：A、B 不相邻时中间的原指令照常执行
+    # （曾跳回 B+4，运行模式通知处理 0xe10d5c/0xe10d60 越过 adrp x19.. 与另一跳板，切掌机即崩；structck ⑩ 核跳板出口）。
+    # A、B 之间不得读写 xR（离线断言：中间指令不含 xR）。宿主按前端给值，Mac 给原常数 → 行为不变 ----
+    # ---- Parameter slots (host only): {NSO build ID: [(offset A, original word A, offset B, original word B, register, key, reason)]}.
+    # The two constant-building instructions at the original site are changed so that the first jumps to a parameter trampoline in the patch area and the second is a nop; the trampoline fetches the key page value indirectly and jumps back to just after the first (A+4): when A and B are not adjacent, the original instructions in between execute as usual
+    # (it used to jump back to B+4; in the operation-mode notification handler 0xe10d5c/0xe10d60 that skipped adrp x19.. and another trampoline, and switching to handheld crashed immediately; structck ⑩ checks the trampoline exit).
+    # xR must not be read or written between A and B (offline assertion: the instructions in between do not contain xR). The host supplies values according to the front end, Mac supplies the original constants → behavior unchanged ----
+    PARAMS = {'db0507f36b84200ac05f75d76ed5026f': [
+        (0xe12d8c, 'd280c813', 0xe12d90, 'f2c07093', 19, 'KRES1', '启动初始化：主机模式输出分辨率 1600x900（{u32 宽, u32 高} 打包）'),
+        (0xe12e1c, 'd280a008', 0xe12e20, 'f2c05a08', 8, 'KRES0', '启动初始化：掌机模式输出分辨率 1280x720'),
+        (0xe10d60, 'd280c818', 0xe10d80, 'f2c07098', 24, 'KRES1', '运行模式变化通知（0x1f）处理：主机模式 1600x900'),
+        (0xe10d5c, 'd280a016', 0xe10d74, 'f2c05a16', 22, 'KRES0', '运行模式变化通知（0x1f）处理：掌机模式 1280x720'),
+        # 宽高比上限 19:9（float 0x40071c72）：宽于 19:9 的屏幕两侧留黑柱。宿主给 max(19/9, 输出宽 / 高) 的浮点位模式（低 32 位）；
+        # 原版输出 16:9（1600x900 / 1280x720）⇒ 仍为 19/9，行为不变；iPhone 1952x900（2.17:1）⇒ 2.169，黑柱宽 0
+        # Aspect ratio cap 19:9 (float 0x40071c72): screens wider than 19:9 get black bars on both sides. The host supplies the float bit pattern (low 32 bits) of max(19/9, output width / height);
+        # the original game outputs 16:9 (1600x900 / 1280x720) ⇒ still 19/9, behavior unchanged; iPhone 1952x900 (2.17:1) ⇒ 2.169, black bar width 0
+        (0x1663ee8, '52838e49', 0x1663eec, '72a800e9', 9, 'KASPECTUI', '界面常量缓冲 0x15 号槽 [屏宽, 屏高, 宽高比上限]：界面精灵着色器按它在上限以外画两侧黑柱（带约 20–30 像素向内的柔边，宿主另加余量把柔边推出屏幕）'),
+        (0xb152bc, '52838e48', 0xb152c0, '72a800e8', 8, 'KASPECT', '新画面模式视口：边距 = (屏宽 − 屏高 × 上限) / 2，经 0x85bc90 设居中视口'),
+        (0x23e888, '52838e48', 0x23e88c, '72a800e8', 8, 'KASPECT', '新画面模式坐标钳制（0x23e760）：x 夹进 [边距, 边距 + 屏高 × 上限]，宽屏两侧的指针 / 触摸不再被夹回中间'),
+    ]}
+    params = PARAMS.get(BUILD_ID, [])
+    for oa, wa, ob_, wb, r, key, why in params:
+        for o, w0 in ((oa, wa), (ob_, wb)):
+            w = struct.unpack_from('<I', IMG, o)[0]
+            assert f'{w:08x}' == w0, f'参数位原指令不符 {o:#x}：{w:08x}'
+            assert o not in kinds and not any(lo <= o < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'参数位与改写点冲突 {o:#x}'
+        for o in range(oa + 4, ob_, 4):
+            ins = dis(struct.unpack_from('<I', IMG, o)[0], o)
+            assert r not in regs_in(ins), f'参数位中间用到 x{r}：{o:#x} {ins.mnemonic} {ins.op_str}'
+        start = here()
+        tmp = 16 if r != 16 else 17
+        emit(STUR(tmp, 31, -16)); emit(MRS_TPIDRRO(r)); emit_slot_addr(r, tmp, key); emit(LDRX(r, r)); emit(LDUR(tmp, 31, -16)); emit(B(here(), oa + 4))
+        struct.pack_into('<I', IMG, oa, B(oa, start)); struct.pack_into('<I', IMG, ob_, NOP); stat('param')
+
+    # 既有三块原生规则跳板均只使用后继覆盖的死临时w8，不改w0/stat返回、sp或NZCV。
+    # 6c6290位于原mode3门后；前方Blaze/引用计数与数据失效6c62dc分支、后方状态更新不动。
+    # The three existing native rule trampolines all use only the dead temporary w8 that is overwritten afterwards, and do not change the w0/stat return, sp or NZCV.
+    # 6c6290 is after the original mode3 gate; the Blaze / reference count and data invalidation 6c62dc branches before it and the state update after it are untouched.
+    rule_blocks = []
+    if RULE_RUN:
+        def run_branch(off, old, body, why):
+            assert struct.unpack_from('<I', IMG, off)[0] == old, f'Run跳板原字不符 {off:#x}'
+            start = here()
+            for word in body(start): emit(word)
+            new = B(off, start)
+            struct.pack_into('<I', IMG, off, new)
+            cuts.append((off, struct.pack('<I', old).hex(), struct.pack('<I', new).hex(), why, '全'))
+            rule_blocks.append((start, bytes(patch[start - PATCH_OFF:]).hex(), why))
+        def cbz(at, target, r, nonzero=False):
+            delta = target-at; assert delta%4==0 and -(1<<20)<=delta<(1<<20)
+            return (0x35000000 if nonzero else 0x34000000) | (((delta>>2)&0x7ffff)<<5) | r
+        run_branch(0x6c6648, 0x34000060, lambda a: [
+            0xb9400268, cbz(a+4,a+12,8,True), B(a+8,0x6c664c),
+            cbz(a+12,a+20,0), B(a+16,0x6c664c), B(a+20,0x6c6654)],
+            'touch-run-v4：Run选择仅player0忽略精力门，非player按原stat返回；w8后继覆盖')
+        run_branch(0x6c6290, 0x710006df, lambda a: [
+            0xb9400268, cbz(a+4,a+12,8,True), B(a+8,0x6c62ec), 0x710006df, B(a+16,0x6c6294)],
+            'touch-run-v4：原合法Run成本段仅player0跳stat10扣除/耗尽降走；非player保持原cmp')
 
 
-    # client4abc60原mode3/当前受控unit门之后；实际GetStat已返回，保W0，只type0取消STA自动Stop。
-    # After the original mode3 / currently controlled unit gate at client4abc60; the actual GetStat has already returned, W0 is preserved, and only for type0 is the STA auto Stop cancelled.
-    run_branch(0x4ac368, 0x35000460, lambda a: [
-        0xb9400268, cbz(a+4,a+12,8), B(a+8,a+16), B(a+12,0x4ac3f4),
-        cbz(a+16,a+24,0), B(a+20,0x4ac3f4), B(a+24,0x4ac36c)],
-        'touch-run-v4：client当前受控Run3仅player0跳STA零值自动Stop；原getter值与真实松杆保留，非player保原门')
+        # client4abc60原mode3/当前受控unit门之后；实际GetStat已返回，保W0，只type0取消STA自动Stop。
+        # After the original mode3 / currently controlled unit gate at client4abc60; the actual GetStat has already returned, W0 is preserved, and only for type0 is the STA auto Stop cancelled.
+        run_branch(0x4ac368, 0x35000460, lambda a: [
+            0xb9400268, cbz(a+4,a+12,8), B(a+8,a+16), B(a+12,0x4ac3f4),
+            cbz(a+16,a+24,0), B(a+20,0x4ac3f4), B(a+24,0x4ac36c)],
+            'touch-run-v4：client当前受控Run3仅player0跳STA零值自动Stop；原getter值与真实松杆保留，非player保原门')
 
 
-    # 原unit null/type5门之后、w8仍为原unitType；只规范player请求2，原其它动作分派/资格完整执行。
-    # After the original unit null/type5 gate, with w8 still the original unitType; only player request 2 is normalized, and the other original action dispatch / eligibility checks run in full.
-    run_branch(0x6c6580, 0x51000849, lambda a: [
-        cbz(a,a+16,8,True), 0x51000849, cbz(a+8,a+16,9,True),
-        0x52800062, 0x51000849, B(a+20,0x6c6584)],
-        'touch-run-v4：原通用合法移动仅player0请求Walk2规范为Run3，非player与其它请求保原，w8/原资格不改')
+        # 原unit null/type5门之后、w8仍为原unitType；只规范player请求2，原其它动作分派/资格完整执行。
+        # After the original unit null/type5 gate, with w8 still the original unitType; only player request 2 is normalized, and the other original action dispatch / eligibility checks run in full.
+        run_branch(0x6c6580, 0x51000849, lambda a: [
+            cbz(a,a+16,8,True), 0x51000849, cbz(a+8,a+16,9,True),
+            0x52800062, 0x51000849, B(a+20,0x6c6584)],
+            'touch-run-v4：原通用合法移动仅player0请求Walk2规范为Run3，非player与其它请求保原，w8/原资格不改')
+
+
+MEASURING = True; emit_all(); measured = len(patch)
+if PATCH_OFF + measured >= (1 << 27):
+    PATCH_OFF = -((measured + 0xFFFF) & ~0xFFFF)
+    print(f'{NAME}: image {len(IMG):#x} + patch {measured:#x} exceeds the b range -> patch area placed below the image at {PATCH_OFF:#x}')
+IMG = bytearray(IMG_PRE); cuts[:] = CUTS_PRE; patch = bytearray(); fix.clear(); gates.clear(); stats.clear(); rule_blocks = []
+MEASURING = False; emit_all()
+assert len(patch) == measured, (len(patch), measured)
 
 os.makedirs(outdir, exist_ok=True)
 P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
-open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch)
+open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch if PATCH_OFF >= 0 else patch + bytearray(-PATCH_OFF - len(patch)) + IMG)
 import hashlib
 with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:
     f.write(hashlib.sha256(open(os.path.abspath(__file__), 'rb').read()).hexdigest() + '  patch_nso.py\n')
@@ -860,7 +967,9 @@ with open(P('sites.tsv'), 'w') as f:
     for a in sorted(kinds):
         if a not in done: f.write(f'{a:#x}\t{kinds[a][0]}\n')
     for wseg in windows: f.write(f'{wseg[0].address:#x}\tW\t{wseg[-1].address + 4:#x}\n')
-    for a, (b, c) in jumps.items(): f.write(f'{a:#x}\tJ\t{b:#x}\t{c}\n')
+    for a, j in jumps.items():
+        if j[0] == 'abs': f.write(f'{a:#x}\tJA\t{j[1]:#x}\t{len(j[2])}\t{",".join(f"{t:#x}" for t in j[2])}\n')   # 第二种跳转表：表首、项数、各项目标 | second idiom: table base, entry count, targets
+        else: f.write(f'{a:#x}\tJ\t{j[0]:#x}\t{j[1]}\n')
 with open(P('cuts.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, ob, nb, why, scope in cuts: f.write(f'{off:#x}\t{ob}\t{nb}\t{scope}\t{why}\n')   # 列：偏移 原字节 新字节 作用域 理由 | Columns: offset, original bytes, new bytes, scope, reason

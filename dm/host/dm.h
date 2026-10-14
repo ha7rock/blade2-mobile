@@ -27,7 +27,8 @@ typedef struct {
     char name[16];
     uint8_t *base;             // 映像（含补丁区）在宿主地址空间的首址 | Start address of the image (including the patch area) in the host address space
     size_t size;
-    uint64_t text_end, ro_off, data_off, patch_off, key_page_off, key_page_size;   // 来自改写器 fixups 头 | From the rewriter fixups header
+    uint64_t text_end, ro_off, data_off, key_page_off, key_page_size;   // 来自改写器 fixups 头 | From the rewriter fixups header
+    int64_t patch_off;         // 补丁区相对映像首址的偏移；< 0 = 补丁区在映像前面（映像大到 b 够不到映像后面时，改写器这样出；产物文件 = 补丁区 + 映像） | patch area offset from the image start; < 0 = the patch area lies before the image (the rewriter does this when the image is too large for b to reach past it; build output file = patch area + image)
     unsigned key_idx[8];
     const Elf64_Dyn *dyn;
     const Elf64_Sym *symtab;

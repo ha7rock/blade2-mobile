@@ -18,7 +18,7 @@ for f in $SRC $GFX $LD $EXTRA; do
 done
 echo "compile failures: $fail"
 clang -mmacosx-version-min=26.0 -o "$B/dmhost_try" "$B"/*.o -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework ImageIO -framework UniformTypeIdentifiers -framework GameController -framework Network > "$B/link.log" 2>&1
-grep -E '^\s+"_' "$B/link.log" | sed -E 's/^\s+"_([^"]+)".*/\1/' | sort -u > "$B/undefined.txt"
+grep -E '^[[:space:]]+"_' "$B/link.log" | sed -E 's/^[[:space:]]+"_([^"]+)".*/\1/' | sort -u > "$B/undefined.txt"
 echo "undefined symbols: $(wc -l < "$B/undefined.txt")"
 tr '\n' ' ' < "$B/undefined.txt"; echo
 [ -x "$B/dmhost_try" ] && echo "LINK OK: $B/dmhost_try"

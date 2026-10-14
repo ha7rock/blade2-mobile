@@ -1,0 +1,26 @@
+# Blade II 宿主（Mac）：d2r-mobile 宿主的通用部分 + Blade 适配，不带任何 D2R 功能文件（dm_*.c / diag.c / touch_mac.c）。
+# 用法：make -f Makefile.blade            → dmhost_blade
+#       make -f Makefile.blade run        → 跑游戏（需 DM_ROMFS / DM_SAVE / DM_TEMP / DM_OUT，见下）
+# Blade II host (Mac): the generic part of the d2r-mobile host + the Blade adaptation, without any D2R feature file (dm_*.c / diag.c / touch_mac.c).
+# Usage: make -f Makefile.blade           → dmhost_blade
+#        make -f Makefile.blade run       → run the game (needs DM_ROMFS / DM_SAVE / DM_TEMP / DM_OUT, see below)
+MACOS_MIN ?= 26.0
+CFLAGS=-O1 -g -Wall -Wno-unused-function -mmacosx-version-min=$(MACOS_MIN) -DAPP_NAME='"Blade II Mobile"'
+SRC=app_mac.m crash.c entry.S front_mac.m hle.c loader.c main.c memstat.m romfs_validate.c thread.c \
+    blade_stubs.c hle_blade.c \
+    $(sort $(wildcard hle_*.c))
+GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m))
+GFX_H=$(sort $(wildcard ../gfx/nvn/*.h ../gfx/nvn/include/*.h ../gfx/tex/*.h))
+LIBDEFLATE=../third_party/libdeflate/lib/deflate_decompress.c ../third_party/libdeflate/lib/zlib_decompress.c ../third_party/libdeflate/lib/adler32.c ../third_party/libdeflate/lib/utils.c ../third_party/libdeflate/lib/arm/cpu_features.c
+FRAMEWORKS=-framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework ImageIO -framework UniformTypeIdentifiers -framework GameController -framework Network
+.DEFAULT_GOAL := dmhost_blade
+dmhost_blade: $(SRC) $(GFX) $(LIBDEFLATE) dm.h hle.h dm_input.h front.h $(GFX_H)
+	clang $(CFLAGS) -I. -I../gfx/nvn/include -fobjc-arc -o $@ $(SRC) $(GFX) $(LIBDEFLATE) $(FRAMEWORKS)
+# 运行：DM_OUT = 改写产物目录（main/sdk 的 .patched.bin 等），DM_ROMFS = Update/RomFS，DM_SAVE = 存档目录（必须），DM_TEMP = 临时目录
+# Run: DM_OUT = rewrite build output dir (.patched.bin etc. of main/sdk), DM_ROMFS = Update/RomFS, DM_SAVE = save dir (required), DM_TEMP = temp dir
+DM_WATCH ?= 120
+run: dmhost_blade
+	@test -n "$(DM_OUT)" || { echo "set DM_OUT=<rewrite build output dir>"; exit 1; }
+	DM_WINDOW=$${DM_WINDOW:-1} DM_WATCH=$(DM_WATCH) ./dmhost_blade "$(DM_OUT)" main sdk
+clean:
+	rm -f dmhost_blade

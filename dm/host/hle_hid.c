@@ -430,6 +430,11 @@ HLE_FORCE("_ZN2nn3hid29SetNpadHandheldActivationModeENS0_26NpadHandheldActivatio
 HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "手柄样式查询；跟 DM_OPMODE 走", uint32_t, h_hid_GetStyle, const uint32_t *id) { return style_of(*id); }
 HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", "全键手柄状态；取 dm_input", void, h_hid_GetFullKey, NpadState *s, const uint32_t *id) { fill(s, *id, STYLE_FULLKEY); }
 HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", "掌机手柄状态；取 dm_input", void, h_hid_GetHandheld, NpadState *s, const uint32_t *id) { fill(s, *id, STYLE_HANDHELD); }
+// Blade II（UE4）还轮询 Joy-Con 双持 / 左 / 右三种样式（NpadStyleTag 位 2 / 3 / 4）：宿主只接全键与掌机，这三种按「没接」回全 0 状态
+// Blade II (UE4) also polls the JoyDual / JoyLeft / JoyRight styles (NpadStyleTag bits 2 / 3 / 4): the host only connects FullKey and Handheld, so these three answer "not connected" with an all-zero state
+HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", "Joy-Con 双持状态；宿主没接这种样式，回全 0", void, h_hid_GetJoyDual, NpadState *s, const uint32_t *id) { fill(s, *id, 1u << 2); }
+HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", "左 Joy-Con 状态；宿主没接这种样式，回全 0", void, h_hid_GetJoyLeft, NpadState *s, const uint32_t *id) { fill(s, *id, 1u << 3); }
+HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", "右 Joy-Con 状态；宿主没接这种样式，回全 0", void, h_hid_GetJoyRight, NpadState *s, const uint32_t *id) { fill(s, *id, 1u << 4); }
 
 // 震动：设备数 0，游戏不会再初始化 / 发送
 // Vibration: device count 0, the game will not initialize / send any further

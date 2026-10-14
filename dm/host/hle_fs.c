@@ -616,6 +616,10 @@ static int rm_tree(const char *p) {
 HLE_FORCE("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", "fsp-srv → 递归删除（只在可写挂载内）", Result, h_fs_DeleteDirRec, const char *path) {
     HP(path); RW(); return rm_tree(hp) ? err_res("rmtree", hp) : RES_OK;
 }
+// Blade II（UE4 的 FSwitchPlatformFile）另用的三个：非递归删目录、按挂载名提交存档（与 Commit 同一件事）、目录项计数
+// Three more used by Blade II (UE4's FSwitchPlatformFile): non-recursive directory delete, commit by mount name (same thing as Commit), directory entry count
+HLE_FORCE("_ZN2nn2fs15DeleteDirectoryEPKc", "fsp-srv → rmdir(2)", Result, h_fs_DeleteDir, const char *path) { HP(path); RW(); return rmdir(hp) ? err_res("rmdir", hp) : RES_OK; }
+HLE_FORCE("_ZN2nn2fs14CommitSaveDataEPKc", "fsp-srv；= Commit(挂载名)", Result, h_fs_CommitSave, const char *name) { return h_fs_Commit(name); }
 HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)", Result, h_fs_RenameFile, const char *from, const char *to) {
     HP(from); RW(); char hp2[1024];
     if (!host_path_ex(to, hp2, sizeof hp2, NULL, 1)) return err_res("rename path", to);
@@ -676,6 +680,18 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
         dir_snapshot(h, &g_mnt[i], c + 1); break;
     }
     *out = (uint64_t)h; return RES_OK;
+}
+HLE_FORCE("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", "fsp-srv → 数目录项（不动读取位置）", Result, h_fs_DirCount, int64_t *count, uint64_t hh) {
+    PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0;
+    if (h->snap) { for (int64_t i = 0; i < h->nsnap; i++) if (h->mode & (h->snap[i].type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE)) n++; *count = n; return RES_OK; }
+    long pos = telldir(h->d); rewinddir(h->d); struct dirent *e;
+    while ((e = readdir(h->d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        { size_t dl = strlen(e->d_name); if (dl > 6 && !strcmp(e->d_name + dl - 6, ".holes")) continue; }
+        char c[1280]; snprintf(c, sizeof c, "%s/%s", h->path, e->d_name); struct stat st; if (stat(c, &st)) continue;
+        if (h->mode & (S_ISDIR(st.st_mode) ? DIRMODE_DIR : DIRMODE_FILE)) n++;
+    }
+    seekdir(h->d, pos); *count = n; return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", "fsp-srv → readdir(3)", Result, h_fs_ReadDirectory, int64_t *count, DirectoryEntry *ents, uint64_t hh, int64_t max) {
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0; struct dirent *e;
