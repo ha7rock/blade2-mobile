@@ -844,7 +844,8 @@ uint64_t mtl_sub_commit(void) {
             else if (ops[i].kind == 3) {   // 通过采样数：自清零以来各槽之和 | Samples passed: the sum of all slots since the reset
                 vis_list *l = ops[i].vis; uint64_t sum = 0;
                 for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
-                free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
+                free(l); { static int all = -1; if (all < 0) { const char *e = getenv("DM_NVN_VIS_ALL"); all = e && !strcmp(e, "1"); } if (all && !sum) sum = 1; }   // 诊断 DM_NVN_VIS_ALL=1：遮挡查询一律「可见」（判是不是查询结果把东西剔掉了） | Diagnostic DM_NVN_VIS_ALL=1: every occlusion query answers 'visible' (to tell whether query results are culling things)
+                uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
             }
             else { uint64_t t = gpu_ticks(), rec[2] = {ops[i].type == 0 || ops[i].type == 0x10 ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }
         }
@@ -3021,6 +3022,7 @@ static inline int m3_use_seen(void *p, uint32_t u) {
 // 翻译器离线看不到贴图描述符，默认把每个槽当 2D：缓冲贴图（UE4 蒙皮的骨骼矩阵 Buffer<float4>）、3D / 立方体贴图在 Metal 里类型不符就读到 0
 // DM_NVN_TEXFACTS=file: record the texture type actually bound to each texture slot of each shader (key \t slot \t type word) as answers for offline translation (dmsh_from_dump.py merges them into tex of nvn/shader_facts.tsv).
 // The translator cannot see texture descriptors offline and treats every slot as 2D by default: texture buffers (UE4 skinning's bone matrices Buffer<float4>), 3D / cube textures read 0 on Metal when the type does not match
+static void texraw_sel_note(id<MTLTexture> t, uint64_t ser);   // 定义在 td_dump 之前 | defined before td_dump
 static void texfacts_note(NvShader *sh, int reg, MTLTextureType tt) {
     static FILE *f; static int tried; static NSMutableSet *seen;
     if (!tried) { tried = 1; const char *e = getenv("DM_NVN_TEXFACTS"); if (e) { f = fopen(e, "a"); seen = [NSMutableSet set]; } }
@@ -3097,6 +3099,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType);
             if (t) texfacts_note(sh, reg, t.textureType);
+            if (t && nvn_stage == 1 && tid < g_ntreg) texraw_sel_note(t, g_treg[tid].t.serial);
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
@@ -5691,6 +5694,32 @@ void td_note(RPD *pd, NSUInteger nc) {
         if (!seen) [g_td_list addObject:@[t, @(ser), @(lv)]];
     }
 }
+static NSMutableDictionary<NSNumber *, id<MTLTexture>> *g_texraw_sel;
+static void texraw_save(id<MTLTexture> t, uint64_t ser) {
+        int bw, bh; NSUInteger w = t.width, h = t.height, dz = t.depth;
+        size_t bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : t.pixelFormat == MTLPixelFormatRGBA32Float ? 16 : 4; (void)bw; (void)bh;
+        size_t row = w * bpp, img = row * h;
+        NSUInteger ns = t.textureType == MTLTextureTypeCube ? 6 : t.textureType == MTLTextureTypeCubeArray ? t.arrayLength * 6 : t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;   // 立方体 / 数组：逐片存（深度按片数叠加） | cube / array: saved slice by slice (depth = slices stacked)
+        id<MTLBuffer> buf = [g_dev newBufferWithLength:img * dz * ns options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+        for (NSUInteger sl = 0; sl < ns; sl++)
+            [b copyFromTexture:t sourceSlice:sl sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, dz) toBuffer:buf destinationOffset:sl * img * dz destinationBytesPerRow:row destinationBytesPerImage:img];
+        [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        char path[1024]; snprintf(path, sizeof path, g_td_path, (int)ser); strlcat(path, ".raw", sizeof path);
+        FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu %zu\n", (unsigned long)w, (unsigned long)h, (unsigned long)(dz * ns), (unsigned long)t.pixelFormat, row); fwrite(buf.contents, 1, img * dz * ns, f); fclose(f); }
+        MLOG("[texraw] ser=%llu %lux%lux%lu 格式 %lu → %s", ser, (unsigned long)w, (unsigned long)h, (unsigned long)dz, (unsigned long)t.pixelFormat, path);
+}
+// DM_NVN_TEXRAW=sel:WxH:fmt（可多项）：绑定时记下该帧片元阶段用到的、尺寸与 Metal 格式都匹配的贴图，帧末随 TEXDUMP 一起按原始字节存
+// DM_NVN_TEXRAW=sel:WxH:fmt (several allowed): at bind time note the textures used by the fragment stage in that frame whose size and Metal format match, saved as raw bytes at frame end together with TEXDUMP
+static void texraw_sel_note(id<MTLTexture> t, uint64_t ser) {
+    static int inited, n; static struct { unsigned w, h, f; } sel[8];
+    if (!inited) { inited = 1; for (const char *q = getenv("DM_NVN_TEXRAW"); q && *q && n < 8; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q))
+        if (!strncmp(q, "sel:", 4) && sscanf(q + 4, "%ux%u:%u", &sel[n].w, &sel[n].h, &sel[n].f) == 3) n++; }
+    if (!n || !t || g_td_frame < 0 || g_td_done || (long)atomic_load(&g_cur_frame) != g_td_frame) return;
+    for (int i = 0; i < n; i++) if (t.width == sel[i].w && t.height == sel[i].h && (unsigned)t.pixelFormat == sel[i].f) {
+        if (!g_texraw_sel) g_texraw_sel = [NSMutableDictionary dictionary];
+        if (g_texraw_sel.count < 16) g_texraw_sel[@(ser)] = t; return; }
+}
 static void td_dump(void) {
     g_td_done = 1;
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
@@ -5714,22 +5743,14 @@ static void td_dump(void) {
     // DM_NVN_TEXRAW=序号,…：按贴图序号存原始字节（含 3D；文件 路径%d 换成序号、后缀 .raw，首行文本头：宽 高 深 格式 每行字节）
     // DM_NVN_TEXRAW=index,...: save raw bytes by texture index (including 3D; file: %d in the path is replaced with the index, suffix .raw, first-line text header: width height depth format bytes-per-row)
     for (const char *q = getenv("DM_NVN_TEXRAW"); q && *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) {
+        if (!strncmp(q, "sel:", 4)) continue;   // 选择器项由 texraw_sel_note 收集（见下） | selector items are collected by texraw_sel_note (below)
         uint64_t ser = (uint64_t)atoll(q); id o = serial_get(ser);
         id<MTLTexture> t = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : o;
         if (!t) { MLOG("[texraw] ser=%llu 不在序号表", ser); continue; }
-        int bw, bh; NSUInteger w = t.width, h = t.height, dz = t.depth;
-        size_t bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : t.pixelFormat == MTLPixelFormatRGBA32Float ? 16 : 4; (void)bw; (void)bh;
-        size_t row = w * bpp, img = row * h;
-        NSUInteger ns = t.textureType == MTLTextureTypeCube ? 6 : t.textureType == MTLTextureTypeCubeArray ? t.arrayLength * 6 : t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;   // 立方体 / 数组：逐片存（深度按片数叠加） | cube / array: saved slice by slice (depth = slices stacked)
-        id<MTLBuffer> buf = [g_dev newBufferWithLength:img * dz * ns options:MTLResourceStorageModeShared];
-        id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-        for (NSUInteger sl = 0; sl < ns; sl++)
-            [b copyFromTexture:t sourceSlice:sl sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, dz) toBuffer:buf destinationOffset:sl * img * dz destinationBytesPerRow:row destinationBytesPerImage:img];
-        [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        char path[1024]; snprintf(path, sizeof path, g_td_path, (int)ser); strlcat(path, ".raw", sizeof path);
-        FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu %zu\n", (unsigned long)w, (unsigned long)h, (unsigned long)(dz * ns), (unsigned long)t.pixelFormat, row); fwrite(buf.contents, 1, img * dz * ns, f); fclose(f); }
-        MLOG("[texraw] ser=%llu %lux%lux%lu 格式 %lu → %s", ser, (unsigned long)w, (unsigned long)h, (unsigned long)dz, (unsigned long)t.pixelFormat, path);
+        texraw_save(t, ser);
     }
+    for (NSNumber *k in g_texraw_sel) texraw_save(g_texraw_sel[k], k.unsignedLongLongValue);   // DM_NVN_TEXRAW=sel:WxH:fmt：该帧片元阶段绑过的、尺寸与 Metal 格式匹配的贴图 | textures bound by the fragment stage in that frame matching size and Metal format
+    [g_texraw_sel removeAllObjects];
     for (NSArray *e in g_td_list) {
         id<MTLTexture> t = e[0]; uint64_t ser = [e[1] unsignedLongLongValue]; NSUInteger lv = [e[2] unsignedIntegerValue];
         if (t.textureType != MTLTextureType2D) { MLOG("[texdump] ser=%llu 类型 %lu 跳过", ser, (unsigned long)t.textureType); continue; }

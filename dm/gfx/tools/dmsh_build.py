@@ -39,7 +39,9 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 CAS = os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
 PRE_STATS = collections.Counter()
-MAC_RECORD = 'xcrun -sdk macosx metal -c; xcrun -sdk macosx metallib'
+# -fpreserve-invariance：让 MSL 里 [[position, invariant]] 真的生效（Metal 默认 fast-math 下各着色器 fma 合并不同，UE4 深度预通道 + 基础通道 GEQUAL 测试要求裁剪位置逐位相同，否则地板按三角形成块丢失）
+# -fpreserve-invariance: make [[position, invariant]] in the MSL actually take effect (under Metal's default fast-math each shader contracts fma differently; UE4's depth prepass + base pass GEQUAL test needs bit-identical clip positions, otherwise floor triangles drop out in blocks)
+MAC_RECORD = 'xcrun -sdk macosx metal -c -fpreserve-invariance; xcrun -sdk macosx metallib'
 TEX_BASE, SAMP_BASE, IMG_BASE, COMB_BASE = 0x168, 0x568, 0x120, 0x20   # c[2]：图像句柄表 0x120 + 8 r（8 槽，紧接贴图表之前；cs_lut_combine_c 写 u4 = 0x140 反推，u5 = 0x148 核对） | c[2]: image handle table 0x120 + 8 r (8 slots, immediately before the texture table; inferred from cs_lut_combine_c writing u4 = 0x140, checked with u5 = 0x148)
 
 def records(d):
@@ -198,7 +200,7 @@ def fetch_finish(key, src, refl):
                 open(fmsl, 'w').write(fv)
                 fair = fmsl[:-6] + '.air'; flib = os.path.join(out, key + '_bf.metallib')
                 try:
-                    subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', fmsl, '-o', fair], check=True)
+                    subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-fpreserve-invariance', fmsl, '-o', fair], check=True)
                     tmp_flib = flib + '.tmp-' + str(os.getpid())
                     subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', fair, '-o', tmp_flib], check=True)
                     os.replace(tmp_flib, flib)
@@ -611,7 +613,7 @@ def finish(key, w, j, c1):
         fmsl = os.path.join(w, fkey + '.metal'); open(fmsl, 'w').write(patched)
         fair = fmsl[:-6] + '.air'; flib = os.path.join(out, fkey + '_b.metallib')
         try:
-            subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', fmsl, '-o', fair], check=True)
+            subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-fpreserve-invariance', fmsl, '-o', fair], check=True)
             subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', fair, '-o', flib + '.tmp'], check=True); os.replace(flib + '.tmp', flib)
         except subprocess.CalledProcessError as e: return '融合变体 metal 失败', str(e)[:160], None
         clone(fmsl, os.path.join(out, fkey + '_b.metal'))
@@ -627,7 +629,7 @@ def finish(key, w, j, c1):
             frefl['gs_faces'] = 6
         write_refl(fkey, frefl)
     try:
-        subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
+        subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-fpreserve-invariance', msl, '-o', air], check=True)
         tmp_lib = lib + '.tmp-' + str(os.getpid())
         subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', tmp_lib], check=True)
         os.replace(tmp_lib, lib)

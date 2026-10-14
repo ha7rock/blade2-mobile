@@ -130,7 +130,7 @@ tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_bu
 
 ## 五、现状与下一步
 
-**2026-10-14 晚的结果（Mac 宿主，`tools/run_mac.sh`，60 fps）**：标题「Press A to Start」→ 读档确认 → 章节地图 → 关卡选择（蓝底 UI）→ 读取画面 → Act 1「Darkness in Luemos」3D 场景：雾、烛光、锁链、尖塔、目标光环、持剑的主角与敌人武器都按正确的调色 / 曝光画出来；不操作时主角被打死出「Defeat」画面。截图在 `~/blade2-work/run/shot_*.png`。
+**2026-10-15 的结果（Mac 宿主，`tools/run_mac.sh`，60 fps）**：标题 → 读档确认（世界地图底图）→ 章节地图 → 关卡选择（角色立绘、关卡预览图）→ 读取画面 → Act 1「Darkness in Luemos」：带贴图的石板地、木桶、锁链、尖塔，雾、烛光、点光源，主角与敌人的模型、受击特效、受伤红闪，画面与真机一致；不操作时主角被打死出「Defeat」画面。截图在 `~/blade2-work/run/shot_*.png`。
 
 着色器链已通：宿主转储（`DM_NVN_SHDUMP`）→ `dmsh_from_dump.py` 合成包 + 映射表 + 作答表 → `dmsh_build.py`（Ryujinx → spirv-cross → metal）→ 285 个着色器 281 个出库（4 个是立方体阴影的几何着色器，见下）。一轮迭代：`tools/shaders_iterate.sh`。
 
@@ -145,9 +145,12 @@ tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_bu
 | 主角不显示 | 蒙皮顶点着色器从**缓冲贴图**读骨骼矩阵，翻译器离线不知道贴图类型，按 2D 声明 → Metal 读到 0 | 宿主运行时记每个着色器各槽实际绑定的贴图类型（`DM_NVN_TEXFACTS`，缓冲 / 3D / 立方体…），`dmsh_from_dump.py` 合进作答表 `shader_facts.tsv`；翻译器补上合并句柄表的槽号解码 |
 | 顶点 / 片元管线建不出（6652 处插值不匹配） | UE4 顶点 / 片元是分开的程序，翻译器要知道配对 | 宿主记配对（`DM_NVN_PAIRS`，含几何阶段 `2:`），翻译器 `SetNextStage` 并集（Ryujinx 的 `MergeFromtNextStage` 改成按位或） |
 
+| 2D 贴图全黑（读取画面底图、关卡预览、UI 图片），3D 材质平的 | d2r 只把带「打包布局」（`SetPackagedTextureLayout`）的贴图从内存池解排布上传；UE4 按 NVN 默认块线性布局直接 memcpy 进池、不带打包布局，于是采样贴图都建成了空的私有 MTLTexture | `tex_pool_src`：池里有存储、不是显示 / 图像 / 可压缩渲染目标 / 线性渲染目标 / 缓冲贴图的，一律按池内容上传（Blade 实测采样贴图 flags = 0x20 / 0，渲染目标 0x8 / 0xc）；脏页跟踪与重传照旧（一局首传 322 张、重传 8978 次） |
+| 地板成块缺失、带筛孔纹 | UE4 深度预通道 + 基础通道 GEQUAL 深度测试要求两个不同顶点着色器算出**逐位相同**的裁剪位置；Metal 默认 fast-math 下各着色器 fma 合并不同，MSL 的 `[[position, invariant]]` 不加编译选项不生效 | `xcrun metal -fpreserve-invariance`（Mac 与 iOS 两条编译口径都加） |
 | 点光源立方体阴影不画 | 4 个几何着色器把三角形发到 6 个面（`EmitVertex` 18 次，层号 0–5 常量，每面乘 `gp_c3` 第 6+4f 行起的矩阵、`_m0[f].x` 为面开关） | 离线认出这一族（`dmsh_build.py gs_cube`），顶点变体按 `instance_id % 6` 选面与矩阵、输出层号与面号常量；几何阶段 uniform 以 `stage=2` 绑定挂进顶点参数块；宿主把实例数与基实例 ×6（反射 `gs_faces`）。坑：UE4 阴影顶点只写世界坐标 xyz，真机上未写的插值 w 缺省 1 而翻译出的 MSL 清零 → 融合时补 1，否则平移行丢失 |
 
 还没做 / 已知问题：
+0. **偶发 GPU hang**（进关卡时出现过一次 `kIOGPUCommandBufferCallbackErrorHang`，后续帧恢复）；`MemoryPoolMapVirtual` 现已实现映射表但本游戏没用到。
 1. **点光源阴影的画面验证**：Act 1 开头没有带阴影的点光源，只在标题场景（角色近景、无地面）用到；立方体图 6 个面已有几何、比较采样器正确，等遇到有接收面的场景再对比。
 2. **音频**：渲染器事件被游戏销毁（`音频渲染器事件的写端句柄已失效`），且只维持协议不出声。
 3. **TBDR 优化**（写回前瞻 / 读入可省 / 延迟通道）现在全关（`DM_NVN_TBDR=0`），是 D2R 调过的，Blade 上要重新验证后再开；`MemoryPoolMapVirtual` / `Downsample` 仍只报红。
