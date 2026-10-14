@@ -124,17 +124,35 @@ tools/run_mac.sh $O 120        # 日志在 ~/blade2-work/run/log/
 
 ## 五、现状与下一步
 
-已做到：
-- [x] d2r-mobile 方法论拆解（上文）
-- [x] Blade II 全量分析：引擎 / SDK / 导入面 / NVN 调用面 / SVC 面（`docs/`）
-- [x] 改写器扩展，三个模块全部改写成功
-- [x] Mac 宿主编译链接通过（通用部分 + Blade 适配）
-- [ ] 跑通到 `nnMain` → UE4 引擎初始化 → 第一帧（见提交记录里的运行日志）
+**2026-10-14 的结果（Mac 宿主，`tools/run_mac.sh`，无窗口模式 60 秒）**：
+
+```
+nnosInitialize → nninitInitializeSdkModule → nninitStartup → 565 个全局构造函数 → nnMain
+→ UE4 启动：读 UE4CommandLine.txt、枚举并打开两个 .pak、创建 NVN 设备（Metal 设备 Apple M6）、
+  交换链 3 张 1280x720、音频渲染器 32 kHz、起 18 条引擎线程（GameThread / RenderThread / RHIThread /
+  TaskGraph / PoolThread×6 / AudioThread / HttpManager …）
+→ 渲染循环稳定运行：60 秒内提交并出图 900 帧，看门狗到时正常结束，无崩溃
+```
+
+一路上修掉的、对「换一款游戏」有普遍意义的问题（每条都有提交记录）：
+
+| 问题 | 根因 | 处理 |
+|---|---|---|
+| 改写器拒绝 `br x18` / `blr x18` / `ldr x18,=lit` | UE4 / 新 clang 的代码形态 | 三种新改写块（见第三节） |
+| `b` 跳不到补丁区 | 映像 131 MB > ±128 MB | 两遍发射，补丁区放映像前 |
+| `StandardAllocator::Initialize` 中止 | UE4 要 16 GB 虚拟地址区，d2r 的 alias 区只有 512 MB | `DM_ALIAS_GB` 放大（iOS 上要么签扩展虚拟寻址权限，要么剪口改小） |
+| 按真机走普通堆而不是虚拟内存 | Blade 的 npdm `SystemResourceSize = 0` | `DM_SYSRES_MB=0`（d2r 写死 32 MB） |
+| 构造函数里 `FMemory::Free` 空指针崩 | sdk 内 libc++ 的 `basic_string` 走 sdk 自己的 `operator new`，释放却走 UE4 的 Binned 分配器；真机 rtld 是**全局插入**（main 的定义优先） | 装载器改成按装载顺序全局解析符号 |
+| `StandardAllocator::Allocate` 接管崩 | d2r 写死了 `sdk+0x2f9974` | 改按符号名取 |
+| 目录枚举递归到栈溢出 | 我写的 `GetDirectoryEntryCount` 用 telldir/seekdir 搅乱了目录流 | 另开目录流计数 |
+| 图形层第一批调用报未实现 | UE4 的 NVN RHI 用缓冲对象 / 组合贴图句柄 / DrawElements 等 37 个入口 | 全部补上，落在 d2r 的录制 / 回放框架里 |
+| `GetSparseTileLayout` 后 memset 负长度崩 | 仓内 `nvn.h` 把该结构留成 1 字节占位 | 按真实布局 0x1c 字节清零 |
+
+现在日志里剩下的「红」全部是**着色器**：Blade 的 Maxwell 着色器控制段不在 d2r 的映射表里、没有翻译好的 metallib（约 400 处 `加载着色器失败`），所以画面是空的、偶发 GPU 地址错误；另有音频渲染器事件的写端句柄在打开后被游戏销毁（待查，不影响运行）。
 
 接下来按依赖顺序：
-1. **启动链**：按运行日志逐个补 `UNIMPL` / 红报的接口（UE4 的 FSwitchPlatformMisc、文件系统读 pak、线程）。
-2. **图形层补 37 个 NVN 入口**：`nvnBuffer*`（UE4 的顶点 / 索引 / uniform 缓冲对象）、`DrawElements` 系列、`BindTexture/BindVertexBuffer/BindImage`、`SetViewport`、`QueueAcquireTexture`（UE4 自己管 swapchain）、`FenceSync/QueueWaitSync`、`TexturePoolRegisterImage`、`DeviceGetTextureHandle`——都在 d2r 的录制 / 回放框架内，有 Metal 对应物。
-3. **着色器**：Blade 的 Maxwell 着色器在 .pak 里（UE4 4.17 内联在 uasset 里）。最省事的路线是宿主在 Mac 上先跑一次、把 `nvnProgramSetShaders` 收到的控制段 / 数据段全部转储，再用 d2r 的翻译链（Ryujinx 翻译器 → spirv-cross → metal）离线出库；`shader_map.tsv` / `shader_facts.tsv` 要为 Blade 重新生成。
-4. **音频**：把渲染器的 voice / final mix 真混成 PCM 交给 CoreAudio（d2r 的 `hle_audio.c` 已有 AudioOut 到 CoreAudio 的一半）。
-5. **iOS 壳**：`loader.c` 的 iOS 分支支持补丁区在前的布局（`gen_embed.py` 节顺序），触屏层换成通用虚拟手柄（Blade 是动作游戏，用摇杆 + 按键映射到 `nn::hid` 即可，不需要 D2R 那种面板命中层）。
-6. **验证**：`structck.py` 认识 `JA` 行与负偏移补丁区；`equiv.py` 对 `br_abs / blr` 块的处理。
+1. **着色器**：在 Mac 宿主加「转储模式」把 `nvnProgramSetShaders` 收到的每个控制段 / 数据段写盘（约几百个），再用 d2r 的翻译链（Ryujinx 翻译器 → spirv-cross → `xcrun metal`）离线出 metallib，为 Blade 生成自己的 `shader_map.tsv` / `shader_facts.tsv`。做完这一步就能看到画面。
+2. **图形层细节**：`MemoryPoolMapVirtual`（虚拟池，UE4 贴图流送用）、`CommandBufferDownsample`（MSAA 解析）目前只报红；GPU 地址错误要在有着色器后再看。
+3. **音频**：查事件被销毁的原因；把渲染器的 voice / final mix 真混成 PCM 交给 CoreAudio。
+4. **验证**：`structck.py` 认识 `JA` 行与负偏移补丁区；`equiv.py` 对 `br_abs / blr` 块与一种新窗口形态的处理（sdk 已通过：11357 处 0 分歧）。
+5. **iOS 壳**：`loader.c` 的 iOS 分支支持补丁区在前的布局（`gen_embed.py` 节顺序）；16 GB 虚拟地址区在 iOS 上的处理；触屏层换成通用虚拟手柄。
