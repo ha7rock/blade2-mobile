@@ -1,0 +1,5 @@
+# game-derived build outputs never go into the repository
+/out/
+/work/
+*.patched.bin
+*.img
