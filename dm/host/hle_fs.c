@@ -672,6 +672,7 @@ static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     free(resolved); free(rel); free(guest); free(parent); free(all); free(names); free(roots);
 }
 HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → opendir(3)", Result, h_fs_OpenDirectory, uint64_t *out, const char *path, int mode) {
+    if (g_flag.fs) LOG("fs opendir %s mode=%d", path, mode);
     HP(path); DIR *d = opendir(hp);
     if (!d) return err_res("opendir", hp);
     dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
@@ -684,14 +685,16 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
 HLE_FORCE("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", "fsp-srv → 数目录项（不动读取位置）", Result, h_fs_DirCount, int64_t *count, uint64_t hh) {
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0;
     if (h->snap) { for (int64_t i = 0; i < h->nsnap; i++) if (h->mode & (h->snap[i].type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE)) n++; *count = n; return RES_OK; }
-    long pos = telldir(h->d); rewinddir(h->d); struct dirent *e;
-    while ((e = readdir(h->d))) {
+    // 另开一个目录流来数：macOS 的 telldir / rewinddir / seekdir 不能可靠地把原流恢复到原位置（试过：恢复后 readdir 直接到尾，UE4 拿到 0 项后反复重开同一目录直到栈溢出）
+    // Count with a separate directory stream: on macOS telldir / rewinddir / seekdir do not reliably restore the original stream (tried: readdir then hit the end immediately, UE4 got 0 entries and reopened the same directory until the stack overflowed)
+    DIR *d2 = opendir(h->path); if (!d2) return err_res("opendir(count)", h->path); struct dirent *e;
+    while ((e = readdir(d2))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         { size_t dl = strlen(e->d_name); if (dl > 6 && !strcmp(e->d_name + dl - 6, ".holes")) continue; }
         char c[1280]; snprintf(c, sizeof c, "%s/%s", h->path, e->d_name); struct stat st; if (stat(c, &st)) continue;
         if (h->mode & (S_ISDIR(st.st_mode) ? DIRMODE_DIR : DIRMODE_FILE)) n++;
     }
-    seekdir(h->d, pos); *count = n; return RES_OK;
+    closedir(d2); *count = n; if (g_flag.fs) LOG("fs dircount %s → %lld", h->path, (long long)n); return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", "fsp-srv → readdir(3)", Result, h_fs_ReadDirectory, int64_t *count, DirectoryEntry *ents, uint64_t hh, int64_t max) {
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0; struct dirent *e;
@@ -707,7 +710,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
         if (!guest_name(h->path, e->d_name, o->name, sizeof o->name)) { *count = n - 1; return err_res("directory name", c); }
         o->type = isdir ? ENT_DIR : ENT_FILE; o->size = isdir ? 0 : dm_data_logical_size(c, st.st_size);
     }
-    *count = n; return RES_OK;
+    *count = n; if (g_flag.fs) { char nm[256]=""; for (int64_t k = 0; k < n && k < 4; k++) { size_t l = strlen(nm); snprintf(nm + l, sizeof nm - l, " [%d]%s", ents[k].type, ents[k].name); } LOG("fs readdir %s max=%lld → %lld%s", h->path, (long long)max, (long long)n, nm); } return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → closedir(3)", void, h_fs_CloseDirectory, uint64_t hh) {
     dirh_t *h = (dirh_t *)hh; closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);

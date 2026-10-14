@@ -227,7 +227,16 @@ static void relocate(module_t *m) {
             if (type == R_AARCH64_RELATIVE) { *where = (uint64_t)m->base + r->r_addend; cnt[0]++; continue; }
             const Elf64_Sym *s = &m->symtab[si];
             uint64_t v = (uint64_t)force_lookup(m->strtab + s->st_name);
-            if (!v) v = s->st_shndx ? (uint64_t)m->base + s->st_value : resolve_sym(m, m->strtab + s->st_name);
+            // 全局插入（同 Horizon rtld 的 lookup_global：按装载顺序 main → … → sdk 找第一个定义，本模块自己的定义不优先）。
+            // UE4 的 main 定义了全局 operator new / delete 与 malloc / free（FMemory）：sdk 里 libc++ 的 basic_string 等通过 PLT 调 _Znwm，
+            // 真机上解析到 main 的 FMemory::Malloc；若像 d2r 原来那样优先本模块定义，sdk 用 musl malloc 分配、main 用 Binned 释放，启动即崩
+            // （构造函数 main+0x3577d60：拷贝 std::string 后 FMemory::Free，Binned 查不到该块，main+0x11879ac 空指针）。
+            // Global interposition (like Horizon rtld's lookup_global: the first definition in load order main → ... → sdk; the module's own definition is not preferred).
+            // UE4's main defines the global operator new / delete and malloc / free (FMemory): libc++'s basic_string etc. inside the sdk call _Znwm through the PLT,
+            // which on the real device resolves to main's FMemory::Malloc; preferring the module's own definition as d2r did makes the sdk allocate with musl malloc and
+            // main free with Binned, crashing at startup (constructor main+0x3577d60: after copying a std::string, FMemory::Free cannot find the block, null pointer at main+0x11879ac).
+            if (!v) v = resolve_sym(m, m->strtab + s->st_name);
+            if (!v && s->st_shndx) v = (uint64_t)m->base + s->st_value;
             if (type == R_AARCH64_JUMP_SLOT) { *where = v; cnt[2]++; }
             else { *where = v + r->r_addend; cnt[1]++; }       // ABS64 / GLOB_DAT
         }

@@ -248,7 +248,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_UsedMem:  case I_UsedNonSys:  v = g_heap_cur + image_bytes(); break;   // 已用 = 堆 + 映像，与 SetHeapSize 的核对同一口径（原先写死 64 MB）。sdk 的 QueryMemoryInfo（sdk+0x34f4ec）只拿它算「程序占用」那一格； | Used = heap + image, the same accounting as the check in SetHeapSize (it used to be hard-coded to 64 MB). The sdk's QueryMemoryInfo (sdk+0x34f4ec) only uses it to compute the "program usage" field;
                                                  // 「可用总量」那一格直接是池总量，所以游戏启动设堆仍要从整池起按 2 MB 往下减到 池 − 映像（约 34 次被拒）——这是原版在真机上的走法，不是我们的口径错
                                                  // The "total available" field is simply the pool total, so at startup the game still has to step down from the whole pool by 2 MB at a time until pool - image (about 34 refusals) when setting its heap -- this is how the original behaves on the real device, not a mistake in our accounting
-        case I_SysResTotal: v = 0x2000000; break; case I_SysResUsed: v = 0x400000; break;
+        // 系统资源大小（npdm SystemResourceSize）：非 0 时 SDK 认为「虚拟地址内存」可用。暗黑的 npdm 有 32 MB；Blade II 的 npdm 是 0——
+        // 真机上它走的是 SetMemoryHeapSize + AllocateMemoryBlock 的普通堆路线，这里报 0 才与真机一致（DM_SYSRES_MB 可改；缺省 32 = d2r）
+        // System resource size (npdm SystemResourceSize): non-zero makes the SDK consider "virtual address memory" available. Diablo's npdm has 32 MB; Blade II's npdm has 0 --
+        // on the real device it takes the plain heap route (SetMemoryHeapSize + AllocateMemoryBlock), so reporting 0 matches the real device (DM_SYSRES_MB adjustable; default 32 = d2r)
+        case I_SysResTotal: { static long mb = -1; if (mb < 0) { const char *e = getenv("DM_SYSRES_MB"); mb = e ? atol(e) : 32; } v = (uint64_t)mb << 20; break; }
+        case I_SysResUsed: v = 0x400000; break;
         case I_DebuggerAttached: v = 0; break;
         case I_RandomEntropy: { uint64_t dm_entropy64(void); v = dm_entropy64(); break; }   // DM_DETCLOCK 开时为确定流（hle_os.c） | a deterministic stream when DM_DETCLOCK is on (hle_os.c)
         case I_ProgramId: v = 0x0100726014352000ull; break;
