@@ -118,23 +118,41 @@ for m in sdk subsdk0 main; do ~/blade2-work/venv/bin/python3 dm/tools/patch_nso.
 # 3. Mac 宿主
 make -C dm/host -f Makefile.blade
 tools/run_mac.sh $O 120        # 日志在 ~/blade2-work/run/log/
+
+# 4. 着色器（反复几轮直到没有「不在映射表里」）：带转储 / 配对 / 贴图类型记录跑一遍，再出包重编
+W=~/blade2-work
+tools/run_mac.sh $O 100 DM_PRESENT_LINK=0 DM_MSL_DIR=$W/build/cache/metal_shader_cache DM_NVN_SHDUMP=$W/shdump \
+  DM_PSO_MANIFEST=off DM_NVN_TBDR=0 DM_KEYS="A@6,A@10,A@14,A@18,A@24,A@30,A@36,A@55" DM_NVN_SHOT=3000:$W/run/shot_%d.png
+tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_build → 重编宿主
 ```
 
 ---
 
 ## 五、现状与下一步
 
-**2026-10-14 的结果（Mac 宿主，`tools/run_mac.sh`，无窗口模式 60 秒）**：
+**2026-10-14 晚的结果（Mac 宿主，`tools/run_mac.sh`，60 fps）**：标题「Press A to Start」→ 读档确认 → 章节地图 → 关卡选择（蓝底 UI）→ 读取画面 → Act 1「Darkness in Luemos」3D 场景：雾、烛光、锁链、尖塔、目标光环、持剑的主角与敌人武器都按正确的调色 / 曝光画出来；不操作时主角被打死出「Defeat」画面。截图在 `~/blade2-work/run/shot_*.png`。
 
-```
-nnosInitialize → nninitInitializeSdkModule → nninitStartup → 565 个全局构造函数 → nnMain
-→ UE4 启动：读 UE4CommandLine.txt、枚举并打开两个 .pak、创建 NVN 设备（Metal 设备 Apple M6）、
-  交换链 3 张 1280x720、音频渲染器 32 kHz、起 18 条引擎线程（GameThread / RenderThread / RHIThread /
-  TaskGraph / PoolThread×6 / AudioThread / HttpManager …）
-→ 渲染循环稳定运行：60 秒内提交并出图 900 帧，看门狗到时正常结束，无崩溃
-```
+着色器链已通：宿主转储（`DM_NVN_SHDUMP`）→ `dmsh_from_dump.py` 合成包 + 映射表 + 作答表 → `dmsh_build.py`（Ryujinx → spirv-cross → metal）→ 285 个着色器 281 个出库（4 个是立方体阴影的几何着色器，见下）。一轮迭代：`tools/shaders_iterate.sh`。
 
-一路上修掉的、对「换一款游戏」有普遍意义的问题（每条都有提交记录）：
+画面之前「跑不出来」的根因（每条都有提交记录）：
+
+| 问题 | 根因 | 处理 |
+|---|---|---|
+| 读取画面永远不结束 | 关卡加载关闭 UE4 视频播放器 → 对**从未打开**的 NVN 解码器调 Stop → 对未初始化的事件上内部锁，GameThread 死等 | 产品剪口：`0x3411998` 跳过 Stop |
+| 进关卡崩在 `0x3a2de34` | 播放器关闭时遍历轨道「取消选轨」，流对象在宿主下恒空 | 产品剪口：`0x3a2aa70` 跳过轨道遍历 |
+| 整帧稳定 200 ms | macOS **App Nap**：窗口不在前台时把进程定时器合并，`SleepThread(10 ms)` 要 200 ms 才醒 | `NSProcessInfo beginActivity`（LatencyCritical）退出 App Nap |
+| 画面全蓝 / 全黑、光照像没有 | UE4 的 32³ 调色 LUT 与 64³ 半透明光照体用**几何着色器**写 `gl_Layer`；Metal 没有几何着色器，所有层都画进第 0 层，LUT 只有一层 → 色调映射后几乎全黑 | 离线把「直通 + 写层号」几何着色器翻成 GLSL 认出层号来源，融进配对顶点着色器（`<顶点键>+<几何键>_b` 变体，输出 `[[render_target_array_index]]`）；宿主按 `renderTargetArrayLength` 整体挂 3D 目标、管线带 `inputPrimitiveTopology`、去掉 `[[point_size]]` |
+| 主角不显示 | 蒙皮顶点着色器从**缓冲贴图**读骨骼矩阵，翻译器离线不知道贴图类型，按 2D 声明 → Metal 读到 0 | 宿主运行时记每个着色器各槽实际绑定的贴图类型（`DM_NVN_TEXFACTS`，缓冲 / 3D / 立方体…），`dmsh_from_dump.py` 合进作答表 `shader_facts.tsv`；翻译器补上合并句柄表的槽号解码 |
+| 顶点 / 片元管线建不出（6652 处插值不匹配） | UE4 顶点 / 片元是分开的程序，翻译器要知道配对 | 宿主记配对（`DM_NVN_PAIRS`，含几何阶段 `2:`），翻译器 `SetNextStage` 并集（Ryujinx 的 `MergeFromtNextStage` 改成按位或） |
+
+还没做 / 已知问题：
+1. **点光源立方体阴影**：4 个几何着色器把三角形发到 6 个面（`EmitVertex` 18 次，层号 0–5 常量），不是直通，现在不画 → 点光源无阴影。做法：实例化 ×6 模拟，顶点变体按 `instance_id % 6` 选面与矩阵。
+2. **音频**：渲染器事件被游戏销毁（`音频渲染器事件的写端句柄已失效`），且只维持协议不出声。
+3. **TBDR 优化**（写回前瞻 / 读入可省 / 延迟通道）现在全关（`DM_NVN_TBDR=0`），是 D2R 调过的，Blade 上要重新验证后再开；`MemoryPoolMapVirtual` / `Downsample` 仍只报红。
+4. **iOS 壳**：补丁区在前的布局、16 GB 虚拟地址区、通用虚拟手柄。
+5. **验证工具**：`structck.py` / `equiv.py` 认识 `JA` 行、负偏移补丁区与新改写块。
+
+**此前（同日白天）的结果**：引擎循环先跑起来（900 帧 / 60 秒，画面空）时修掉的通用问题：
 
 | 问题 | 根因 | 处理 |
 |---|---|---|
@@ -147,12 +165,4 @@ nnosInitialize → nninitInitializeSdkModule → nninitStartup → 565 个全局
 | 目录枚举递归到栈溢出 | 我写的 `GetDirectoryEntryCount` 用 telldir/seekdir 搅乱了目录流 | 另开目录流计数 |
 | 图形层第一批调用报未实现 | UE4 的 NVN RHI 用缓冲对象 / 组合贴图句柄 / DrawElements 等 37 个入口 | 全部补上，落在 d2r 的录制 / 回放框架里 |
 | `GetSparseTileLayout` 后 memset 负长度崩 | 仓内 `nvn.h` 把该结构留成 1 字节占位 | 按真实布局 0x1c 字节清零 |
-
-现在日志里剩下的「红」全部是**着色器**：Blade 的 Maxwell 着色器控制段不在 d2r 的映射表里、没有翻译好的 metallib（约 400 处 `加载着色器失败`），所以画面是空的、偶发 GPU 地址错误；另有音频渲染器事件的写端句柄在打开后被游戏销毁（待查，不影响运行）。
-
-接下来按依赖顺序：
-1. **着色器**：在 Mac 宿主加「转储模式」把 `nvnProgramSetShaders` 收到的每个控制段 / 数据段写盘（约几百个），再用 d2r 的翻译链（Ryujinx 翻译器 → spirv-cross → `xcrun metal`）离线出 metallib，为 Blade 生成自己的 `shader_map.tsv` / `shader_facts.tsv`。做完这一步就能看到画面。
-2. **图形层细节**：`MemoryPoolMapVirtual`（虚拟池，UE4 贴图流送用）、`CommandBufferDownsample`（MSAA 解析）目前只报红；GPU 地址错误要在有着色器后再看。
-3. **音频**：查事件被销毁的原因；把渲染器的 voice / final mix 真混成 PCM 交给 CoreAudio。
-4. **验证**：`structck.py` 认识 `JA` 行与负偏移补丁区；`equiv.py` 对 `br_abs / blr` 块与一种新窗口形态的处理（sdk 已通过：11357 处 0 分歧）。
-5. **iOS 壳**：`loader.c` 的 iOS 分支支持补丁区在前的布局（`gen_embed.py` 节顺序）；16 GB 虚拟地址区在 iOS 上的处理；触屏层换成通用虚拟手柄。
+| 开场视频 Tick 空指针 | movie 库在宿主下只空播，RHI 流对象从未建立 | 产品剪口：`0x3a29e40 → ret` |
