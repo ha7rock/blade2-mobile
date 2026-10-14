@@ -111,8 +111,16 @@ void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 // The original game's 16:9 constants, behavior unchanged; DM_GAME_RES=<width>x<height> (docked mode; handheld scaled by 720/900) is only for side-by-side comparison with iOS widescreen
 uint64_t front_game_res(int docked) {
     unsigned w, h; const char *e = getenv("DM_GAME_RES");
+#if DM_GENERIC_HOST
+    // 通用宿主：1600×900 / 1280×720 是暗黑的主机 / 掌机常数；别的游戏两种模式都按 1280×720 出（Blade 只渲 1280×720），DM_GAME_RES=宽x高 对两种模式同值
+    // Generic host: 1600×900 / 1280×720 are Diablo's docked / handheld constants; another game gets 1280×720 in both modes (Blade only renders 1280×720), DM_GAME_RES=<width>x<height> applies the same value to both modes
+    (void)docked;
+    if (e && sscanf(e, "%ux%u", &w, &h) == 2) return (uint64_t)h << 32 | w;
+    return 720ull << 32 | 1280;
+#else
     if (e && sscanf(e, "%ux%u", &w, &h) == 2) return docked ? (uint64_t)h << 32 | w : (uint64_t)(h * 4 / 5) << 32 | (w * 4 / 5 + 3) / 4 * 4;
     return docked ? 900ull << 32 | 1600 : 720ull << 32 | 1280;
+#endif
 }
 
 static NSPoint g_test_last;   // 合成鼠标脚本：上一条带坐标的指令落在视图里的点（dragto 从这里起拖） | synthetic mouse script: the point in the view where the last instruction with coordinates landed (dragto starts dragging from here)

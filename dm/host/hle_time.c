@@ -34,13 +34,21 @@ HLE_FORCE("time", "按返回点认出建局种子那一处（DM_FIXED_TIME）；
         module_t *ms = NULL, *mm = NULL;
         for (int i = 0; i < g_nmod; i++) { if (!strcmp(g_mod[i].name, "sdk")) ms = &g_mod[i]; if (!strcmp(g_mod[i].name, "main")) mm = &g_mod[i]; }
         void *f = ms ? module_sym(ms, "time") : NULL; if (!f) die("SDK 里找不到 time");
+#if DM_GENERIC_HOST
+        // 建局种子那一处是暗黑 main 里的固定返回点，别的游戏不认任何返回点：DM_FIXED_TIME 只固定用户时钟；要固定某处 time() 由 DM_FIXED_TIME_SITE=<main 偏移（bl 的下一条）> 指定
+        // The game-creation seed site is a fixed return point in Diablo's main; for another game no return point is matched: DM_FIXED_TIME only fixes the user clock; to fix one time() call give its site with DM_FIXED_TIME_SITE=<offset in main (the instruction after the bl)>
+        uint32_t w = 0; const char *site = getenv("DM_FIXED_TIME_SITE"); uint64_t so = site ? strtoull(site, 0, 0) : 0;
+        if (mm && so >= 4 && so < mm->size) { w = *(uint32_t *)(mm->base + so - 4); if ((w & 0xfc000000) == 0x94000000) seed_ret = (uint64_t)mm->base + so; else LOG("【红】DM_FIXED_TIME_SITE=%#llx：main+%#llx 不是 bl（%#x），不固定", (unsigned long long)so, (unsigned long long)(so - 4), w); }
+        (void)w;
+#else
         uint32_t w = mm ? *(uint32_t *)(mm->base + 0x3509a0) : 0;
         if ((w & 0xfc000000) == 0x94000000) seed_ret = (uint64_t)mm->base + 0x3509a4;               // bl time（构建 db0507f3…；改写器会改跳转目标，只认 bl 本身） | bl time (build db0507f3…; the rewriter changes the branch target, so only the bl itself is matched)
         else if (fixed_time() >= 0) LOG("【红】DM_FIXED_TIME：main 0x3509a0 不是预期的 bl time（%#x），建局 time() 未固定", w);
+#endif
         sdk_time = (int64_t (*)(int64_t *))f;
     }
     int64_t ft = fixed_time();
-    if (ft >= 0 && lr == seed_ret) {
+    if (ft >= 0 && seed_ret && lr == seed_ret) {
         static int once; if (!once++) LOG("DM_FIXED_TIME：建局 time() 返回 %lld", (long long)ft);
         if (t) *t = ft; return ft;
     }

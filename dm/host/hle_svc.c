@@ -11,6 +11,9 @@
 #include <unistd.h>
 #include <sched.h>
 #include <time.h>
+#ifndef DM_PROGRAM_ID
+#define DM_PROGRAM_ID 0x0100726014352000ull   // 暗黑 3.3.94012 的 title id | title id of Diablo 3.3.94012
+#endif
 
 // 预留一整块客体地址空间，按 Horizon 分区（地址值直接用宿主 mmap 得到的真地址）。只占地址、不占内存。
 // 大小 5 GB：游戏要的是开头 1 GB（别名区、栈）+ 一整块堆（应用内存池 3285 MiB，见下面 APP_POOL），合计约 4.2 GB；
@@ -256,7 +259,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_SysResUsed: v = 0x400000; break;
         case I_DebuggerAttached: v = 0; break;
         case I_RandomEntropy: { uint64_t dm_entropy64(void); v = dm_entropy64(); break; }   // DM_DETCLOCK 开时为确定流（hle_os.c） | a deterministic stream when DM_DETCLOCK is on (hle_os.c)
-        case I_ProgramId: v = 0x0100726014352000ull; break;
+        case I_ProgramId: v = DM_PROGRAM_ID; break;   // 本游戏的 title id（缺省暗黑；别的游戏由 Makefile -DDM_PROGRAM_ID=… 给） | this game's title id (default Diablo; another game's Makefile supplies -DDM_PROGRAM_ID=…)
         case I_IsApplication: v = 1; break;
         case I_UserExcAddr: v = 0; break;
         default: v = 0; break;

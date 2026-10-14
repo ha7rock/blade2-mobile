@@ -10,9 +10,12 @@ void probe_install(void); void ticks_install(void); void hid_keys_init(void); vo
 typedef void (*fn0)(void); typedef void (*fn2)(uint64_t, uint64_t); typedef void (*fnp)(void *);
 static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("缺符号 %s", n); return p; }
 
-// 游戏参数：argv[0] 固定为 "D2R"，"--" 之后的原样追加（真机由 nn::init 从进程参数区取，经 SetHostArgc/Argv 交给 SDK）
-// Game arguments: argv[0] is fixed to "D2R", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
-static char *g_argv[64] = {"D2R"}; static int g_argc = 1;
+// 游戏参数：argv[0] 固定为产品名（缺省 "D2R"，别的游戏由 Makefile 以 -DDM_ARGV0='"..."' 给），"--" 之后的原样追加（真机由 nn::init 从进程参数区取，经 SetHostArgc/Argv 交给 SDK）
+// Game arguments: argv[0] is fixed to the product name (default "D2R"; another game's Makefile supplies it with -DDM_ARGV0='"..."'), and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
+#ifndef DM_ARGV0
+#define DM_ARGV0 "D2R"
+#endif
+static char *g_argv[64] = {DM_ARGV0}; static int g_argc = 1;
 
 void crash_sample_self(void);
 // 存档落盘节流：游戏把脏了的存档容器写盘并提交的「非强制刷新」每拍调一次（main+0x2497ac → main+0xdff8a4，强制 = 0），
@@ -24,6 +27,9 @@ void crash_sample_self(void);
 // so a newly created character is first committed only after about 30 seconds, and if the process is ended before that (being reclaimed by the system after switching away is normal on a phone) the character is gone. Changed to 3 seconds.
 // Only non-forced writes are affected (new character, key bindings, rename); in-run character saves, settings etc. are forced writes anyway and do not go through the throttle. DM_SAVE_THROTTLE=seconds can change it (30 = the original game).
 static void save_throttle_patch(void) {
+#if DM_GENERIC_HOST
+    return;   // 常数地址是暗黑 main 里的固定偏移，别的游戏没有这一处（也就没有「原值 ≠ 30」的红） | the constant's address is a fixed offset in Diablo's main; another game has no such site (and so no "original value ≠ 30" red)
+#endif
     const char *v = getenv("DM_SAVE_THROTTLE"); int sec = v ? atoi(v) : 3;
     module_t *m = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
@@ -43,6 +49,9 @@ static void save_throttle_patch(void) {
 static void game_seed_maybe(void) {
     const char *v = getenv("DM_GAME_SEED");
     if (!v) return;
+#if DM_GENERIC_HOST
+    LOG("DM_GAME_SEED=%s：固定种子开关是暗黑 main 里的固定偏移，别的游戏没有，忽略", v); return;   // the fixed-seed switch is a fixed offset in Diablo's main; another game has none, ignored
+#endif
     module_t *m = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
     if (!m) die("DM_GAME_SEED：没有 main 模块");

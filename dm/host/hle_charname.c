@@ -25,6 +25,9 @@ static uintptr_t main_base(void) {
 
 HLE_FORCE("isalpha", "离线角色名放行非 ASCII：只对角色名三处校验里的调用把 ≥0x80 的字节当字母，其余同 SDK 原实现", int, h_isalpha, int c) {
     if ((unsigned)((c | 0x20) - 'a') < 26) return 1;
+#if DM_GENERIC_HOST
+    return 0;   // 返回点区间是暗黑 main 里的固定偏移，别的游戏只按 ASCII 判 | the return-point ranges are fixed offsets in Diablo's main; another game judges ASCII only
+#endif
     if (c >= 0x80 || c < 0) {
         uintptr_t off = (uintptr_t)__builtin_return_address(0) - main_base();
         if ((off >= 0x7fe8a8 && off < 0x7feeec) || (off >= 0x807fd8 && off < 0x809d60) ||
@@ -38,6 +41,9 @@ HLE_FORCE("isalpha", "离线角色名放行非 ASCII：只对角色名三处校�
 // The filter in the keyboard request (from main+0x3213dd8) is a function object with a tag bit: value 1 = empty (no filtering); otherwise it is an inline / heap callable object,
 // and when inline the word right after it is the wrapped function pointer. Clear it only when what it wraps is exactly the naming filter function main+0xe09190; returns 1 = cleared
 int dm_charname_unfilter(void) {
+#if DM_GENERIC_HOST
+    return 0;   // 过滤器对象 / 起名过滤函数是暗黑 main 里的固定偏移 | the filter object / naming filter function are fixed offsets in Diablo's main
+#endif
     uintptr_t b = main_base(); if (!b) return 0;
     uint64_t *fn = (uint64_t *)(b + 0x3213dd8);
     if (fn[0] == 1 || fn[1] != b + 0xe09190) return 0;
