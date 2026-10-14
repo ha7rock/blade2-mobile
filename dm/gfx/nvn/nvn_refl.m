@@ -62,6 +62,7 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             o->v[o->nv].ct = [t hasPrefix:@"uint"] ? NVN_CT_UINT : [t hasPrefix:@"int"] ? NVN_CT_INT : NVN_CT_FLOAT;
             o->nv++;
         }
+        o->writes_layer = [j[@"writes_layer"] intValue] != 0;
         NSDictionary *ra = j[@"raster"];
         o->pos_attr = -1; o->may_discard = 1; o->writes_smask = 1;
         if ([ra isKindOfClass:[NSDictionary class]]) {

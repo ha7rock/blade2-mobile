@@ -441,7 +441,19 @@ void svc_thread_dump(void) {
     }
 }
 
+// DM_SLOW_SVC=<毫秒>：任一 svc（睡眠 / 等待）耗时超过阈值就记一行（线程、svc 号、耗时、调用点）——找「每帧固定卡 N 毫秒」的来源用
+// DM_SLOW_SVC=<ms>: log one line (thread, svc number, elapsed, call site) whenever any svc (sleep / wait) takes longer than the threshold -- for finding the source of "every frame stalls N ms"
+static int svc_thread_inner(int num, uint64_t *regs);
 int svc_thread(int num, uint64_t *regs) {
+    static int64_t thr_ns = -1;
+    if (thr_ns < 0) { const char *e = getenv("DM_SLOW_SVC"); thr_ns = e ? (int64_t)(atof(e) * 1e6) : 0; }
+    if (!thr_ns) return svc_thread_inner(num, regs);
+    uint64_t t0 = now_ns(), lr = regs[30], x0 = regs[0]; int r = svc_thread_inner(num, regs); uint64_t d = now_ns() - t0;
+    if ((int64_t)d >= thr_ns) { thr_t *me = pthread_getspecific(g_keythr); module_t *m = module_of((void *)lr);
+        static int n; if (n++ < 5000) LOG("[慢svc] 线程 %#x svc %#x x0=%#llx 耗时 %.1f ms lr=%s+%#llx", me ? me->handle : 0, num, (unsigned long long)x0, d / 1e6, m ? m->name : "?", m ? lr - (uint64_t)m->base : lr); }
+    return r;
+}
+static int svc_thread_inner(int num, uint64_t *regs) {
     { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; } }
     if (g_flag.thr && num != 0x0B) { thr_t *me = pthread_getspecific(g_keythr); LOG("[%#x] svc %#x x0=%#llx x1=%#llx x2=%#llx x3=%#llx", me ? me->handle : 0, num, regs[0], regs[1], regs[2], regs[3]); }
     switch (num) {

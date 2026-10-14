@@ -93,6 +93,12 @@ static class SwshXlate
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }
         public bool QueryHostSupportsTextureShadowLod() => true;
+        // 顶点阶段直接写 gl_Layer / gl_ViewportIndex（Metal：顶点函数输出 [[render_target_array_index]] / [[viewport_array_index]]）。
+        // 缺省 false 时 Ryujinx 把顶点写的层号降成普通插值输出（等几何着色器转发），分层目标（UE4 的 32³ 调色 LUT、64³ 半透明光照体）全画进第 0 层
+        // The vertex stage writes gl_Layer / gl_ViewportIndex directly (Metal: vertex function outputs [[render_target_array_index]] / [[viewport_array_index]]).
+        // With the default false, Ryujinx demotes the layer written by the vertex shader to an ordinary interpolant (waiting for a geometry shader to forward it), and layered targets (UE4's 32³ color LUT, 64³ translucency lighting volumes) all land in layer 0
+        public bool QueryHostSupportsLayerVertexTessellation() => true;
+        public bool QueryHostSupportsViewportIndexVertexTessellation() => true;
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
@@ -120,6 +126,17 @@ static class SwshXlate
                 // Job debug = false: turn off DebugMode (DebugMode skips the AST optimizer and the output is full of temporaries; semantics unchanged)
                 var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
+                // 配对翻译（UE4：顶点 / 片元是分开的程序）："next" = 与本顶点着色器配过对的片元着色器作业列表；逐个 SetNextStage，
+                // 顶点阶段按片元读到的插值输出补写（Metal 建管线要求片元的每个 user(locnN) 输入都由顶点写出）
+                // Paired translation (UE4: vertex / fragment are separate programs): "next" = the list of fragment shader jobs this vertex shader was paired with;
+                // SetNextStage for each, so the vertex stage writes every interpolant the fragment reads (Metal requires every fragment user(locnN) input to be written by the vertex shader)
+                if (job["next"] is JsonArray nexts)
+                    foreach (JsonObject nj in nexts)
+                    {
+                        var nacc = new Accessor(File.ReadAllBytes((string)nj["code"]), nj);
+                        var nctx = Translator.CreateContext(0, nacc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags & ~TranslationFlags.Compute));
+                        ctx.SetNextStage(nctx);
+                    }
                 ShaderProgram p = ctx.Translate();
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), p.BinaryCode);
                 var res = new JsonObject

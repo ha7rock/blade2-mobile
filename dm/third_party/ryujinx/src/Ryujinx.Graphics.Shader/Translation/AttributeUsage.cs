@@ -55,8 +55,11 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         public void MergeFromtNextStage(bool gpPassthrough, bool nextUsesFixedFunctionAttributes, AttributeUsage nextStage)
         {
-            NextInputAttributesComponents = nextStage.ThisInputAttributesComponents;
-            NextUsedInputAttributesPerPatch = nextStage.UsedInputAttributesPerPatch;
+            // dm: a vertex shader may be paired with several fragment shaders (UE4 builds separate per-stage programs);
+            // SetNextStage is then called once per partner, so union the next-stage inputs instead of overwriting them
+            NextInputAttributesComponents |= nextStage.ThisInputAttributesComponents;
+            if (NextUsedInputAttributesPerPatch == null) NextUsedInputAttributesPerPatch = new HashSet<int>(nextStage.UsedInputAttributesPerPatch);
+            else NextUsedInputAttributesPerPatch.UnionWith(nextStage.UsedInputAttributesPerPatch);
             NextUsesFixedFuncAttributes = nextUsesFixedFunctionAttributes;
             MergeOutputUserAttributes(gpPassthrough, nextStage.UsedInputAttributes, nextStage.UsedInputAttributesPerPatch);
 

@@ -67,4 +67,4 @@ def vs_inputs(code):
 def sph_stage(code):
     """图形着色器 SPH 头的阶段字段（第 0 字 bits 10..13）：1 顶点、5 像素 | Stage field of the graphics shader SPH header (word 0, bits 10..13): 1 vertex, 5 pixel"""
     if code[:4] != bytes.fromhex('78563412'): return None
-    return {1: 'vs', 5: 'ps'}.get((struct.unpack_from('<I', code, 0x30)[0] >> 10) & 0xf)
+    return {1: 'vs', 4: 'gs', 5: 'ps'}.get((struct.unpack_from('<I', code, 0x30)[0] >> 10) & 0xf)   # 4 几何（Metal 无几何着色器：只作离线分析，见 dmsh_build.py gs_layer） | 4 geometry (Metal has no geometry shaders: offline analysis only, see dmsh_build.py gs_layer)

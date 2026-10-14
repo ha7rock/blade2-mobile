@@ -31,6 +31,7 @@ typedef struct {
     uint8_t route_b, has_c1; // B 路线；有 c1 常数段 | Route B; has a c1 constant segment
     uint8_t drv_read[3];     // B：运行时读驱动段 c0 / c2（下标 0、2；出包时由 MSL 静态统计，tools/dmsh_build.py drv_reads） | B: reads driver segments c0 / c2 at runtime (indices 0, 2; gathered statically from the MSL at packaging time, tools/dmsh_build.py drv_reads)
     uint16_t c1_len;         // c1 常数段长度（B；全库 0 / 256 / 512 / 768） | Length of the c1 constant segment (B; 0 / 256 / 512 / 768 across the whole library)
+    uint8_t writes_layer;    // 顶点阶段写层号 [[render_target_array_index]]（分层目标；dmsh_build.py writes_layer） | Vertex stage writes the layer index [[render_target_array_index]] (layered targets; dmsh_build.py writes_layer)
     // 全覆盖首绘证明用（dmsh_build.py raster_facts；缺字段 = 不可证）：顶点——位置 xyz 原样取自属性 pos_attr（-1 = 否），w 为常数 1（pos_w1）或取同属性 .w；
     // 片元——可能丢弃、写 sample_mask、写出的颜色号位图
     // For the fully-covering-first-draw proof (dmsh_build.py raster_facts; missing field = not provable): vertex - position xyz taken as-is from attribute pos_attr (-1 = no), w is the constant 1 (pos_w1) or taken from the same attribute's .w;

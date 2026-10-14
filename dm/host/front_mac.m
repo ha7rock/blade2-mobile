@@ -155,6 +155,11 @@ void front_run(void (*guest)(void)) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        // 退出 App Nap：窗口不在前台、没有用户输入时 macOS 会把进程的定时器合并到几百毫秒一拍——实测 Blade 的游戏线程 SleepThread(10 ms) 要 200 ms 才醒，整帧 p50 200 ms。
+        // 游戏是延迟敏感的用户发起活动（与 Switch 上永远前台一致），持有到进程退出
+        // Opt out of App Nap: when the window is not frontmost and there is no user input, macOS coalesces the process's timers to a few hundred ms -- measured on Blade: the game thread's SleepThread(10 ms) took 200 ms to wake, whole-frame p50 200 ms.
+        // The game is a latency-sensitive user-initiated activity (consistent with always being in the foreground on the Switch), held until the process exits
+        static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical) reason:@"game loop"];
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable

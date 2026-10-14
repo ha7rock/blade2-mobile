@@ -1471,6 +1471,12 @@ static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw
 static id<MTLRenderPipelineState> g_enc_pso; static id<MTLDepthStencilState> g_enc_dss;   // 本编码器上已设的（相同不重设） | Already set on this encoder (not set again if identical)
 static int g_enc_vis, g_enc_has_vis;   // 本编码器当前的可见性计数模式（0 关 / 槽号 + 1）、是否挂了可见性缓冲 | This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // 回放中改了管线 / 深度模板相关状态 | Pipeline / depth-stencil related state was changed during replay
+// 分层渲染（Blade / UE4：顶点阶段写 [[render_target_array_index]]，3D / 数组贴图整体作目标：32³ 调色 LUT、64³ 半透明光照体）：
+// 当前绘制的图元类别（1 点 2 线 3 三角），只进顶点写层号的程序的管线键（inputPrimitiveTopology 是分层渲染的管线要求）；其余程序不受影响
+// Layered rendering (Blade / UE4: the vertex stage writes [[render_target_array_index]], a whole 3D / array texture is the target: 32³ color LUT, 64³ translucency lighting volumes):
+// primitive class of the current draw (1 point 2 line 3 triangle), entering the pipeline key only for programs whose vertex stage writes the layer (inputPrimitiveTopology is a pipeline requirement of layered rendering); other programs are unaffected
+static int g_cur_topo;
+static int prim_topo(int prim) { return prim == 0 ? 1 : prim == 1 || prim == 2 || prim == 3 ? 2 : 3; }
 static uint64_t g_stat_args_enc, g_stat_args_reuse;   // 参数缓冲：新编 / 复用次数 | Argument buffer: new-encode / reuse counts
 static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // 带宽账：附件读入 / 写出字节、全量读写通道数 | Bandwidth ledger: attachment load / store bytes, number of full load-store passes
 // DM_NVN_PASSDUMP：逐条记通道附件 / 采样 / 出图（贴图按序号），供离线做数据流分析；P / D / R / S 行的通道号一致（= 开通道后的 g_stat_pass）
@@ -1839,6 +1845,7 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
 // clear_only: a pass opened only to land pending clears, attaching only the attachments that have clears - the other attachments are not touched by this pass, and attaching them costs a pointless load and store on TBDR
 // (Mac character select screen: the color-clear pass drags along a 400x225 depth load and store)
 static RENC rp_begin_ex(int clear_only);
+static NSUInteger layered_len(RPD *pd);   // 分层目标的层数（0 / 1 = 不分层）；定义在 prog_get 之后 | Layer count of a layered target (0 / 1 = not layered); defined after prog_get
 static RENC rp_begin(void) { return rp_begin_ex(0); }
 static RENC rp_begin_ex(int clear_only) {
     if (g_enc) return g_enc;
@@ -1902,6 +1909,11 @@ static RENC rp_begin_ex(int clear_only) {
         }
     }
     if (!any) { RED_ONCE(4, "渲染目标都建不出 MTLTexture"); return nil; }
+    // 分层渲染：首绘程序的顶点阶段写层号时，没按视图选定单层的 3D / 数组附件整体挂上（renderTargetArrayLength = 各附件层数的最小值；
+    // 任一附件是普通 2D 贴图则不分层）。顶点不写层号的通道照旧挂第 0 层 / 视图选的那一层
+    // Layered rendering: when the vertex stage of the first draw's program writes the layer index, 3D / array attachments that the view did not pin to one layer are attached whole
+    // (renderTargetArrayLength = minimum layer count over the attachments; any plain 2D attachment disables layering). Passes whose vertex stage does not write the layer keep attaching layer 0 / the view's layer
+    { NSUInteger len = layered_len(pd); if (len > 1) { pd.renderTargetArrayLength = len; PD("L %llu 分层目标 %lu 层", g_stat_pass + 1, (unsigned long)len); } }
     for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i] && zskip_zero_clear(i)) {
         g_zskip_cand_ok[i] = 1; g_zskip_cand[i] = (zskip_zero){R.rt.color[i]->serial, (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].set_levels ? R.rt.cview[i].base_level : 0), (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].set_layers ? R.rt.cview[i].min_layer : 0)};
     }
@@ -2055,7 +2067,7 @@ static void shmap_load(void) {
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; } @end   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 #include "nvn_pso_skey.h"
-@interface NvProg : NSObject { @public NvShader *sh[6]; } @end
+@interface NvProg : NSObject { @public NvShader *sh[6]; char gskey[24]; } @end   // gskey：绑了几何着色器时的键（不加载，见 prog_get） | gskey: key of the bound geometry shader (not loaded, see prog_get)
 @implementation NvProg @end
 // 预热项：后台建好、等提交线程领用。vs / fs 强引用（pso 里只是裸指针，后台字典随任务结束释放）
 // Warm-up entry: built in the background, waiting to be taken by the submit thread. vs / fs are strong references (in pso they are only raw pointers, and the background dictionary is released when the task ends)
@@ -2210,7 +2222,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
 
 static int stage_of(NSString *zh) {
     if ([zh isEqualToString:@"顶点"]) return 0; if ([zh isEqualToString:@"像素"]) return 1; if ([zh isEqualToString:@"计算"]) return 5;
-    if ([zh isEqualToString:@"外壳"]) return 3; if ([zh isEqualToString:@"域"]) return 4; return -1;
+    if ([zh isEqualToString:@"外壳"]) return 3; if ([zh isEqualToString:@"域"]) return 4; if ([zh isEqualToString:@"几何"]) return 2; return -1;
 }
 #define NVN_RT_RANGE_RO_IMPL 1
 // 私有续用只接受明确RO的B反射，sbuf缺rw不把默认0当证明；不改变既有反射/翻译链。
@@ -2247,6 +2259,14 @@ static NvShader *shader_get(NSString *pc, int stage) {
     pso_user_record("S\t%s\t%d\n", pc.UTF8String, stage);
     g_bp_lib_n++; g_bp_lib_ns += bp_now() - bt;
     return o;
+}
+// 可选着色器（融合变体）：库文件不存在就静默返回空，不报红 | Optional shader (fused variant): returns nil silently when the library file does not exist, no red report
+static NvShader *shader_get_opt(NSString *pc, int stage) {
+    if (g_shcache && g_shcache[pc]) return g_shcache[pc];
+    static NSMutableSet *missing; if (!missing) missing = [NSMutableSet set];
+    if ([missing containsObject:pc]) return nil;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:[NSString stringWithFormat:@"%@/%@.metallib", g_msl_dir, pc]]) { [missing addObject:pc]; return nil; }
+    return shader_get(pc, stage);
 }
 static id<MTLLibrary> g_builtin_lib;
 static NSMutableDictionary<NSString *, NvShader *> *g_builtin;
@@ -2314,14 +2334,26 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
             MLOG("【红】着色器控制段 %s 不在映射表里", k.UTF8String); continue;
         }
         int st = stage_of(zh);
+        // 几何阶段：Metal 没有几何着色器，不加载；记下键（配对记录 "2:<键>"），离线把它的「直通 + 写层号」融进配对的顶点着色器（dmsh_build.py gs_layer），
+        // 顶点着色器随后按 <顶点键>+<几何键> 取分层变体
+        // Geometry stage: Metal has no geometry shaders, not loaded; the key is recorded (pairing record "2:<key>") and offline its "pass-through + layer write" is fused into the paired vertex shader (dmsh_build.py gs_layer);
+        // the vertex shader is then fetched as the layered variant <vertex key>+<geometry key>
+        if (st == 2) { snprintf(o->gskey, sizeof o->gskey, "%s", k.UTF8String); continue; }
         NvShader *sh = st >= 0 ? shader_get([k stringByAppendingString:@"_b"], st) : nil;
         if (sh) o->sh[st] = sh; else MLOG("【红】着色器 %s（%s）加载失败：先跑 dm/gfx/tools/dmsh_build.py 出包", k.UTF8String, zh.UTF8String);
+    }
+    if (o->gskey[0] && o->sh[0]) {   // 顶点 + 几何：优先取融合变体 <顶点键>+<几何键>_b；没有（几何不是直通写层号 / 还没出包）就用普通顶点着色器 | Vertex + geometry: prefer the fused variant <vertex key>+<geometry key>_b; without one (the geometry shader is not a pass-through layer write / not built yet) use the plain vertex shader
+        NSString *fk = [NSString stringWithFormat:@"%.16s+%s_b", o->sh[0]->key, o->gskey];
+        NvShader *fused = shader_get_opt(fk, 0);
+        if (fused) o->sh[0] = fused; else { static int n; if (n++ < 8) MLOG("几何着色器 %s 与顶点 %.16s：没有融合变体 %s，按无几何着色器画（分层目标只画第 0 层）", o->gskey, o->sh[0]->key, fk.UTF8String); }
     }
     if (p->serial) serial_put(p->serial, o);
     // DM_NVN_PAIRS=文件：记下每个程序组合里各阶段的键（顶点 / 片元成对翻译要用：片元读的插值输出顶点必须写，Metal 建管线时核）
     // DM_NVN_PAIRS=file: record the keys of each stage in every program combination (needed for paired vertex / fragment translation: every interpolant the fragment reads must be written by the vertex shader, checked by Metal at pipeline creation)
     { static FILE *pf; static int tried; if (!tried) { tried = 1; const char *e = getenv("DM_NVN_PAIRS"); if (e) pf = fopen(e, "a"); }
-      if (pf) { char line[256] = ""; for (int st = 0; st < 6; st++) if (o->sh[st] && o->sh[st]->key[0]) { size_t l = strlen(line); snprintf(line + l, sizeof line - l, "%s%d:%.16s", l ? " " : "", st, o->sh[st]->key); } if (line[0]) { fprintf(pf, "%s\n", line); fflush(pf); } } }
+      if (pf) { char line[256] = ""; for (int st = 0; st < 6; st++) if (o->sh[st] && o->sh[st]->key[0]) { size_t l = strlen(line); snprintf(line + l, sizeof line - l, "%s%d:%.16s", l ? " " : "", st, o->sh[st]->key); }
+          if (o->gskey[0]) { size_t l = strlen(line); snprintf(line + l, sizeof line - l, "%s2:%.16s", l ? " " : "", o->gskey); }   // 几何阶段键（不加载，离线融合用） | Geometry stage key (not loaded, for offline fusion)
+          if (line[0]) { fprintf(pf, "%s\n", line); fflush(pf); } } }
     return o;
 }
 void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
@@ -2562,6 +2594,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
             break; } }
     d.rasterSampleCount = k->samples ? k->samples : 1;
     d.alphaToCoverageEnabled = k->a2c;
+    if (k->topo) d.inputPrimitiveTopology = k->topo == 1 ? MTLPrimitiveTopologyClassPoint : k->topo == 2 ? MTLPrimitiveTopologyClassLine : MTLPrimitiveTopologyClassTriangle;   // 分层渲染要求 | Required for layered rendering
     for (int i = 0; i < 8; i++) {
         if (!k->cfmt[i]) continue;
         MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
@@ -2603,6 +2636,27 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
 }
 // 管线键：当前状态 S + 通道格式（普通通道；合并通道另带 lmap / 特化函数，由 pso_get 填）
 // Pipeline key: current state S + pass formats (normal pass; a merged pass additionally carries lmap / specialized function, filled in by pso_get)
+// 分层目标的层数：首绘程序（S.prog 已按阶段合并）的顶点阶段写层号时，没按视图钉死单层的 3D / 数组 / 立方体附件整体挂上
+// （renderTargetArrayLength = 各附件层数的最小值；任一附件是普通 2D 贴图则不分层）。顶点不写层号的通道照旧挂第 0 层 / 视图选的那一层
+// Layer count of a layered target: when the vertex stage of the first draw's program (S.prog is already merged per stage) writes the layer index, 3D / array / cube attachments that the view did not pin to one layer are attached whole
+// (renderTargetArrayLength = minimum layer count over the attachments; any plain 2D attachment disables layering). Passes whose vertex stage does not write the layer keep attaching layer 0 / the view's layer
+static NSUInteger layered_len(RPD *pd) {
+    if (!S.prog) return 0;
+    __unsafe_unretained NvProg *fp = prog_get(S.prog); __unsafe_unretained NvShader *fvs = fp ? fp->sh[0] : nil;
+    if (!fvs || !fvs->rf.writes_layer) return 0;
+    NSUInteger len = 0;
+    for (int i = 0; i < R.rt.n + 1; i++) {
+        MTLRenderPassAttachmentDescriptor *a = i < R.rt.n ? (MTLRenderPassAttachmentDescriptor *)pd.colorAttachments[i] : pd.depthAttachment; if (!a.texture) continue;
+        const view_t *v = i < R.rt.n ? &R.rt.cview[i] : &R.rt.dview; int hv = i < R.rt.n ? R.rt.has_cview[i] : R.rt.has_dview;
+        if (hv && v->set_layers && v->nlayers == 1) { PD("L %llu 不分层：附件 %d 视图钉死单层", g_stat_pass + 1, i); return 0; }   // NVN：层数 0 = 全部层 | NVN: layer count 0 = all layers   // 视图钉死单层 | The view pins a single layer
+        MTLTextureType tt = a.texture.textureType;
+        NSUInteger n = tt == MTLTextureType3D ? MAX(a.texture.depth >> a.level, 1u) : tt == MTLTextureType2DArray ? a.texture.arrayLength : tt == MTLTextureTypeCubeArray ? a.texture.arrayLength * 6 : tt == MTLTextureTypeCube ? 6 : 0;
+        if (!n) { PD("L %llu 不分层：附件 %d 贴图类型 %lu 无层", g_stat_pass + 1, i, (unsigned long)tt); return 0; }
+        len = len ? MIN(len, n) : n;
+    }
+    PD("L %llu 顶点写层号，附件层数 %lu", g_stat_pass + 1, (unsigned long)len);
+    return len;
+}
 static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples, int lmap) {
     memset(k, 0, sizeof *k);
     k->vs = (__bridge void *)vs; k->fs = (__bridge void *)fs;
@@ -2610,6 +2664,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
     k->blend_en = S.color.blend_en; k->chmask = S.chmask.mask; k->a2c = S.ms.a2c;
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
     const nvn_refl *rf = &vs->rf;
+    k->topo = rf->writes_layer ? (uint8_t)g_cur_topo : 0;
     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 16 && a < S.nattr) { k->attr[a] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
 }
 // ---- 并行预编：首次遇到的管线原先在提交线程一条条同步编，一帧里连着缺 9 条 = 284 ms（真机重场面）。
@@ -2663,7 +2718,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
-    if (!ps) { MLOG("【红】建渲染管线失败：%s", e.localizedDescription.UTF8String); return nil; }
+    if (!ps) { static int n; if (n++ < 40) MLOG("【红】建渲染管线失败：%s（vs %s / fs %s）", e.localizedDescription.UTF8String, vs ? vs->key : "-", fs ? fs->key : "-"); return nil; }
     pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
     pso_record("R\t%s\n", shex);
     pso_user_record("R\t%s\n", shex);
@@ -4588,6 +4643,7 @@ frz_plain:;
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // 可读 tile 合并：按物理 → 逻辑映射与特化取管线 | Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
+    { int topo = prim_topo(dw ? dw->prim : di->prim); if (topo != g_cur_topo) { g_cur_topo = topo; if (pr->sh[0] && pr->sh[0]->rf.writes_layer) g_pso_dirty = 1; } }   // 分层渲染：图元类别进管线键 | Layered rendering: the primitive class enters the pipeline key
     if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;

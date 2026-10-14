@@ -83,7 +83,7 @@ def shader_key(key, name, rec):
     pc = dmsh_facts.row(key, FACTS[key]).encode() if key in FACTS else '缺'.encode()
     map_row = MAP_ROWS.get(key, '缺'.encode()) + MAP_CONFLICT_ROWS.get(key, b'')
     embedded = rec if name.startswith('main.rodata@') else b''
-    payload = (b'record\0' + rec + b'\0map\0' + map_row + b'\0pc\0' + pc + b'\0embedded\0' + embedded +
+    payload = (b'record\0' + rec + b'\0map\0' + map_row + b'\0pc\0' + pc + b'\0embedded\0' + embedded + b'\0pairs\0' + ','.join(sorted(PAIRS.get(key, ()))).encode() + b'\0gs\0' + ','.join(sorted(PAIRS_GS.get(key, ()))).encode() +
                b'\0tools\0' + TOOL_FP + b'\0code\0' + CODE_FP.encode() +
                b'\0rule\0' + shader_rule_source(name))
     return hashlib.sha256(payload).hexdigest()
@@ -245,6 +245,15 @@ def main_rec(mi, o):
     if g < 0 or mi[o:o + 4] != bytes.fromhex('34127698'): sys.exit(f'【红】main 映像 @{o:#x} 不是内嵌着色器控制段（MAIN={MAIN}）')
     return bytes(0x38) + mi[g:o + 0x880]
 
+# 顶点 / 片元配对（宿主 DM_NVN_PAIRS 记录：每行 "0:<顶点键> 1:<片元键> …"）：顶点着色器的作业带上所有配过对的片元作业（翻译器 SetNextStage）
+# Vertex / fragment pairing (recorded by the host via DM_NVN_PAIRS: each line "0:<vertex key> 1:<fragment key> ..."): a vertex shader's job carries the jobs of every fragment shader it was paired with (translator SetNextStage)
+PAIRS, PAIRS_GS = {}, {}   # PAIRS_GS：顶点键 → 配过对的几何键（宿主记录 "2:<几何键>"；见 gs_layer） | PAIRS_GS: vertex key -> paired geometry keys (host records "2:<geometry key>"; see gs_layer)
+_pf = os.environ.get('PAIRS', os.path.join(DM_ROOT, 'shpairs.txt'))
+if os.path.exists(_pf):
+    for ln in open(_pf):
+        st = dict(x.split(':', 1) for x in ln.split() if ':' in x)
+        if '0' in st and '1' in st: PAIRS.setdefault(st['0'], set()).add(st['1'])
+        if '0' in st and '2' in st: PAIRS_GS.setdefault(st['0'], set()).add(st['2'])
 def job_for(key, name, rec, w):
     ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]; stage = stage_of.get(key, name[:2])
     c1o, c1t = struct.unpack_from('<2I', rec, ci + 0x700)   # 控制段 +0x700：c1 相对指令区起点、+0x704：指令区总长（c1 = 两者之间；全库长度 0 / 256 / 512 / 768） | control segment +0x700: c1 relative to the start of the instruction area, +0x704: total length of the instruction area (c1 = what lies between the two; lengths across the whole library are 0 / 256 / 512 / 768)
@@ -253,8 +262,16 @@ def job_for(key, name, rec, w):
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(),
          'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}   # 翻译选项（见 dmsh_xlate/Program.cs）；放宽精度缺省开（GPU 浮点末位误差不进游戏状态，mini 整帧 −26%）   # c1：翻译器读间接跳转表用 | translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
-    if key not in FACTS: j['pc_missing'] = True; return j, c1   # 作答表里没有：查询按缺省（汇总里单列） | not in the answer table: queries use defaults (listed separately in the summary)
-    j.update(FACTS[key])
+    if key in FACTS: j.update(FACTS[key])
+    else: j['pc_missing'] = True   # 作答表里没有：查询按缺省（汇总里单列） | not in the answer table: queries use defaults (listed separately in the summary)
+    if stage == 'vs' and key in PAIRS:
+        j['next'] = []
+        for fk in sorted(PAIRS[key]):
+            if fk not in loc: continue
+            fname, fi = loc[fk]
+            if fname not in packs: packs[fname] = records(open(os.path.join(dm_dir, fname), 'rb').read())
+            fj, _ = job_for(fk, fname, packs[fname][fi], w)
+            j['next'].append(fj)
     return j, c1
 
 def raster_facts(stage, src):
@@ -385,13 +402,100 @@ RULES = []   # 按着色器名挂的 MSL 改写规则（函数, 适用判定）�
 CODE_FP = hashlib.sha256(source_without_rule_bodies().encode() + b''.join(b'\0' + open(m.__file__, 'rb').read() for m in (dmsh_chain,) + ((ios_metal,) if IOSOUT else ()))).hexdigest()
 TOOL_FP = tool_fingerprint().encode()
 
+# ---- 几何着色器直通 + 写层号 → 融进顶点着色器 ----
+# UE4 的分层目标（32³ 调色 LUT、64³ 半透明光照体、立方体阴影）用 FWriteToSliceGS：几何着色器把三角形原样转发，只把顶点传来的层号写进 gl_Layer。
+# Metal 没有几何着色器，但顶点函数可以直接输出 [[render_target_array_index]]：把几何着色器翻成 GLSL（Ryujinx → spirv-cross），认出
+# "gl_Layer = <输入插值 N 的分量 c>"（按位或按值取整），再在配对顶点着色器的 MSL 里补一个 uint 输出 = 同一插值分量。认不出的几何着色器照旧不画（报在汇总里）。
+# ---- Geometry shader pass-through + layer write → fused into the vertex shader ----
+# UE4's layered targets (32³ color LUT, 64³ translucency lighting volumes, cube shadows) use FWriteToSliceGS: the geometry shader forwards the triangle unchanged and only writes the layer index passed from the vertex into gl_Layer.
+# Metal has no geometry shaders, but a vertex function can output [[render_target_array_index]] directly: translate the geometry shader to GLSL (Ryujinx → spirv-cross), recognize
+# "gl_Layer = <component c of input interpolant N>" (as bits or by value), then add a uint output = the same interpolant component to the paired vertex shader's MSL. Unrecognized geometry shaders are still not drawn (reported in the summary).
+GS_CACHE, GS_LOCK = {}, threading.Lock()
+def gs_glsl(key, w):
+    spv = os.path.join(w, key + '.spv')
+    if not os.path.exists(spv): return None, '几何着色器没有 spv（翻译失败？）'
+    r = subprocess.run(['spirv-cross', '--version', '450', spv], capture_output=True, text=True)
+    return (r.stdout, '') if r.returncode == 0 else (None, 'spirv-cross GLSL 失败：' + r.stderr.strip()[:120])
+def gs_layer(key, w):
+    """几何着色器的层号来源 {'locn': 输入插值号, 'comp': 分量, 'bits': 按位取整}；不是直通写层号则 None | Where the geometry shader's layer comes from; None unless it is a pass-through layer write"""
+    with GS_LOCK:
+        if key in GS_CACHE: return GS_CACHE[key][0]
+        glsl, why = gs_glsl(key, w); info = None
+        if glsl: open(os.path.join(out, key + '_b.glsl'), 'w').write(glsl)   # 留档：几何着色器的 GLSL（分析依据） | Kept for the record: the geometry shader's GLSL (basis of the analysis)
+        if glsl:
+            # spirv-cross 的 GLSL：输入插值 "layout(location = N) in vec4 NAME[3];"，层号多经临时量 "float T = NAME[i].c;" 再 "gl_Layer = floatBitsToInt(T);"（按位）或 "int(T)"（按值）
+            # spirv-cross GLSL: input interpolants "layout(location = N) in vec4 NAME[3];", the layer usually goes through a temporary "float T = NAME[i].c;" then "gl_Layer = floatBitsToInt(T);" (bits) or "int(T)" (value)
+            locs = {m.group(2): int(m.group(1)) for m in re.finditer(r'layout\(location = (\d+)\) in vec4 (\w+)\[', glsl)}
+            temps = {m.group(1): (m.group(2), m.group(3)) for m in re.finditer(r'float (\w+) = (\w+)\[\w+\]\.([xyzw]);', glsl)}
+            m = re.search(r'gl_Layer\s*=\s*([^;]+);', glsl)
+            emits = len(re.findall(r'EmitVertex\s*\(', glsl))
+            src_m = re.match(r'\s*(floatBitsToInt|int)?\s*\(?\s*(\w+)(?:\[\w+\]\.([xyzw]))?\s*\)?\s*$', m.group(1)) if m else None
+            arr = comp = None
+            if src_m:
+                v = src_m.group(2)
+                if src_m.group(3): arr, comp = v, src_m.group(3)
+                elif v in temps: arr, comp = temps[v]
+            if not m: why = '没有写 gl_Layer'
+            elif arr not in locs: why = 'gl_Layer 不是直接取自输入插值：' + m.group(1)[:80]
+            elif emits != 3: why = f'EmitVertex {emits} 次（只认三角形直通；6 面 = 立方体阴影，待做实例化模拟）'
+            else: info = {'locn': locs[arr], 'comp': comp, 'bits': src_m.group(1) != 'int'}
+        GS_CACHE[key] = (info, why)
+        return info
+def gs_layer_why(key, w): gs_layer(key, w); return GS_CACHE[key][1]
+def fuse_layer(src, info):
+    """在顶点 MSL 里补写 out.gl_Layer（[[render_target_array_index]]）= 插值 locn 的分量 | Add out.gl_Layer ([[render_target_array_index]]) = component of interpolant locn to the vertex MSL"""
+    out_s = re.search(r'struct main0_out\s*\{(.*?)\};', src, re.S)
+    if not out_s: return None
+    mem = re.search(r'(\w+)\s+(\w+)\s+\[\[user\(locn%d\)\]\]' % info['locn'], out_s.group(1))
+    if not mem: return None
+    name = mem.group(2); comp = info['comp']
+    body = out_s.group(1).rstrip() + '\n    uint gl_Layer [[render_target_array_index]];\n'
+    src = src[:out_s.start(1)] + body + src[out_s.end(1):]
+    # 分层管线带 inputPrimitiveTopology，Metal 不许顶点函数再写 [[point_size]]（三角形 / 线类别下报错）：融合变体去掉点大小输出
+    # Layered pipelines carry inputPrimitiveTopology and Metal then forbids the vertex function from writing [[point_size]] (error under the triangle / line class): the fused variant drops the point size output
+    src = re.sub(r'\n\s*float\s+\w+\s+\[\[point_size\]\];', '', src)
+    src = re.sub(r'\n\s*out\.gl_PointSize\s*=\s*[^;]+;', '', src)
+    expr = f'as_type<int>(out.{name}.{comp})' if info['bits'] else f'int(out.{name}.{comp})'
+    i = src.rfind('    return out;')
+    if i < 0: return None
+    return src[:i] + f'    out.gl_Layer = uint(max({expr}, 0));\n' + src[i:]
+
 def finish(key, w, j, c1):
     name, k = loc[key]
     res = json.load(open(os.path.join(w, key + '.res.json')))
     msl = os.path.join(w, key + '.metal'); air = msl[:-6] + '.air'; lib = os.path.join(out, key + '_b.metallib')
+    if j['stage'] == 'gs':   # 几何着色器：Metal 没有，只做离线分析（结果给配对的顶点着色器用；无 metallib） | Geometry shader: none on Metal, offline analysis only (result used by the paired vertex shader; no metallib)
+        info = gs_layer(key, w)
+        return ('ok', '', {'key': key + '_b', 'stage': 'gs', 'bindings': [], 'drv_unfillable': [], 'gs': info}) if info else ('几何着色器不是直通写层号', gs_layer_why(key, w), None)
     r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
     src = open(msl).read()
+    fused = None
+    if j['stage'] == 'vs' and key in PAIRS_GS:   # 顶点 + 直通写层号的几何：顶点着色器补写 [[render_target_array_index]]（分层目标），出成变体 <顶点键>+<几何键>_b
+        for gk in sorted(PAIRS_GS[key]):
+            info = gs_layer(gk, w)
+            if not info: continue
+            patched = fuse_layer(src, info)
+            if not patched: return '顶点融合几何失败', f'{gk}: {info}', None
+            fused = (gk, patched)
+            break
+    if fused:
+        gk, patched = fused
+        fkey = key + '+' + gk
+        fmsl = os.path.join(w, fkey + '.metal'); open(fmsl, 'w').write(patched)
+        fair = fmsl[:-6] + '.air'; flib = os.path.join(out, fkey + '_b.metallib')
+        try:
+            subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', fmsl, '-o', fair], check=True)
+            subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', fair, '-o', flib + '.tmp'], check=True); os.replace(flib + '.tmp', flib)
+        except subprocess.CalledProcessError as e: return '融合变体 metal 失败', str(e)[:160], None
+        clone(fmsl, os.path.join(out, fkey + '_b.metal'))
+        fentry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', patched)
+        frefl = {'key': fkey + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': 'vs',
+                 'entry': fentry.group(2) if fentry else 'main0', 'msl_entry_kind': 'vertex', 'threadgroup_size': None, 'c1': c1.hex(), 'notes': res['notes'] + [f'融合几何着色器 {gk}（直通写层号）'],
+                 'drv_reads': drv_reads(patched), 'drv_unfillable': unfillable(drv_reads(patched)), 'bindings': reflect(key, 'vs', patched, res),
+                 'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', patched)],
+                 'raster': raster_facts('vs', patched), 'writes_layer': 1, 'fused_gs': gk}
+        write_refl(fkey, frefl)
     try:
         subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
         tmp_lib = lib + '.tmp-' + str(os.getpid())
@@ -413,7 +517,10 @@ def finish(key, w, j, c1):
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['无配对 PC 反射，查询按缺省'] if j.get('pc_missing') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
-            'raster': raster_facts(j['stage'], src)}
+            'raster': raster_facts(j['stage'], src),
+            # 顶点阶段写层号（分层目标：宿主把 3D / 数组贴图整体挂成 renderTargetArrayLength，管线带 inputPrimitiveTopology）
+            # The vertex stage writes the layer index (layered targets: the host attaches the whole 3D / array texture as renderTargetArrayLength and the pipeline carries inputPrimitiveTopology)
+            'writes_layer': int('[[render_target_array_index]]' in src)}
     write_refl(key, refl)
     fetch_finish(key, src, refl)
     return 'ok', '', refl
@@ -460,7 +567,7 @@ def fin(key):
         return key, 'ok', '', fetch_finish(key, src, refl)
     if key in xerr or not os.path.exists(os.path.join(w, key + '.spv')): return key, '翻译失败', xerr.get(key, '无 spv'), None
     result = (key,) + finish(key, w, jobs[key], c1s[key])
-    if result[1] == 'ok': publish_cache(key, digests[key], rule_fps[key], CODE_FP)
+    if result[1] == 'ok' and jobs[key]['stage'] != 'gs': publish_cache(key, digests[key], rule_fps[key], CODE_FP)
     return result
 with cf.ThreadPoolExecutor(NJ) as ex: res = list(ex.map(fin, keys))
 shutil.rmtree(w, ignore_errors=True)

@@ -16,8 +16,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from maxwell_refs import sph_stage
 dump, packdir = sys.argv[1], sys.argv[2]; game = sys.argv[3] if len(sys.argv) > 3 else 'blade'
 NVN = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../nvn')
-WORD = {'vs': '顶点', 'ps': '像素', 'cs': '计算'}
-recs = {'vs': [], 'ps': [], 'cs': []}; bad = 0
+WORD = {'vs': '顶点', 'ps': '像素', 'cs': '计算', 'gs': '几何'}
+# 几何着色器（阶段 4）也进包：Metal 没有几何着色器，dmsh_build.py 只把它翻成 GLSL 做离线分析（直通 + 写层号 → 融进配对的顶点着色器），宿主不加载
+# Geometry shaders (stage 4) go into the package too: Metal has no geometry shaders, dmsh_build.py only translates them to GLSL for offline analysis (pass-through + layer write → fused into the paired vertex shader); the host does not load them
+recs = {'vs': [], 'ps': [], 'cs': [], 'gs': []}; bad = 0
 for fn in sorted(os.listdir(dump)):
     if not fn.endswith('.ctl'): continue
     key = fn[:-4]; ctl = open(os.path.join(dump, fn), 'rb').read(); code = open(os.path.join(dump, key + '.code'), 'rb').read()

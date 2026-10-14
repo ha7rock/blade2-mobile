@@ -7,6 +7,7 @@ typedef struct {
     const void *vs, *fs; uint32_t cfmt[8], dfmt, sfmt, samples, blend_en, chmask, a2c; blend_st blend[8];
     va_st attr[16]; vs_st stream[16];
     uint8_t lmap[8]; const void *fsfn;
+    uint8_t topo;   // 顶点写层号的程序：绘制图元类别（1 点 2 线 3 三角）→ inputPrimitiveTopology（分层渲染要求）；其余 0 | Programs whose vertex stage writes the layer: primitive class of the draw (1 point 2 line 3 triangle) -> inputPrimitiveTopology (required for layered rendering); 0 otherwise
 } pso_key;
 
 typedef struct {
