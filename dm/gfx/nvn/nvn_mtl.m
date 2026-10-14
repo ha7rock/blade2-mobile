@@ -4684,7 +4684,7 @@ frz_plain:;
         }
         if (dw->count >= 4) enc_r_draw_indexed(en, mp, (dw->count / 4) * 6, MTLIndexTypeUInt32, g_quad_gpu, g_quad_ib.length, 1, dw->first, 0);
     } else if (dw) {
-        if (dw->count) enc_r_draw(en, mp, dw->first, dw->count);
+        if (dw->count) { if (dw->instances > 1 || dw->base_instance) enc_r_draw_instanced(en, mp, dw->first, dw->count, dw->instances ? dw->instances : 1, dw->base_instance); else enc_r_draw(en, mp, dw->first, dw->count); }   // Blade：DrawArraysInstanced | Blade: DrawArraysInstanced
     } else {
         if (prim == 7) { RED_ONCE(20, "带索引的四边形未实现"); return; }
         if (di->itype == 0) { RED_ONCE(21, "8 位索引未实现"); return; }
@@ -5282,6 +5282,7 @@ void mtl_exec(const uint8_t *p) {
                 mtl_exec((const uint8_t *)t); g_ret_n--; break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
+            case OP_FENCE_SYNC: { uint64_t sp; memcpy(&sp, a, 8); sync_t *fs = (sync_t *)(uintptr_t)sp; fs->fenced = 1; fs->fence = g_fence + 1; break; }   // Blade：命令缓冲里的围栏 = 本次提交完成（提交时 ++g_fence） | Blade: fence inside a command buffer = this submission completes (++g_fence at commit)
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }

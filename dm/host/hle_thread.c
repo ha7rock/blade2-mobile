@@ -80,6 +80,12 @@ static void *h_get(uint32_t h, int type) {       // 查不到即报（句柄错�
     if (!o) LOG("句柄无效 %#x（要类型 %d）", h, type);
     return o;
 }
+static void *h_lookup(uint32_t h, int type) {       // 查不到即报（句柄错是真错误） | Reports if not found (a wrong handle is a real error)
+    void *o = h_peek(h, type);
+    return o;
+}
+static void *h_lookup(uint32_t h, int type);   // 同 h_get 但查不到不打日志 | same as h_get but silent when not found
+
 static thr_t *cur(void) {
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t) die("非客体线程调用了线程 SVC");
@@ -669,3 +675,15 @@ void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时�
     e->signaled = 1; wake_sync_waiters();
     pthread_mutex_unlock(&G);
 }
+// 容错版（宿主定时线程用，如 Blade 的音频渲染器节拍）：写端句柄已失效（游戏销毁了事件）返回 0、不中止；未绑定的也不就地绑定（宿主线程上不能执行 SDK 代码）
+// Tolerant variant (for host timer threads, e.g. Blade's audio renderer tick): returns 0 without aborting when the write-end handle is gone (the game destroyed the event); an unbound one is not bound on the spot either (SDK code cannot run on a host thread)
+int hle_signal_system_event_try(void *ev) {
+    pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
+    if (!wh) return 0;
+    pthread_mutex_lock(&G);
+    event_t *e = h_lookup(wh, O_EVENT_W);
+    if (e) { e->signaled = 1; wake_sync_waiters(); }
+    pthread_mutex_unlock(&G);
+    return e != NULL;
+}
+int hle_system_event_bound(void *ev) { pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock); return wh != 0; }

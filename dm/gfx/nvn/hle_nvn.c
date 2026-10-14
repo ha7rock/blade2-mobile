@@ -1200,3 +1200,87 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (f >= 8 && slow_on()) slow_emit(f - 8);
     prev_out = now_ns();
 }
+
+// ---------- Blade II（UE4 4.17 的 NVN RHI）用到而暗黑从没调过的入口（37 个，清单：工程 docs / nvn_slots 对比） ----------
+// 都落在既有的录制 / 回放框架里：缓冲对象 = 内存池 + 偏移（GPU 地址 = CPU 地址）；组合贴图句柄拆成分离贴图 / 采样器两条记录
+// （位布局与 GetSeparate*Handle 一致：低 20 位贴图号、20 位以上采样器号）；命令缓冲内围栏记成 OP_FENCE_SYNC，回放时取本次提交的栅栏值。
+// ---------- Entries Blade II (UE4 4.17's NVN RHI) uses that Diablo never called (37, list: project docs / nvn_slots comparison) ----------
+// All land in the existing record / replay framework: buffer object = memory pool + offset (GPU address = CPU address); a combined texture handle is split
+// into separate texture / sampler records (bit layout same as GetSeparate*Handle: texture id in the low 20 bits, sampler id from bit 20 up);
+// a fence inside a command buffer is recorded as OP_FENCE_SYNC and the replay takes this submission's fence value.
+typedef struct { NVNdevice *dev; pool_t *pool; int64_t off; uint64_t size; } buf_builder_t;   FITS(buf_builder_t, NVNbufferBuilder);
+typedef struct { uint32_t magic; pool_t *pool; int64_t off; uint64_t size; } buf_t;           FITS(buf_t, NVNbuffer);
+#define BB(b) ((buf_builder_t *)(b))
+NVN(nvnBufferBuilderSetDefaults, void, NVNbufferBuilder *b) { NVNdevice *d = BB(b)->dev; memset(b, 0, sizeof(buf_builder_t)); BB(b)->dev = d; }
+NVN(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *b, NVNdevice *d) { BB(b)->dev = d; }
+NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b, NVNmemoryPool *p, ptrdiff_t off, size_t n) { BB(b)->pool = (pool_t *)p; BB(b)->off = off; BB(b)->size = n; }
+NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *bf, const NVNbufferBuilder *b) {
+    const buf_builder_t *s = (const buf_builder_t *)b; buf_t *o = (buf_t *)bf;
+    o->magic = MAGIC('B', 'U', 'F', 0); o->pool = s->pool; o->off = s->off; o->size = s->size;
+    static int bad; if ((!o->pool || !o->pool->mem) && !bad++) LOG("【红】BufferInitialize 没有内存池存储（pool=%p）", (void *)o->pool);
+    return 1;
+}
+NVN(nvnBufferFinalize, void, NVNbuffer *bf) { ((buf_t *)bf)->magic = 0; }
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *bf) { const buf_t *o = (const buf_t *)bf; return o->pool && o->pool->mem ? (NVNbufferAddress)(uintptr_t)(o->pool->mem + o->off) : 0; }
+NVN(nvnBufferMap, void *, const NVNbuffer *bf) { const buf_t *o = (const buf_t *)bf; return o->pool && o->pool->mem ? (void *)(o->pool->mem + o->off) : NULL; }
+NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) { return ((const pool_t *)p)->mem; }
+NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *r) {
+    (void)p; (void)r; static int once; if (!once++) LOG("【红】MemoryPoolMapVirtual 未实现（虚拟池映射 %d 段）：GPU 地址 = CPU 地址的模型里物理池页不能换着映射", n); return 1;
+}
+// 组合贴图句柄 = 贴图池号 | 采样器池号 << 20（真机 NVN 的位布局）
+// Combined texture handle = texture pool id | sampler pool id << 20 (the real NVN bit layout)
+NVN(nvnDeviceGetTextureHandle, NVNtextureHandle, const NVNdevice *d, int tex, int samp) { (void)d; return (NVNtextureHandle)((uint64_t)(uint32_t)tex & 0xFFFFF) | ((uint64_t)(uint32_t)samp << 20); }
+NVN(nvnDeviceRegisterFastClearColor, NVNboolean, NVNdevice *d, const float *c, NVNformat f) { (void)d; (void)c; (void)f; return 1; }
+NVN(nvnDeviceRegisterFastClearDepth, NVNboolean, NVNdevice *d, float v) { (void)d; (void)v; return 1; }
+NVN(nvnCommandBufferBindTexture, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNtextureHandle h) {
+    uint64_t tv = (uint64_t)h & 0xFFFFF, sv = (uint64_t)h & ~0xFFFFFull;
+    bind_handles(c, OP_BIND_TEX, st, i, 1, &tv); bind_handles(c, OP_BIND_SAMP, st, i, 1, &sv);
+}
+NVN(nvnCommandBufferBindImage, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNimageHandle h) { uint64_t v = (uint64_t)h; bind_handles(c, OP_BIND_IMG, st, i, 1, &v); }
+NVN(nvnCommandBufferBindVertexBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress a, size_t n) {
+    if (i < 0 || i >= 16) { LOG("【红】BindVertexBuffer index=%d", i); return; }
+    p_bind_vbuf *r = RECN(c, OP_BIND_VBUF, p_bind_vbuf, r, 1); r->first = i; r->n = 1; r->r[0].address = a; r->r[0].size = n;
+}
+NVN(nvnCommandBufferSetViewport, void, NVNcommandBuffer *c, int x, int y, int w, int h) {
+    p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = 0; r->n = 1;
+    r->v[0][0] = (float)x; r->v[0][1] = (float)y; r->v[0][2] = (float)w; r->v[0][3] = (float)h; r->v[0][4] = 0; r->v[0][5] = 1;
+}
+NVN(nvnCommandBufferDrawArraysInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n, int bi, int inst) {
+    *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n, inst, bi};
+}
+NVN(nvnCommandBufferDrawElements, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib) {
+    *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, 0, 0, 1, ib};
+}
+NVN(nvnCommandBufferDrawElementsBaseVertex, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib, int bv) {
+    *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, 0, 1, ib};
+}
+NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer *c, NVNsync *s, NVNsyncCondition cond, int flags) {
+    (void)cond; (void)flags; *(uint64_t *)rec(c, OP_FENCE_SYNC, 8) = (uint64_t)(uintptr_t)s;
+}
+NVN(nvnCommandBufferGetCommandMemorySize, size_t, const NVNcommandBuffer *c) { const cmd_t *o = (const cmd_t *)c; return o->cur && o->begin && o->cur > o->begin ? (size_t)(o->cur - o->begin) : 0; }
+NVN(nvnCommandBufferSetTiledCacheAction, void, NVNcommandBuffer *c, NVNtiledCacheAction a) { (void)c; (void)a; }   // 分块缓存是 Tegra 的硬件策略，Metal 上无对应 | tiled cache is a Tegra hardware policy, nothing to do on Metal
+NVN(nvnCommandBufferDownsample, void, NVNcommandBuffer *c, const NVNtexture *src, const NVNtexture *dst) {
+    (void)c; static int once; if (!once++) LOG("【红】CommandBufferDownsample（多重采样解析）未实现：%ux%u 采样 %d → %ux%u", CTX(src)->d.width, CTX(src)->d.height, CTX(src)->d.samples, CTX(dst)->d.width, CTX(dst)->d.height);
+}
+NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow *w, int *idx) { (void)q; return (NVNqueueAcquireTextureResult)h_nvnWindowAcquireTexture(w, NULL, idx); }
+NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
+    (void)q; const sync_t *o = (const sync_t *)s;   // 真机：队列在 GPU 上等围栏；宿主提交是按序的，用 CPU 等代替（最多 5 秒，超时报红继续） | real device: the queue waits on the GPU; host submissions are in order, so wait on the CPU instead (at most 5 s, report and continue on timeout)
+    if (o->fenced && !mtl_wait(o->fence, 5000000000ull)) { static int once; if (!once++) LOG("【红】QueueWaitSync 等栅栏 %llu 超时 5 秒", (unsigned long long)o->fence); }
+    return 1;
+}
+NVN(nvnTextureBuilderGetLevels, int, const NVNtextureBuilder *b) { return (int)((const tex_builder_t *)b)->d.levels; }
+// NVNtextureSparseTileLayout 在仓内 nvn.h 里还是 1 字节占位：真实布局 {int numTiledLevels; int tileWidth, tileHeight, tileDepth; int reserved[3]}（0x1c 字节），
+// 全清零 = 没有分块级（UE4 按 numTiledLevels 建数组，只清 1 字节时它读到栈上的残值 → memset 负长度崩）
+// NVNtextureSparseTileLayout is still a 1-byte placeholder in the repo's nvn.h: the real layout is {int numTiledLevels; int tileWidth, tileHeight, tileDepth; int reserved[3]} (0x1c bytes);
+// all zero = no tiled levels (UE4 builds an array from numTiledLevels; with only 1 byte cleared it read a stale stack value → memset with a negative length crashed)
+NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNtextureSparseTileLayout *out) { (void)b; memset(out, 0, 0x1c); }
+NVN(nvnTextureBuilderGetStorageClass, NVNstorageClass, const NVNtextureBuilder *b) { (void)b; return (NVNstorageClass)0; }   // 存储类只影响真机的内存池页属性 | the storage class only affects memory pool page attributes on the real device
+NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b, NVNtextureDepthStencilMode m) { (void)b; (void)m; }   // 深度 / 模板读取模式：回放层按视图格式定 | depth / stencil read mode: the replay layer decides by view format
+NVN(nvnTextureBuilderSetSize2D, void, NVNtextureBuilder *b, int w, int h) { TB(b)->d.width = w; TB(b)->d.height = h; TB(b)->d.depth = 1; }
+NVN(nvnTextureBuilderSetSize3D, void, NVNtextureBuilder *b, int w, int h, int d) { TB(b)->d.width = w; TB(b)->d.height = h; TB(b)->d.depth = d; }
+NVN(nvnTextureGetLevels, int, const NVNtexture *t) { return (int)CTX(t)->d.levels; }
+NVN(nvnTextureGetSamples, int, const NVNtexture *t) { return CTX(t)->d.samples > 1 ? CTX(t)->d.samples : 0; }
+NVN(nvnTextureGetTarget, NVNtextureTarget, const NVNtexture *t) { return (NVNtextureTarget)CTX(t)->d.target; }
+NVN(nvnTextureGetTextureAddress, NVNtextureAddress, const NVNtexture *t) { return (NVNtextureAddress)(uintptr_t)CTX(t)->mem; }
+NVN(nvnTexturePoolRegisterImage, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) { (void)tp; mtl_reg_tex(id, CTX(t), (const view_t *)v); }   // 图像与贴图共用登记（见 BindImages） | images share registration with textures (see BindImages)
+NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }

@@ -17,6 +17,7 @@
 
 void hle_bind_system_event(void *ev, int autoclear);   // hle_thread.c
 void hle_signal_system_event(void *ev);
+int hle_signal_system_event_try(void *ev);   // 容错版：句柄没了返回 0 | tolerant: returns 0 when the handle is gone
 
 // ---------- movie（subsdk0 的任天堂视频库，不装载）：d2r 已空播；UE4 的播放器还读媒体信息 ----------
 // ---------- movie (Nintendo video library in subsdk0, not loaded): d2r already plays empty; UE4's player also reads media info ----------
@@ -119,7 +120,14 @@ HLE_FORCE("nndetailDiagAbortFormatImpl", "SDK 中止（带格式）：宿主打�
 // no mixing, no sound; wave buffers are never "played and returned". Real output (CoreAudio mixing the voices) is the next step; the interface shape is fixed here.
 #define AUDREN_PERIOD_NS 5000000ll
 static struct { void *event; pthread_t th; _Atomic int run, started; } g_ren;
-static void *audren_tick(void *a) { (void)a; pthread_setname_np("blade audren tick"); while (atomic_load(&g_ren.run)) { if (atomic_load(&g_ren.started) && g_ren.event) hle_signal_system_event(g_ren.event); struct timespec ts = {0, AUDREN_PERIOD_NS}; nanosleep(&ts, NULL); } return NULL; }
+static void *audren_tick(void *a) {
+    (void)a; pthread_setname_np("blade audren tick"); int bad = 0;
+    while (atomic_load(&g_ren.run)) {
+        if (atomic_load(&g_ren.started) && g_ren.event && !bad && !hle_signal_system_event_try(g_ren.event)) { bad = 1; LOG("【红】音频渲染器事件的写端句柄已失效（游戏销毁了事件？）：停止触发"); }
+        struct timespec ts = {0, AUDREN_PERIOD_NS}; nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
 // AudioRendererParameter（SDK 公开布局，0x34 字节）：+0 sampleRate +4 sampleCount +8 mixBufferCount +0xc subMixCount +0x10 voiceCount +0x14 sinkCount +0x18 effectCount +0x1c performanceFrameCount ...
 // AudioRendererParameter (public SDK layout, 0x34 bytes): +0 sampleRate +4 sampleCount +8 mixBufferCount +0xc subMixCount +0x10 voiceCount +0x14 sinkCount +0x18 effectCount +0x1c performanceFrameCount ...
 HLE_FORCE("_ZN2nn5audio32InitializeAudioRendererParameterEPNS0_22AudioRendererParameterE", "渲染器参数缺省值（SDK 公开缺省：48 kHz、240 样本、24 混音缓冲、0 子混音…）", void, h_ren_InitParam, int32_t *p) {
