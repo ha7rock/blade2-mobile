@@ -21,7 +21,8 @@ FITS(queue_builder_t, NVNqueueBuilder);
 typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; } queue_t;                 FITS(queue_t, NVNqueue);
 
 typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
-typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; } pool_t;                FITS(pool_t, NVNmemoryPool);
+typedef struct { const void *phys; uint64_t poff, voff, size; } vmap_t;   // 虚拟池的一段映射：虚拟偏移 voff 起 size 字节 → 物理池 phys 的 poff | one mapping of a virtual pool: size bytes from virtual offset voff -> poff of physical pool phys
+typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; vmap_t *vmap; uint32_t nvmap, vcap; } pool_t;   FITS(pool_t, NVNmemoryPool);   // vmap：VIRTUAL 池（flags 0x200，无 CPU 存储）的映射表（nvnMemoryPoolMapVirtual） | vmap: mapping table of a VIRTUAL pool (flags 0x200, no CPU storage) (nvnMemoryPoolMapVirtual)
 
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // 贴图 / 采样器描述符池 | Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);

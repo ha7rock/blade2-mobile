@@ -1349,10 +1349,19 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     up_flush();
     return mt;
 }
+// 内容来自内存池的贴图（CPU 写进池、宿主解排布上传、脏页跟踪重传）：带打包布局的（暗黑：SetPackagedTextureLayout），
+// 或 UE4 这种按 NVN 默认块线性布局直接 memcpy 进池的采样贴图——池里有存储、不是显示 / 图像 / 可压缩渲染目标 / 线性渲染目标、不是缓冲贴图
+//（Blade 实测：采样贴图 flags = 0x20 SPARSE 或 0，渲染目标 0x8 / 0xc / 0x9，缓冲贴图 0x4）
+// Textures whose content comes from a memory pool (the CPU writes into the pool, the host deswizzles and uploads, dirty tracking re-uploads): packaged-layout ones (Diablo: SetPackagedTextureLayout),
+// or sampled textures that UE4 memcpys into the pool in NVN's default block-linear layout -- storage in a pool, not display / image / compressible render target / linear render target, not a buffer texture
+// (measured on Blade: sampled textures flags = 0x20 SPARSE or 0, render targets 0x8 / 0xc / 0x9, buffer textures 0x4)
+static inline int tex_pool_src(const tex_t *t) {
+    return t->mem && t->d.target != 10 && (t->has_layout || !(t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)));
+}
 static id<MTLTexture> tex_mtl(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
-    int packaged = t->has_layout && t->mem;
+    int packaged = tex_pool_src(t);
     id have = serial_get(t->serial);
     if (packaged) {
         NvPkg *pk = have;
@@ -3547,7 +3556,7 @@ static int rt_range_shape(const p_set_rt *a, const p_set_rt *b) {
         (a->has_dview && memcmp(&a->dview,&b->dview,sizeof a->dview))) return 0;
     const tex_t *x=a->color[0], *y=b->color[0];
     if (!x->serial || x->serial != y->serial || x->d.target != NVN_TEXTURE_TARGET_2D || y->d.target != NVN_TEXTURE_TARGET_2D ||
-        x->d.samples > 1 || y->d.samples > 1 || (x->has_layout && x->mem) || (y->has_layout && y->mem) ||
+        x->d.samples > 1 || y->d.samples > 1 || tex_pool_src(x) || tex_pool_src(y) ||
         memcmp(&x->d,&y->d,sizeof x->d) || x->mem != y->mem || x->pool != y->pool || x->off != y->off) return 0;
     const view_t *v=&a->cview[0], *w=&b->cview[0]; int levels=x->d.levels;
     if (!v->set_levels || !w->set_levels || v->base_level < 0 || v->base_level >= levels ||
@@ -3558,7 +3567,7 @@ static int rt_range_shape(const p_set_rt *a, const p_set_rt *b) {
     if (memcmp(v,&cv,sizeof cv)) return 0;
     if (a->depth) { const tex_t *d=a->depth,*e=b->depth;
         if (!d->serial || d->serial != e->serial || d->d.target != NVN_TEXTURE_TARGET_2D || e->d.target != NVN_TEXTURE_TARGET_2D ||
-            d->d.samples > 1 || e->d.samples > 1 || (d->has_layout && d->mem) || (e->has_layout && e->mem) ||
+            d->d.samples > 1 || e->d.samples > 1 || tex_pool_src(d) || tex_pool_src(e) ||
             memcmp(&d->d,&e->d,sizeof d->d) || d->mem != e->mem || d->pool != e->pool || d->off != e->off) return 0;
         int dl=a->has_dview && a->dview.set_levels ? a->dview.base_level : 0;
         if (dl < 0 || dl >= d->d.levels || mip_extent(d->d.width,dl) < mip_extent(x->d.width,v->base_level) ||
@@ -5000,7 +5009,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (r->height + bh - 1) / bh, x0 = (size_t)(r->xoffset / bw) * bpb, y0 = r->yoffset / bh;
     int nz = r->depth ? r->depth : 1, is3d = t->d.target == 2;
-    if (t->has_layout && t->mem) {
+    if (tex_pool_src(t)) {
         uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u), lz = is3d ? MAX(t->d.depth >> level, 1u) : 1;
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
         uint8_t *lin = malloc(lp * lr * lz);

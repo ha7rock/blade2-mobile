@@ -176,13 +176,24 @@ NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
-    o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
+    o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vmap = NULL; o->nvmap = o->vcap = 0;   // 游戏给的池对象内存是脏的：映射表字段必须清零 | the pool object memory handed over by the game is dirty: the mapping table fields must be zeroed
     if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】MemoryPoolInitialize 非虚拟池没有存储 flags=%#x size=%#llx", o->flags, o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
 }
-NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
+// 池内偏移 → CPU 地址（= GPU 地址）。物理 / 普通池直接算；VIRTUAL 池按映射表找覆盖 [off, off+n) 的那一段（UE4 的 NVN RHI 把流送贴图放在虚拟池里，
+// 物理页经 nvnMemoryPoolMapVirtual 提交；游戏往物理池写数据，宿主让贴图直接指到物理池的那段内存，脏页跟踪与上传照旧）
+// Pool offset -> CPU address (= GPU address). Physical / plain pools compute directly; for a VIRTUAL pool, look up the mapping covering [off, off+n) (UE4's NVN RHI keeps streamed textures in a virtual pool,
+// physical pages are committed through nvnMemoryPoolMapVirtual; the game writes the data into the physical pool, and the host points the texture straight at that physical memory, so dirty tracking and upload work as before)
+uint8_t *nvn_pool_mem(const pool_t *p, uint64_t off, uint64_t n) {
+    if (!p || p->magic != MAGIC('P', 'O', 'O', 'L')) return NULL;
+    if (p->mem) return p->mem + off;
+    for (uint32_t i = 0; i < p->nvmap; i++) { const vmap_t *m = &p->vmap[i];
+        if (off >= m->voff && off + n <= m->voff + m->size) { const pool_t *ph = m->phys; return ph && ph->mem ? ph->mem + m->poff + (off - m->voff) : NULL; } }
+    return NULL;
+}
+NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } free(((pool_t *)p)->vmap); ((pool_t *)p)->vmap = NULL; ((pool_t *)p)->nvmap = ((pool_t *)p)->vcap = 0; ((pool_t *)p)->magic = 0; }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
 
@@ -247,7 +258,8 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8);
     nvn_tex_layout(&o->d, &o->L);
-    o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
+    o->mem = nvn_pool_mem(s->pool, s->off, o->L.size);
+    if (s->pool && !s->pool->mem && !o->mem) { static int n; if (n++ < 8) LOG("【红】TextureInitialize：虚拟池偏移 %#llx 长 %#llx 还没映射到物理池（%ux%u fmt=%#x）", (unsigned long long)s->off, (unsigned long long)o->L.size, o->d.width, o->d.height, o->d.format); }
     o->serial = nvn_new_serial();
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)t, o->d.width, o->d.height, o->d.depth,
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);
@@ -1242,15 +1254,43 @@ NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b, NVNmemoryPool *p, ptr
 NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *bf, const NVNbufferBuilder *b) {
     const buf_builder_t *s = (const buf_builder_t *)b; buf_t *o = (buf_t *)bf;
     o->magic = MAGIC('B', 'U', 'F', 0); o->pool = s->pool; o->off = s->off; o->size = s->size;
-    static int bad; if ((!o->pool || !o->pool->mem) && !bad++) LOG("【红】BufferInitialize 没有内存池存储（pool=%p）", (void *)o->pool);
+    static int bad; if (!nvn_pool_mem(o->pool, o->off, o->size) && !bad++) LOG("【红】BufferInitialize 没有内存池存储（pool=%p，虚拟池未映射？）", (void *)o->pool);
     return 1;
 }
 NVN(nvnBufferFinalize, void, NVNbuffer *bf) { ((buf_t *)bf)->magic = 0; }
-NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *bf) { const buf_t *o = (const buf_t *)bf; return o->pool && o->pool->mem ? (NVNbufferAddress)(uintptr_t)(o->pool->mem + o->off) : 0; }
-NVN(nvnBufferMap, void *, const NVNbuffer *bf) { const buf_t *o = (const buf_t *)bf; return o->pool && o->pool->mem ? (void *)(o->pool->mem + o->off) : NULL; }
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *bf) { const buf_t *o = (const buf_t *)bf; return (NVNbufferAddress)(uintptr_t)nvn_pool_mem(o->pool, o->off, o->size); }
+NVN(nvnBufferMap, void *, const NVNbuffer *bf) { const buf_t *o = (const buf_t *)bf; return nvn_pool_mem(o->pool, o->off, o->size); }
 NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) { return ((const pool_t *)p)->mem; }
+// 虚拟池映射（真机 NVN：NVNmappingRequest = {物理池, 物理偏移, 虚拟偏移, 长度, 存储类}，物理池为空 = 解除映射）。宿主只记映射表：
+// 之后建在该虚拟偏移上的贴图 / 缓冲直接指到物理池内存（nvn_pool_mem）。已建的贴图不回溯（UE4 先映射再建贴图；TextureInitialize 时未映射会报红）
+// Virtual pool mapping (real NVN: NVNmappingRequest = {physical pool, physical offset, virtual offset, size, storage class}; a null physical pool = unmap). The host only keeps the mapping table:
+// textures / buffers created later at that virtual offset point straight at the physical pool memory (nvn_pool_mem). Already-created textures are not revisited (UE4 maps first, then creates the texture; TextureInitialize reports red if unmapped)
+typedef struct { const NVNmemoryPool *phys; ptrdiff_t poff, voff; size_t size; int storage_class; } nvn_mapping_req;
 NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *r) {
-    (void)p; (void)r; static int once; if (!once++) LOG("【红】MemoryPoolMapVirtual 未实现（虚拟池映射 %d 段）：GPU 地址 = CPU 地址的模型里物理池页不能换着映射", n); return 1;
+    pool_t *o = (pool_t *)p; const nvn_mapping_req *q = (const nvn_mapping_req *)r;
+    static uint64_t logged;
+    for (int i = 0; i < n; i++) {
+        uint64_t voff = (uint64_t)q[i].voff, size = q[i].size;
+        // 先去掉与本段重叠的旧映射（截断 / 删除） | first drop existing mappings overlapping this range (trim / delete)
+        for (uint32_t k = 0; k < o->nvmap;) { vmap_t *m = &o->vmap[k];
+            if (m->voff + m->size <= voff || voff + size <= m->voff) { k++; continue; }
+            if (m->voff < voff && m->voff + m->size > voff + size) {   // 中间挖空：拆两段 | hole in the middle: split in two
+                vmap_t tail = {m->phys, m->poff + (voff + size - m->voff), voff + size, m->voff + m->size - (voff + size)};
+                m->size = voff - m->voff;
+                if (o->nvmap == o->vcap) { o->vcap = o->vcap ? o->vcap * 2 : 64; o->vmap = realloc(o->vmap, o->vcap * sizeof *o->vmap); m = &o->vmap[k]; }
+                o->vmap[o->nvmap++] = tail; k++; continue; }
+            if (m->voff < voff) { m->size = voff - m->voff; k++; continue; }
+            if (m->voff + m->size > voff + size) { uint64_t cut = voff + size - m->voff; m->poff += cut; m->voff += cut; m->size -= cut; k++; continue; }
+            o->vmap[k] = o->vmap[--o->nvmap];
+        }
+        if (q[i].phys) {
+            if (o->nvmap == o->vcap) { o->vcap = o->vcap ? o->vcap * 2 : 64; o->vmap = realloc(o->vmap, o->vcap * sizeof *o->vmap); }
+            o->vmap[o->nvmap++] = (vmap_t){(const pool_t *)q[i].phys, (uint64_t)q[i].poff, voff, size};
+        }
+        if (logged++ < 12) LOG("[nvn] 虚拟池 %p：%s 虚拟偏移 %#llx 长 %#llx ← 物理池 %p 偏移 %#llx（存储类 %d；现有 %u 段）", (void *)p, q[i].phys ? "映射" : "解除",
+                               (unsigned long long)voff, (unsigned long long)size, (const void *)q[i].phys, (unsigned long long)q[i].poff, q[i].storage_class, o->nvmap);
+    }
+    return 1;
 }
 // 组合贴图句柄 = 贴图池号 | 采样器池号 << 20（真机 NVN 的位布局）
 // Combined texture handle = texture pool id | sampler pool id << 20 (the real NVN bit layout)
