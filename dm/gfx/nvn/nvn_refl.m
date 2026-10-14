@@ -31,7 +31,7 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
         for (NSDictionary *b in bs) {
             NSString *k = b[@"kind"]; nvn_rbind *r = &o->b[o->nb];
             id rg = b[@"reg"]; int reg = [rg isKindOfClass:[NSNumber class]] ? [rg intValue] : -1, aid = [b[@"arg_id"] intValue];
-            r->aid = (uint16_t)aid; r->reg = reg < 0 ? 0 : (uint16_t)reg;
+            r->aid = (uint16_t)aid; r->reg = reg < 0 ? 0 : (uint16_t)reg; r->st = (uint8_t)[b[@"stage"] intValue];
             if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
             else if ([k isEqualToString:@"samp"]) r->kind = NVN_RB_SAMP;
             else if ([k isEqualToString:@"samp_tex"]) r->kind = NVN_RB_SAMPT;
@@ -62,7 +62,7 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             o->v[o->nv].ct = [t hasPrefix:@"uint"] ? NVN_CT_UINT : [t hasPrefix:@"int"] ? NVN_CT_INT : NVN_CT_FLOAT;
             o->nv++;
         }
-        o->writes_layer = [j[@"writes_layer"] intValue] != 0;
+        o->writes_layer = [j[@"writes_layer"] intValue] != 0; o->gs_faces = (uint8_t)[j[@"gs_faces"] intValue];
         NSDictionary *ra = j[@"raster"];
         o->pos_attr = -1; o->may_discard = 1; o->writes_smask = 1;
         if ([ra isKindOfClass:[NSDictionary class]]) {

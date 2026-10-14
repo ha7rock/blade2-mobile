@@ -422,7 +422,11 @@ def gs_layer(key, w):
         if key in GS_CACHE: return GS_CACHE[key][0]
         glsl, why = gs_glsl(key, w); info = None
         if glsl: open(os.path.join(out, key + '_b.glsl'), 'w').write(glsl)   # 留档：几何着色器的 GLSL（分析依据） | Kept for the record: the geometry shader's GLSL (basis of the analysis)
-        if glsl:
+        if glsl and len(re.findall(r'EmitVertex\s*\(', glsl)) == 18:   # 6 面 × 3 顶点：立方体阴影 | 6 faces x 3 vertices: cube shadow
+            cube, cwhy = gs_cube(glsl)
+            if cube: info = dict(cube, kind='cube')
+            else: why = '6 面几何着色器认不出：' + cwhy
+        elif glsl:
             # spirv-cross 的 GLSL：输入插值 "layout(location = N) in vec4 NAME[3];"，层号多经临时量 "float T = NAME[i].c;" 再 "gl_Layer = floatBitsToInt(T);"（按位）或 "int(T)"（按值）
             # spirv-cross GLSL: input interpolants "layout(location = N) in vec4 NAME[3];", the layer usually goes through a temporary "float T = NAME[i].c;" then "gl_Layer = floatBitsToInt(T);" (bits) or "int(T)" (value)
             locs = {m.group(2): int(m.group(1)) for m in re.finditer(r'layout\(location = (\d+)\) in vec4 (\w+)\[', glsl)}
@@ -438,7 +442,7 @@ def gs_layer(key, w):
             if not m: why = '没有写 gl_Layer'
             elif arr not in locs: why = 'gl_Layer 不是直接取自输入插值：' + m.group(1)[:80]
             elif emits != 3: why = f'EmitVertex {emits} 次（只认三角形直通；6 面 = 立方体阴影，待做实例化模拟）'
-            else: info = {'locn': locs[arr], 'comp': comp, 'bits': src_m.group(1) != 'int'}
+            else: info = {'kind': 'layer', 'locn': locs[arr], 'comp': comp, 'bits': src_m.group(1) != 'int'}
         GS_CACHE[key] = (info, why)
         return info
 def gs_layer_why(key, w): gs_layer(key, w); return GS_CACHE[key][1]
@@ -460,6 +464,128 @@ def fuse_layer(src, info):
     if i < 0: return None
     return src[:i] + f'    out.gl_Layer = uint(max({expr}, 0));\n' + src[i:]
 
+# ---- 6 面几何着色器（UE4 单趟点光源阴影 FOnePassPointShadowDepthGS）→ 实例化 ×6 的顶点变体 ----
+# 几何着色器把每个三角形发到立方体 6 个面：面 f 开关 = gp_c3._m0[f].x > 0，位置 = 输入插值（世界坐标）× gp_c3 第 base+stride·f 行起的 4 行（行向量乘法），
+# gl_Layer = f，其余输出 = 输入直通 / 裁剪位置副本 / 面号常量（按位或按值）。Metal 没有几何着色器：顶点变体按 instance_id % 6 选面，
+# 宿主把实例数与基实例 ×6（反射 gs_faces），几何阶段的 uniform 以 stage=2 的绑定挂进顶点参数块。每面的视锥剔除省掉（裁剪等价）。
+# ---- 6-face geometry shader (UE4 one-pass point light shadow FOnePassPointShadowDepthGS) -> vertex variant instanced x6 ----
+# The geometry shader emits every triangle to the 6 cube faces: face f enabled = gp_c3._m0[f].x > 0, position = input interpolant (world space) x the 4 rows of gp_c3 from row base+stride*f (row-vector product),
+# gl_Layer = f, the other outputs = input pass-through / copy of the clip position / face constant (bits or value). Metal has no geometry shaders: the vertex variant selects the face by instance_id % 6,
+# the host multiplies instance count and base instance by 6 (reflection gs_faces), and the geometry stage's uniform is bound into the vertex argument buffer as a stage=2 binding. Per-face frustum culling is dropped (clipping is equivalent).
+def gs_cube(glsl):
+    """返回 {'pos_in': 输入插值号或 None(gl_Position 直通), 'mat': (base, stride) 或 None, 'enable': 行号或 None, 'outs': {出位置号: {分量: ('in', 插值号, 分量) | ('pos', 分量) | ('face', bits)}}}；认不出返回 (None, 原因)"""
+    ins = {m.group(2): int(m.group(1)) for m in re.finditer(r'layout\(location = (\d+)\) in vec4 (\w+)\[', glsl)}
+    outs = {m.group(2): int(m.group(1)) for m in re.finditer(r'layout\(location = (\d+)\) out vec4 (\w+);', glsl)}
+    defs = dict(re.findall(r'(?:float|int|bool) (_\d+) = ([^;]+);', glsl))
+    layers = [int(x) for x in re.findall(r'gl_Layer = (\d+);', glsl)]
+    if sorted(set(layers)) != [0, 1, 2, 3, 4, 5]: return None, f'层号不是 0–5 常量：{sorted(set(layers))}'
+    def block(face):   # 面 face 第一个顶点的赋值（到该面第一次 EmitVertex 为止） | assignments of the first vertex of face `face` (up to that face's first EmitVertex)
+        i = glsl.index(f'gl_Layer = {face};'); j = glsl.index('EmitVertex', i)
+        # 往前取到上一次 EmitVertex / EndPrimitive / main 起点 | back to the previous EmitVertex / EndPrimitive / start of main
+        k = max(glsl.rfind('EmitVertex', 0, i), glsl.rfind('EndPrimitive', 0, i), glsl.rfind('void main', 0, i))
+        return dict(re.findall(r'(\w+\.[xyzw]|gl_Layer) = ([^;]+);', glsl[k:j]))
+    b0, b1 = block(0), block(1)
+    def src_of(expr, depth=0):   # 追到来源：输入插值 / gl_in 位置 / 矩阵乘积 | trace to the source: input interpolant / gl_in position / matrix product
+        m = re.match(r'^(\w+)\[\w+\]\.([xyzw])$', expr)
+        if m and m.group(1) in ins: return ('in', ins[m.group(1)], m.group(2))
+        m = re.match(r'^gl_in\[\w+\]\.gl_Position\.([xyzw])$', expr)
+        if m: return ('clip', m.group(1))
+        m = re.search(r'gp_c3_1\._m0\[(\d+)\]\.([xyzw])', expr)
+        if m: return ('mat', int(m.group(1)), m.group(2), expr)
+        if expr in defs and depth < 8: return src_of(defs[expr], depth + 1)
+        return None
+    def lit(x):
+        try: return float(x)
+        except ValueError: return None
+    def expand(expr, rows, ins_seen, depth=0, seen=None):   # 递归展开临时量：收集乘积链里用到的矩阵行与输入插值 | expand temporaries recursively: collect the matrix rows and input interpolants used in the product chain
+        seen = seen if seen is not None else set()
+        for r, c in re.findall(r'gp_c3_1\._m0\[(\d+)\]\.([xyzw])', expr): rows.add(int(r))
+        for nm in re.findall(r'\b(\w+)\[\w+\]\.[xyzw]', expr):
+            if nm in ins: ins_seen.add(ins[nm])
+        if depth > 12: return
+        for v in re.findall(r'_\d+', expr):
+            if v in defs and v not in seen: seen.add(v); expand(defs[v], rows, ins_seen, depth + 1, seen)
+    res = {'outs': {}, 'pos_in': None, 'mat': None, 'enable': None}
+    rows0 = set()
+    for tgt, val in b0.items():
+        if tgt == 'gl_Layer': continue
+        name, comp = tgt.split('.')
+        src = src_of(val) if lit(val) is None else None
+        if name == 'gl_Position':
+            if src and src[0] == 'clip': continue   # 位置直通 | position pass-through
+            if not src or src[0] != 'mat': return None, f'位置 {comp} 来源认不出：{val}'
+            ins_seen = set(); expand(val, rows0, ins_seen)
+            if len(ins_seen) == 1: res['pos_in'] = ins_seen.pop()
+            continue
+        if name not in outs: continue
+        if lit(val) is not None:
+            v1 = lit(b1.get(tgt, 'x')); bits = v1 is not None and 0 < v1 < 1e-30
+            res['outs'].setdefault(outs[name], {})[comp] = ('face', bits)
+        elif src and src[0] == 'in': res['outs'].setdefault(outs[name], {})[comp] = ('in', src[1], src[2])
+        elif src and src[0] == 'mat': res['outs'].setdefault(outs[name], {})[comp] = ('pos', src[2])
+        elif src and src[0] == 'clip': res['outs'].setdefault(outs[name], {})[comp] = ('pos', src[1])
+        else: return None, f'输出 {tgt} 来源认不出：{val}'
+    if rows0:
+        rows1 = set()
+        for tgt, val in b1.items():
+            if tgt.startswith('gl_Position') and lit(val) is None: expand(val, rows1, set())
+        if len(rows0) != 4 or len(rows1) != 4: return None, f'矩阵行数 {sorted(rows0)} / {sorted(rows1)}'
+        base, stride = min(rows0), min(rows1) - min(rows0)
+        if sorted(rows0) != [base, base + 1, base + 2, base + 3] or stride <= 0: return None, f'矩阵行 {sorted(rows0)} 不连续'
+        res['mat'] = (base, stride)
+        if res['pos_in'] is None: return None, '矩阵乘的输入插值认不出'
+        m = re.search(r'0\.0 < gp_c3_1\._m0\[(\d+)\]\.x', glsl)
+        if m: res['enable'] = int(m.group(1))
+    return res, ''
+def fuse_cube(src, info):
+    """顶点 MSL → 实例化 ×6 的立方体阴影变体 | vertex MSL -> cube-shadow variant instanced x6"""
+    out_s = re.search(r'struct main0_out\s*\{(.*?)\};', src, re.S)
+    if not out_s: return None
+    members = {int(m.group(3)): m.group(2) for m in re.finditer(r'(\w+)\s+(\w+)\s+\[\[user\(locn(\d+)\)\]\]', out_s.group(1))}
+    sig = re.search(r'vertex main0_out main0\((.*?)\)\s*\{', src, re.S)
+    if not sig: return None
+    params = sig.group(1)
+    pre = ''
+    if '[[instance_id]]' in params:
+        params = params.replace('uint gl_InstanceIndex [[instance_id]]', 'uint gs_iid [[instance_id]]')
+        if '[[base_instance]]' in params: pre = '    uint gl_InstanceIndex = gl_BaseInstance + (gs_iid - gl_BaseInstance) / 6u;\n'
+        else: pre = '    uint gl_InstanceIndex = gs_iid / 6u;\n'
+    else: params = params + ', uint gs_iid [[instance_id]]'
+    ids = [int(x) for x in re.findall(r'\[\[id\((\d+)\)\]\]', src)]
+    gid = max(ids) + 1 if ids else 0
+    ds = re.search(r'struct spvDescriptorSetBuffer0\s*\{(.*?)\};', src, re.S)
+    if not ds: return None
+    if 'struct _16\n' not in src and 'struct _16 ' not in src: return None
+    src = src[:ds.end(1)] + f'    constant _16* gs_c3 [[id({gid})]];\n' + src[ds.end(1):]
+    # 融合输出结构 | fused output struct
+    fo = 'struct main0_fused\n{\n    float4 gl_Position [[position, invariant]];\n    uint gl_Layer [[render_target_array_index]];\n'
+    for loc in sorted(info['outs']): fo += f'    float4 g_{loc} [[user(locn{loc})]];\n'
+    fo += '};\n\n'
+    src = src.replace('vertex main0_out main0(', fo + 'vertex main0_fused main0(', 1)
+    src = re.sub(r'vertex main0_fused main0\((.*?)\)\s*\{', lambda m: f'vertex main0_fused main0({params})\n{{\n{pre}', src, count=1, flags=re.S)
+    src = re.sub(r'\n\s*float\s+\w+\s+\[\[point_size\]\];', '', src); src = re.sub(r'\n\s*out\.gl_PointSize\s*=\s*[^;]+;', '', src)
+    body = '    main0_fused fo = {}; uint gs_face = gs_iid % 6u; constant float4* gs_m = (*spvDescriptorSet0.gs_c3)._m0;\n'
+    if info['mat']:
+        base, stride = info['mat']
+        pm = members.get(info['pos_in'])
+        if pm is None: return None
+        # 顶点没写该插值的 .w（UE4 阴影顶点只写世界坐标 xyz）：硬件上未写的插值分量 w 缺省 1，翻译出的 MSL 却把输出清零 → 补 1，否则矩阵的平移行丢掉
+        # The vertex stage does not write .w of that interpolant (UE4 shadow vertex shaders write only world xyz): on hardware an unwritten w defaults to 1 while the translated MSL zero-initialises outputs -> use 1, otherwise the matrix's translation row is lost
+        pw = f'out.{pm}.w' if re.search(r'\bout\.' + pm + r'\.w\s*=', src) or re.search(r'\bout\.' + pm + r'\s*=', src) else '1.0'
+        body += f'    {{ float4 p = float4(out.{pm}.xyz, {pw}); uint r = {base}u + {stride}u * gs_face; fo.gl_Position = p.x * gs_m[r] + p.y * gs_m[r + 1u] + p.z * gs_m[r + 2u] + p.w * gs_m[r + 3u]; }}\n'
+        if info['enable'] is not None: body += f'    if (gs_m[{info["enable"]}u + gs_face].x <= 0.0) fo.gl_Position = float4(0.0, 0.0, 2.0, 1.0);\n'   # 该面关着：裁掉 | face disabled: clipped away
+    else: body += '    fo.gl_Position = out.gl_Position;\n'
+    for loc, comps in sorted(info['outs'].items()):
+        for c, sv in sorted(comps.items()):
+            if sv[0] == 'face': body += f'    fo.g_{loc}.{c} = {"as_type<float>(int(gs_face))" if sv[1] else "float(gs_face)"};\n'
+            elif sv[0] == 'pos': body += f'    fo.g_{loc}.{c} = fo.gl_Position.{sv[1]};\n'
+            else:
+                m = members.get(sv[1]); body += f'    fo.g_{loc}.{c} = {"out." + m + "." + sv[2] if m else "0.0"};\n'
+    body += '    fo.gl_Layer = gs_face;\n    return fo;\n'
+    i = src.rfind('    return out;')
+    if i < 0: return None
+    return src[:i] + body + src[i + len('    return out;\n'):]
+
 def finish(key, w, j, c1):
     name, k = loc[key]
     res = json.load(open(os.path.join(w, key + '.res.json')))
@@ -475,12 +601,12 @@ def finish(key, w, j, c1):
         for gk in sorted(PAIRS_GS[key]):
             info = gs_layer(gk, w)
             if not info: continue
-            patched = fuse_layer(src, info)
+            patched = fuse_cube(src, info) if info['kind'] == 'cube' else fuse_layer(src, info)
             if not patched: return '顶点融合几何失败', f'{gk}: {info}', None
-            fused = (gk, patched)
+            fused = (gk, patched, info['kind'])
             break
     if fused:
-        gk, patched = fused
+        gk, patched, gkind = fused
         fkey = key + '+' + gk
         fmsl = os.path.join(w, fkey + '.metal'); open(fmsl, 'w').write(patched)
         fair = fmsl[:-6] + '.air'; flib = os.path.join(out, fkey + '_b.metallib')
@@ -495,6 +621,10 @@ def finish(key, w, j, c1):
                  'drv_reads': drv_reads(patched), 'drv_unfillable': unfillable(drv_reads(patched)), 'bindings': reflect(key, 'vs', patched, res),
                  'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', patched)],
                  'raster': raster_facts('vs', patched), 'writes_layer': 1, 'fused_gs': gk}
+        if gkind == 'cube':   # 几何阶段的 uniform（gp_c3 = 几何阶段 uniform 槽 0）以 stage=2 挂进顶点参数块；宿主把实例数 ×6 | the geometry stage's uniform (gp_c3 = geometry stage uniform slot 0) bound into the vertex argument buffer as stage=2; the host multiplies instances by 6
+            gid = int(re.search(r'gs_c3 \[\[id\((\d+)\)\]\]', patched).group(1))
+            frefl['bindings'] = [b for b in frefl['bindings'] if b['msl_name'] != 'gs_c3'] + [{'msl_name': 'gs_c3', 'msl_type': 'constant _16*', 'arg_id': gid, 'kind': 'cbuf', 'reg': 0, 'stage': 2}]
+            frefl['gs_faces'] = 6
         write_refl(fkey, frefl)
     try:
         subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)

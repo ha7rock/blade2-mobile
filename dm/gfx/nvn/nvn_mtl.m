@@ -2389,7 +2389,8 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
     if (o->gskey[0] && o->sh[0]) {   // 顶点 + 几何：优先取融合变体 <顶点键>+<几何键>_b；没有（几何不是直通写层号 / 还没出包）就用普通顶点着色器 | Vertex + geometry: prefer the fused variant <vertex key>+<geometry key>_b; without one (the geometry shader is not a pass-through layer write / not built yet) use the plain vertex shader
         NSString *fk = [NSString stringWithFormat:@"%.16s+%s_b", o->sh[0]->key, o->gskey];
         NvShader *fused = shader_get_opt(fk, 0);
-        if (fused) o->sh[0] = fused; else { static int n; if (n++ < 8) MLOG("几何着色器 %s 与顶点 %.16s：没有融合变体 %s，按无几何着色器画（分层目标只画第 0 层）", o->gskey, o->sh[0]->key, fk.UTF8String); }
+        if (fused) { o->sh[0] = fused; static int n; if (n++ < 16) MLOG("几何着色器融合变体 %s 启用（帧 %llu，面数 %d）", fk.UTF8String, (unsigned long long)atomic_load(&g_cur_frame), fused->rf.gs_faces); }
+        else { static int n; if (n++ < 8) MLOG("几何着色器 %s 与顶点 %.16s：没有融合变体 %s，按无几何着色器画（分层目标只画第 0 层）", o->gskey, o->sh[0]->key, fk.UTF8String); }
     }
     if (p->serial) serial_put(p->serial, o);
     // DM_NVN_PAIRS=文件：记下每个程序组合里各阶段的键（顶点 / 片元成对翻译要用：片元读的插值输出顶点必须写，Metal 建管线时核）
@@ -3052,7 +3053,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         const nvn_rbind *b = &sh->rf.b[i];
         int reg = b->reg, aid = b->aid;
         if (b->kind == NVN_RB_CBUF) {
-            const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
+            const p_bind_buf *u = reg < 16 ? &S.ubo[b->st ? b->st : nvn_stage][reg] : NULL;   // st：融合几何着色器的顶点变体从几何阶段取 uniform | st: the vertex variant with a fused geometry shader takes the uniform from the geometry stage
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
             use_rec("buf", u->addr, u->size, 0, NULL);
@@ -3076,7 +3077,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             slots[aid] = sid && sid < g_nsreg && g_srid[sid] ? g_srid[sid] : dummy_samp_rid();
             USE_SAMP(ss ? ss : dummy_samp(), MTLResourceUsageRead);
             if (bl && sid > 0) { int ok = sid < g_nsreg && g_sreg_ok[sid]; samp_par sp = ok ? g_sreg[sid] : (samp_par){0};   // 本段已持 g_rmu | g_rmu is already held in this section
-                if (ok) PD("B %llu st%d samp reg%d sid=%d mag=%d min=%d（0 最近点 / 1 双线性；2–5 带 mip）", g_stat_pass, nvn_stage, reg, sid, (int)sp.magf, (int)sp.minf); }
+                if (ok) PD("B %llu st%d samp reg%d sid=%d mag=%d min=%d cmp=%d/%d（0 最近点 / 1 双线性；2–5 带 mip；cmp 模式/函数）", g_stat_pass, nvn_stage, reg, sid, (int)sp.magf, (int)sp.minf, (int)sp.cmp_mode, (int)sp.cmp_func); }
         } else if (b->kind == NVN_RB_TEX) {
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
@@ -4832,7 +4833,8 @@ frz_plain:;
         }
         if (dw->count >= 4) enc_r_draw_indexed(en, mp, (dw->count / 4) * 6, MTLIndexTypeUInt32, g_quad_gpu, g_quad_ib.length, 1, dw->first, 0);
     } else if (dw) {
-        if (dw->count) { if (dw->instances > 1 || dw->base_instance) enc_r_draw_instanced(en, mp, dw->first, dw->count, dw->instances ? dw->instances : 1, dw->base_instance); else enc_r_draw(en, mp, dw->first, dw->count); }   // Blade：DrawArraysInstanced | Blade: DrawArraysInstanced
+        if (dw->count) { int gf = pr->sh[0] && pr->sh[0]->rf.gs_faces ? pr->sh[0]->rf.gs_faces : 1;   // 几何着色器实例化模拟：实例数与基实例 ×面数 | instanced geometry-shader emulation: instances and base instance x faces
+            if (dw->instances > 1 || dw->base_instance || gf > 1) enc_r_draw_instanced(en, mp, dw->first, dw->count, (dw->instances ? dw->instances : 1) * gf, dw->base_instance * gf); else enc_r_draw(en, mp, dw->first, dw->count); }   // Blade：DrawArraysInstanced | Blade: DrawArraysInstanced
     } else {
         if (prim == 7) { RED_ONCE(20, "带索引的四边形未实现"); return; }
         if (di->itype == 0) { RED_ONCE(21, "8 位索引未实现"); return; }
@@ -4840,8 +4842,9 @@ frz_plain:;
         uint64_t gpu;
         if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu)) { RED_ONCE(22, "索引缓冲不在内存池里"); return; }
         use_rec("buf", di->ibuf, (uint64_t)di->count * (di->itype == 1 ? 2 : 4), 0, NULL);
+        { int gf = pr->sh[0] && pr->sh[0]->rf.gs_faces ? pr->sh[0]->rf.gs_faces : 1;   // 几何着色器实例化模拟 | instanced geometry-shader emulation
         if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ((__bridge id<MTLBuffer>)mb).length - mo,
-                di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
+                (di->instances ? di->instances : 1) * gf, di->base_vertex, di->base_instance * gf); }
     }
     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
 }
@@ -5708,12 +5711,14 @@ static void td_dump(void) {
         int bw, bh; NSUInteger w = t.width, h = t.height, dz = t.depth;
         size_t bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : t.pixelFormat == MTLPixelFormatRGBA32Float ? 16 : 4; (void)bw; (void)bh;
         size_t row = w * bpp, img = row * h;
-        id<MTLBuffer> buf = [g_dev newBufferWithLength:img * dz options:MTLResourceStorageModeShared];
+        NSUInteger ns = t.textureType == MTLTextureTypeCube ? 6 : t.textureType == MTLTextureTypeCubeArray ? t.arrayLength * 6 : t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;   // 立方体 / 数组：逐片存（深度按片数叠加） | cube / array: saved slice by slice (depth = slices stacked)
+        id<MTLBuffer> buf = [g_dev newBufferWithLength:img * dz * ns options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-        [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, dz) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:img];
+        for (NSUInteger sl = 0; sl < ns; sl++)
+            [b copyFromTexture:t sourceSlice:sl sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, dz) toBuffer:buf destinationOffset:sl * img * dz destinationBytesPerRow:row destinationBytesPerImage:img];
         [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
         char path[1024]; snprintf(path, sizeof path, g_td_path, (int)ser); strlcat(path, ".raw", sizeof path);
-        FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu %zu\n", (unsigned long)w, (unsigned long)h, (unsigned long)dz, (unsigned long)t.pixelFormat, row); fwrite(buf.contents, 1, img * dz, f); fclose(f); }
+        FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu %zu\n", (unsigned long)w, (unsigned long)h, (unsigned long)(dz * ns), (unsigned long)t.pixelFormat, row); fwrite(buf.contents, 1, img * dz * ns, f); fclose(f); }
         MLOG("[texraw] ser=%llu %lux%lux%lu 格式 %lu → %s", ser, (unsigned long)w, (unsigned long)h, (unsigned long)dz, (unsigned long)t.pixelFormat, path);
     }
     for (NSArray *e in g_td_list) {
