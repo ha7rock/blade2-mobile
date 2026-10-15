@@ -788,7 +788,7 @@ void dm_gfx_suspend(int on) {
 }
 // 诊断 DM_NVN_SERIAL（缺省关，只为定位一帧错画）：1 = 每次出图入队后等 GPU 把本帧（含出图命令缓冲）做完再放游戏录下一帧；2 = 另外每次提交后也等 GPU 做完（帧内各提交互不重叠）
 // Diagnostic DM_NVN_SERIAL (off by default, only for localizing one-frame glitches): 1 = after each present is queued, wait until the GPU has finished this frame (including the present command buffer) before the game records the next one; 2 = also wait for GPU completion after every submit (no overlap between submits inside a frame)
-static int nvn_serial(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_SERIAL"); v = e ? atoi(e) : 0; if (v) LOG("[nvn] DM_NVN_SERIAL=%d：%s（诊断，帧率会降）", v, v >= 2 ? "每次提交与每帧出图后都等 GPU 完成" : "每帧出图后等 GPU 完成"); } return v; }
+static int nvn_serial(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_SERIAL"); v = e ? atoi(e) : 0; if (v) LOG("[nvn] DM_NVN_SERIAL=%d：%s（诊断，帧率会降）", v, v == 3 ? "每帧出图后只等本帧游戏提交完成" : v == 4 ? "每帧出图后只等出图命令缓冲完成" : v >= 2 ? "每次提交与每帧出图后都等 GPU 完成" : "每帧出图后等 GPU 完成"); } return v; }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
@@ -805,7 +805,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
     atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
     gfx_leave();
-    if (nvn_serial() >= 2) mtl_finish();
+    if (nvn_serial() == 2) mtl_finish();
 }
 
 // 只影响 GPU 状态 / 只在 GPU 上执行的命令：空设备只计数（跳板已计）
@@ -1144,7 +1144,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) { o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop); o->rfence[idx] = mtl_last_fence(); }   // 只入队，立即返回；记下画这张的提交栅栏 | enqueue only, return immediately; remember the fence of the submission that drew it
     gfx_leave();
-    if (nvn_serial() >= 1) mtl_finish();
+    if (nvn_serial() == 3) mtl_wait(mtl_last_fence(), UINT64_MAX);   // 3 = 只等本帧游戏提交做完（不等出图命令缓冲）：区分「帧间游戏提交重叠」与「出图命令缓冲参与的重叠」 | 3 = wait only for this frame's game submissions (not the present command buffer): separates cross-frame game-submit overlap from overlap involving the present command buffer
+    else if (nvn_serial() == 4) mtl_present_flush();   // 4 = 只等出图命令缓冲做完 | 4 = wait only for the present command buffer
+    else if (nvn_serial() >= 1) mtl_finish();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     if (nvn_real[0] || nvn_real[1]) {   // DM_NVN_PROF：录制期 = 除提交外全部已实现函数耗时；提交期 = QueueSubmitCommands | DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands

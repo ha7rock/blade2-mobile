@@ -496,6 +496,7 @@ typedef struct { void *buf; uint32_t slot; } vis_slot;
 typedef struct { int n; vis_slot s[]; } vis_list;
 #define VIS_SLOTS 8192
 typedef struct { __strong id<MTLBuffer> buf; uint64_t fence; } vis_buf;
+static int vis_accum(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_VIS_ACCUM"); v = e && !strcmp(e, "1"); } return v; }
 static vis_buf g_vis_ring[4]; static int g_vis_ring_n, g_vis_ring_i = -1;
 static id<MTLBuffer> g_vis; static uint32_t g_vis_n;   // 本次提交的可见性缓冲与已用槽数 | This submission's visibility buffer and number of slots used
 static int vis_in_ring(id<MTLBuffer> b) { for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].buf == b) return 1; return 0; }
@@ -608,6 +609,7 @@ void mtl_sub_begin(void) {
     if (!g_vis_ring[pick].buf) { g_vis_ring[pick].buf = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis_ring[pick].buf); }
     if (g_vis && !vis_in_ring(g_vis)) defer_obj_release(g_vis);   // 上次提交留下的溢出缓冲（见 g_vis_n >= VIS_SLOTS 那一处）：退役，否则它一直留在驻留集里 | the overflow buffer left by the previous submission (see the place with g_vis_n >= VIS_SLOTS): retire it, otherwise it stays in the residency set forever
     g_vis = g_vis_ring[pick].buf;
+    if (vis_accum()) memset(g_vis.contents, 0, VIS_SLOTS * 8);   // DM_NVN_VIS_ACCUM：累加模式下领用时清零（环里的缓冲已等过栅栏） | DM_NVN_VIS_ACCUM: zero on take in accumulate mode (ring buffers have passed their fence)
     void pg_sub_begin_ext(uint64_t fence); pg_sub_begin_ext(g_fence + 1);
     void arena_begin(void); arena_begin();
 }
@@ -840,6 +842,22 @@ int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
 }
 static void rp_flush(void);
 static const char *cctx_snap(void);   // 这次提交里有什么（出错时打进红行；定义在 mtl_exec 之前） | What is in this submission (printed into the failure line on error; defined before mtl_exec)
+// 诊断 DM_NVN_VISSTAT=1（缺省关）：按报告地址记遮挡查询结果序列，统计「非零 → 0 → 非零」（一帧被判全遮挡又恢复，即可见性 A-B-A 的查询侧来源）与「0 → 非零 → 0」，每 20000 次报告打一行
+// Diagnostic DM_NVN_VISSTAT=1 (off by default): per report address, track the occlusion-query result sequence and count "nonzero -> 0 -> nonzero" (judged fully occluded for one report, then back: the query-side source of a visibility A-B-A) and "0 -> nonzero -> 0"; one log line per 20000 reports
+static void vis_stat_note(uint64_t addr, uint64_t sum, int nslots) {
+    static int on = -1; if (on < 0) on = getenv("DM_NVN_VISSTAT") != NULL; if (!on) return;
+    enum { VN = 1 << 14 }; static uint64_t ka[VN], v0[VN], v1[VN]; static uint8_t nv[VN]; static uint64_t tot, zero, flip_z, flip_nz, noslot, coll; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    tot++; if (!sum) zero++; if (!nslots) noslot++;
+    uint32_t h = (uint32_t)((addr * 0x9E3779B97F4A7C15ull) >> 50) & (VN - 1); int k;
+    for (k = 0; k < 8; k++) { uint32_t j = (h + k) & (VN - 1); if (!ka[j] || ka[j] == addr) { h = j; break; } }
+    if (k == 8) coll++;
+    else { if (!ka[h]) { ka[h] = addr; nv[h] = 0; }
+        if (nv[h] >= 2) { if (v0[h] && !v1[h] && sum) flip_z++; if (!v0[h] && v1[h] && !sum) flip_nz++; }
+        v0[h] = v1[h]; v1[h] = sum; if (nv[h] < 2) nv[h]++; }
+    if (tot % 20000 == 0) MLOG("DM_NVN_VISSTAT：报告 %llu 次，结果 0 的 %llu 次（其中无计数槽 %llu），非零→0→非零 %llu 次，0→非零→0 %llu 次，表满 %llu", (unsigned long long)tot, (unsigned long long)zero, (unsigned long long)noslot, (unsigned long long)flip_z, (unsigned long long)flip_nz, (unsigned long long)coll);
+    pthread_mutex_unlock(&mu);
+}
 uint64_t mtl_sub_commit(void) {
     defer_fallback();   // 推迟合并通道：提交结束仍有未回放的 P 绘制（正常路径不会到这里） | Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
     rp_flush();
@@ -864,10 +882,11 @@ uint64_t mtl_sub_commit(void) {
         for (int i = 0; i < n; i++) {
             if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
             else if (ops[i].kind == 3) {   // 通过采样数：自清零以来各槽之和 | Samples passed: the sum of all slots since the reset
-                vis_list *l = ops[i].vis; uint64_t sum = 0;
+                vis_list *l = ops[i].vis; uint64_t sum = 0; int vis_nslots = l->n;
                 for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
                 free(l); { static int all = -1; if (all < 0) { const char *e = getenv("DM_NVN_VIS_ALL"); all = e && !strcmp(e, "1"); } if (all && !sum) sum = 1; }   // 诊断 DM_NVN_VIS_ALL=1：遮挡查询一律「可见」（判是不是查询结果把东西剔掉了） | Diagnostic DM_NVN_VIS_ALL=1: every occlusion query answers 'visible' (to tell whether query results are culling things)
                 uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
+                vis_stat_note(ops[i].addr, sum, vis_nslots);
             }
             else { uint64_t t = gpu_ticks(), rec[2] = {ops[i].type == 0 || ops[i].type == 0x10 ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }
         }
@@ -2101,8 +2120,11 @@ static RENC rp_begin_ex(int clear_only) {
         // 退役的只能是上一块溢出缓冲。溢出缓冲本身在下次提交换回环里的缓冲时退役（mtl_sub_begin）
         // Slots used up (one submission exceeds VIS_SLOTS counting passes): create an overflow buffer and continue with it. Buffers in the ring must not be handed to retirement (they are still used in rotation, and retiring would remove them from the residency set);
         // only the previous overflow buffer may be retired. The overflow buffer itself is retired when the next submission switches back to a ring buffer (mtl_sub_begin)
-        if (!g_vis || g_vis_n >= VIS_SLOTS) { if (g_vis && !vis_in_ring(g_vis)) defer_obj_release(g_vis); g_vis = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis); g_vis_n = 0; }
+        if (!g_vis || g_vis_n >= VIS_SLOTS) { if (g_vis && !vis_in_ring(g_vis)) defer_obj_release(g_vis); g_vis = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis); g_vis_n = 0; if (vis_accum()) memset(g_vis.contents, 0, VIS_SLOTS * 8); }
         pd.visibilityResultBuffer = g_vis;
+        // 诊断 DM_NVN_VIS_ACCUM=1（缺省关）：可见性结果改「跨编码器累加」（缺省 Reset = 每建一个渲染编码器就重置可见性数据；同一提交的各通道共用一块缓冲、各占一槽，判重置是否把前面通道的计数清掉）；槽在缓冲领用时清零
+        // Diagnostic DM_NVN_VIS_ACCUM=1 (off by default): visibility results 'accumulate across encoders' (default Reset = visibility data is reset whenever a render encoder is created; all passes of one submission share one buffer with one slot each — tells whether the reset wipes earlier passes' counts); slots are zeroed when the buffer is taken
+        if (vis_accum()) pd.visibilityResultType = MTLVisibilityResultTypeAccumulate;
     }
     g_enc_vis = 0; g_enc_has_vis = g_vis_on;
     pg_render(pd, (NSUInteger)R.rt.n);
