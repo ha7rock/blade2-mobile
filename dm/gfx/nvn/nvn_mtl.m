@@ -700,7 +700,16 @@ static void blit_note(void);   // 逐通道转储：拷贝 / 缓冲更新结束�
 #if DM_NVN_M3
 static BENC blit(void) { blit_note(); rp_end(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); } return g_blit; }
 #else
-static BENC blit(void) { blit_note(); rp_end(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; } return g_blit; }
+// 复用同一个拷贝编码器时，前后两次拷贝之间也要一道屏障：Metal 4 同一编码器内的命令不保证按录制顺序执行，先写后读 / 同区间两次写会乱序
+// （上游 t_nvn 5c 未加屏障时 3 次里 1 次读到旧值）。建编码器时那道屏障只管它与之前的编码器。Blade：uniform 内联更新与缓冲拷贝都走这里，
+// 乱序一次就是某帧 uniform 是旧值 / 半新——整帧全黑、特效顶点炸满屏，随机出现（录屏实录）
+// When reusing the same copy encoder a barrier is also needed between two copies: Metal 4 does not guarantee commands inside one encoder run in recording order, so write-then-read / two writes
+// to the same range can be reordered (upstream t_nvn 5c read a stale value 1 time in 3 without it). The barrier at encoder creation only orders it against earlier encoders. Blade: inline uniform updates
+// and buffer copies all go through here; one reorder = a frame with stale / half-new uniforms -- whole frame black, effect vertices exploding across the screen, at random (seen in screen recordings)
+static BENC blit(void) { blit_note(); rp_end();
+    if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; }
+    else [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+    return g_blit; }
 #endif
 
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
@@ -6109,14 +6118,15 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
     if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
     id<MTLBuffer> rl_rb = g_rl_rb; NSUInteger rl_w = g_rl_w, rl_h = g_rl_h; g_rl_rb = nil;
-    if (rl_rb) { BENC rb_enc = enc_b_begin(cb); [rb_enc copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(g_rl_x0, g_rl_y0, 0) sourceSize:MTLSizeMake(rl_w, rl_h, 1) toBuffer:rl_rb destinationOffset:0 destinationBytesPerRow:rl_w * 4 destinationBytesPerImage:rl_w * rl_h * 4]; enc_b_end(rb_enc); }
+    if (rl_rb) { BENC rb_enc = enc_b_begin(cb); [rb_enc barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [rb_enc copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(g_rl_x0, g_rl_y0, 0) sourceSize:MTLSizeMake(rl_w, rl_h, 1) toBuffer:rl_rb destinationOffset:0 destinationBytesPerRow:rl_w * 4 destinationBytesPerImage:rl_w * rl_h * 4]; enc_b_end(rb_enc); }
     unsigned long long rl_n = g_present_n, rl_tns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); FILE *rl_f = g_rl_f; pthread_mutex_t *rl_mu = g_rl_mu;
     if (g_dm_present_link) {   // 留一份给空节拍重出图 | keep a copy for re-presenting on empty ticks
         id<MTLTexture> dt = dr.texture;
         if (!g_last_frame || g_last_frame.width != dt.width || g_last_frame.height != dt.height || g_last_frame.pixelFormat != dt.pixelFormat) {
             MTLTextureDescriptor *ld = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dt.pixelFormat width:dt.width height:dt.height mipmapped:NO];
             ld.storageMode = MTLStorageModePrivate; ld.usage = MTLTextureUsageShaderRead; if (g_last_frame) defer_obj_release(g_last_frame); g_last_frame = [g_dev newTextureWithDescriptor:ld]; res_add(g_last_frame); }
-        BENC lf = enc_b_begin(cb); [lf copyFromTexture:dt sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(dt.width, dt.height, 1) toTexture:g_last_frame destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)]; enc_b_end(lf);
+        BENC lf = enc_b_begin(cb); [lf barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];   // Metal 4：编码器之间不自动排序，先等渲染编码器写完 drawable 再拷（没有这道屏障时副本随机是黑的 → 空节拍重出图黑一拍） | Metal 4: encoders are not ordered automatically; wait for the render encoder to finish the drawable before copying (without this the copy is randomly black → a black refresh on empty-tick re-presents)
+        [lf copyFromTexture:dt sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(dt.width, dt.height, 1) toTexture:g_last_frame destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)]; enc_b_end(lf);
     }
     [cb endCommandBuffer];
 #endif
@@ -6233,7 +6243,7 @@ static void present_repeat(id<CAMetalDrawable> dr) {   // 空节拍：把上一�
     @autoreleasepool {
         [g_q4 waitForDrawable:dr];
         [g_rep_alloc4[i] reset]; CBUF cb = g_rep_cb[i]; [cb beginCommandBufferWithAllocator:g_rep_alloc4[i]];
-        BENC b = enc_b_begin(cb); [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dt destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)]; enc_b_end(b);
+        BENC b = enc_b_begin(cb); [b barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dt destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)]; enc_b_end(b);
         [cb endCommandBuffer];
         MTL4CommitOptions *o = [MTL4CommitOptions new];
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { if (f.error) MLOG("【红】重出图命令缓冲错误：%s", f.error.description.UTF8String); atomic_store(&g_rep_busy[i], 0); }];
