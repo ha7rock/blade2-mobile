@@ -149,6 +149,8 @@ tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_bu
 | 地板成块缺失、带筛孔纹 | UE4 深度预通道 + 基础通道 GEQUAL 深度测试要求两个不同顶点着色器算出**逐位相同**的裁剪位置；Metal 默认 fast-math 下各着色器 fma 合并不同，MSL 的 `[[position, invariant]]` 不加编译选项不生效 | `xcrun metal -fpreserve-invariance`（Mac 与 iOS 两条编译口径都加） |
 | 点光源立方体阴影不画 | 4 个几何着色器把三角形发到 6 个面（`EmitVertex` 18 次，层号 0–5 常量，每面乘 `gp_c3` 第 6+4f 行起的矩阵、`_m0[f].x` 为面开关） | 离线认出这一族（`dmsh_build.py gs_cube`），顶点变体按 `instance_id % 6` 选面与矩阵、输出层号与面号常量；几何阶段 uniform 以 `stage=2` 绑定挂进顶点参数块；宿主把实例数与基实例 ×6（反射 `gs_faces`）。坑：UE4 阴影顶点只写世界坐标 xyz，真机上未写的插值 w 缺省 1 而翻译出的 MSL 清零 → 融合时补 1，否则平移行丢失 |
 
+2026-10-15 午后：**有声音了**——`hle_blade.c` 的音频渲染器按 SDK 接口真混音（游戏用 32 个 44.1 kHz 单声道 DSP-ADPCM 声音槽 → 32 kHz 渲染器 → CoreAudio，`DM_AUDIO=1`，`DM_AUDIO_GAIN` 调响度，`DM_AUDIO_OUT_DUMP` 存混音）；d2r 的暗黑专属固定地址缺省在通用宿主下全部失效（`DM_GENERIC_HOST`）；TBDR 优化开启验证通过（画面一致、GPU 时间持平，Mac 默认仍关）；200 秒脚本游玩（移动 / 攻击）无崩溃。
+
 还没做 / 已知问题：
 0. **偶发 GPU hang**（进关卡时出现过一次 `kIOGPUCommandBufferCallbackErrorHang`，后续帧恢复）；`MemoryPoolMapVirtual` 现已实现映射表但本游戏没用到。
 1. **点光源阴影的画面验证**：Act 1 开头没有带阴影的点光源，只在标题场景（角色近景、无地面）用到；立方体图 6 个面已有几何、比较采样器正确，等遇到有接收面的场景再对比。
