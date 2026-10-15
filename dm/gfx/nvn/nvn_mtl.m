@@ -96,6 +96,12 @@ static id<MTL4CommandAllocator> g_alloc4[ALLOC_MAX];   // 主提交的命令分�
 static id<MTL4CommandAllocator> g_up_alloc4[3];
 static id<MTL4CommandAllocator> g_present_alloc4[3];
 static CBUF g_present_cb[3];
+// 空节拍重出图：节拍对象每拍都交来一张 drawable；没有新游戏帧的那一拍原先直接返回不出图，这张 drawable 的旧内容（黑）被显示一个刷新周期——录屏逐帧可见 8 ms 的全黑闪（游戏帧晚到一拍就出现，GPU 忙时成串）。
+// 现在每次出图顺手把 drawable 拷一份到 g_last_frame，空节拍把它再出一次。两套分配器 / 命令缓冲轮用，栅栏按完成回调。
+// Re-present on empty ticks: the display link hands a drawable every tick; a tick without a new game frame used to return without presenting, and that drawable's stale (black) content was displayed for one refresh --
+// screen recordings show 8 ms all-black flashes frame by frame (whenever a game frame misses a tick; in bursts when the GPU is busy). Now every present also copies the drawable into g_last_frame, and empty ticks present it again.
+// Two allocators / command buffers in rotation, fenced by the completion callback.
+static id<MTLTexture> g_last_frame; static id<MTL4CommandAllocator> g_rep_alloc4[2]; static CBUF g_rep_cb[2]; static _Atomic int g_rep_busy[2]; static uint64_t g_rep_n, g_rep_presented;
 static id<MTL4ArgumentTable> g_vt, g_ft, g_ct, g_up_ct;
 static id<MTL4ArgumentTable> g_present_args;
 #endif
@@ -358,7 +364,7 @@ void mtl_init(void) {
         g_present_alloc4[i] = [g_dev newCommandAllocatorWithDescriptor:pad error:&ae];
         if (!g_present_alloc4[i]) MDIE("建立出图 MTL4CommandAllocator[%d] 失败：%s", i, ae.localizedDescription.UTF8String);
         g_present_cb[i] = [g_dev newCommandBuffer];
-        if (!g_present_cb[i]) MDIE("建立出图 MTL4CommandBuffer[%d] 失败", i);
+        if (!g_present_cb[i]) MDIE("建立出图 MTL4CommandBuffer[%d] 失败", i);        if (i < 2) { g_rep_alloc4[i] = [g_dev newCommandAllocatorWithDescriptor:pad error:&ae]; g_rep_cb[i] = [g_dev newCommandBuffer]; if (!g_rep_alloc4[i] || !g_rep_cb[i]) MDIE("建立重出图 MTL4 分配器 / 命令缓冲[%d] 失败", i); }
     }
     MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new];
     atd.maxBufferBindCount = 31; atd.maxTextureBindCount = 1;
@@ -6095,6 +6101,13 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<MTLBuffer> rl_rb = g_rl_rb; NSUInteger rl_w = g_rl_w, rl_h = g_rl_h; g_rl_rb = nil;
     if (rl_rb) { BENC rb_enc = enc_b_begin(cb); [rb_enc copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(g_rl_x0, g_rl_y0, 0) sourceSize:MTLSizeMake(rl_w, rl_h, 1) toBuffer:rl_rb destinationOffset:0 destinationBytesPerRow:rl_w * 4 destinationBytesPerImage:rl_w * rl_h * 4]; enc_b_end(rb_enc); }
     unsigned long long rl_n = g_present_n, rl_tns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); FILE *rl_f = g_rl_f; pthread_mutex_t *rl_mu = g_rl_mu;
+    if (g_dm_present_link) {   // 留一份给空节拍重出图 | keep a copy for re-presenting on empty ticks
+        id<MTLTexture> dt = dr.texture;
+        if (!g_last_frame || g_last_frame.width != dt.width || g_last_frame.height != dt.height || g_last_frame.pixelFormat != dt.pixelFormat) {
+            MTLTextureDescriptor *ld = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dt.pixelFormat width:dt.width height:dt.height mipmapped:NO];
+            ld.storageMode = MTLStorageModePrivate; ld.usage = MTLTextureUsageShaderRead; if (g_last_frame) defer_obj_release(g_last_frame); g_last_frame = [g_dev newTextureWithDescriptor:ld]; res_add(g_last_frame); }
+        BENC lf = enc_b_begin(cb); [lf copyFromTexture:dt sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(dt.width, dt.height, 1) toTexture:g_last_frame destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)]; enc_b_end(lf);
+    }
     [cb endCommandBuffer];
 #endif
 #if !DM_NVN_M3
@@ -6125,8 +6138,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
             for (int i = 1; i < 300; i++) { double v = a[i]; int j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
             double b[300]; memcpy(b, e2e, sizeof b);
             for (int i = 1; i < 300; i++) { double v = b[i]; int j = i - 1; while (j >= 0 && b[j] > v) { b[j + 1] = b[j]; j--; } b[j + 1] = v; }
-            MLOG("显示节拍 至 %llu：节拍 300、出图 %llu、空节拍 %llu、合并丢弃旧帧 %llu；提交领先目标上屏 p50 %.3f ms / 最小 %.3f ms；游戏入队到目标上屏 p50 %.3f ms / 最小 %.3f / 最大 %.3f ms",
-                 (unsigned long long)g_link_tick_n, (unsigned long long)g_present_n, (unsigned long long)(g_link_tick_n - g_present_n),
+            MLOG("显示节拍 至 %llu：节拍 300、出图 %llu、空节拍 %llu（重出图 %llu）、合并丢弃旧帧 %llu；提交领先目标上屏 p50 %.3f ms / 最小 %.3f ms；游戏入队到目标上屏 p50 %.3f ms / 最小 %.3f / 最大 %.3f ms",
+                 (unsigned long long)g_link_tick_n, (unsigned long long)g_present_n, (unsigned long long)(g_link_tick_n - g_present_n), (unsigned long long)g_rep_presented,
                  (unsigned long long)g_link_dropped, a[149], a[0], b[149], b[0], b[299]);
         }
     }
@@ -6193,6 +6206,22 @@ static uint64_t g_stall_t0, g_stall_drop, g_stall_n; static int g_stall_red, g_s
 // but it is not counted as stuck and no failure is reported; the stall is measured from the later of "the most recent callback / the most recent activation" (A16 logs: 8–17 seconds inactive and 17 seconds in the background were both reported as 「前台卡住」(stuck in foreground))
 __attribute__((weak)) int dm_focus_now(void) { return 1; }   // 宿主 hle_oe.c 提供强定义；图形单测不链宿主时视为一直激活 | The host's hle_oe.c provides the strong definition; when graphics unit tests do not link the host it is treated as always active
 __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
+static void present_repeat(id<CAMetalDrawable> dr) {   // 空节拍：把上一帧再出一次（见 g_last_frame 处说明） | empty tick: present the previous frame again (see the note at g_last_frame)
+    id<MTLTexture> src = g_last_frame; if (!dr || !src) return;
+    id<MTLTexture> dt = dr.texture; if (dt.width != src.width || dt.height != src.height || dt.pixelFormat != src.pixelFormat) return;
+    int i = (int)(g_rep_n++ % 2); if (atomic_load(&g_rep_busy[i])) return;   // 上上次的还没完成（极少）：这拍放弃 | the one before last has not completed yet (rare): skip this tick
+    atomic_store(&g_rep_busy[i], 1);
+    @autoreleasepool {
+        [g_q4 waitForDrawable:dr];
+        [g_rep_alloc4[i] reset]; CBUF cb = g_rep_cb[i]; [cb beginCommandBufferWithAllocator:g_rep_alloc4[i]];
+        BENC b = enc_b_begin(cb); [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dt destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)]; enc_b_end(b);
+        [cb endCommandBuffer];
+        MTL4CommitOptions *o = [MTL4CommitOptions new];
+        [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { if (f.error) MLOG("【红】重出图命令缓冲错误：%s", f.error.description.UTF8String); atomic_store(&g_rep_busy[i], 0); }];
+        CBUF buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; [g_q4 signalDrawable:dr];
+        [dr present]; g_rep_presented++;
+    }
+}
 @implementation NvMetalDisplayLinkDelegate
 - (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
     (void)link;
@@ -6206,7 +6235,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_link_cv);
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
-    if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); return; }
+    if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); if (g_dm_present_link) present_repeat(update.drawable); return; }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     pq_item it = g_pq[(g_pq_in - 1) % PQ]; g_link_it_tin = it.t_in;
     g_pq_read = g_pq_in;
