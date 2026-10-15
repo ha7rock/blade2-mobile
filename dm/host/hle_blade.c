@@ -160,13 +160,14 @@ static struct {
     bufmixer_t fx[REN_FXMAX]; int nfx;
     float bufgain[REN_BUFMAX][2]; int route_dirty;
     voice_t v[REN_VMAX];
-    AudioUnit au; int real;
+    AudioUnit au; int real; _Atomic int au_paused;   // au_paused：前端 / 音频会话要求暂停出声（dm_audren_suspend），单元停着、节拍线程按实时静音消耗 | au_paused: the front end / audio session asked to pause output (dm_audren_suspend); the unit is stopped and the tick thread consumes silently in real time
     FILE *dump;
     uint64_t frames, ticks, reverb_warned; int peak; int bad_event;
     uint64_t last_stat_ns;
 } g_ren;
 
-static int real_audio_ren(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : 0; }
+// 缺省与 hle_audio.c 同口径：iOS 真出声（产品要有声音），Mac 静音接收端 | Default matches hle_audio.c: real output on iOS (the product must have sound), silent sink on Mac
+static int real_audio_ren(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
 // 客体 VoiceType / MemoryPoolType 都只是一个指针大小的句柄（SDK 公开布局：{ void *_pInfo }，游戏把它们按 8 字节一个排成数组），宿主只写这 8 字节：指向宿主对象
 // Guest VoiceType / MemoryPoolType are each a pointer-sized handle (public SDK layout: { void *_pInfo }, the game lays them out in arrays 8 bytes apart); the host writes only these 8 bytes: a pointer to the host object
 static voice_t *vget(const void *g) {
@@ -301,7 +302,8 @@ static OSStatus ren_au_render(void *ctx, AudioUnitRenderActionFlags *f, const Au
 }
 static int ren_au_open(int rate) {   // 立体声 16 位、渲染器采样率喂给 DefaultOutput（它自己转到设备采样率） | Stereo 16-bit at the renderer rate into DefaultOutput (it converts to the device rate itself)
 #if TARGET_OS_IPHONE
-    // iOS 没有 DefaultOutput：输出单元是 RemoteIO（音频会话由 d2r 的 hle_audio.c 在 iOS 上统一激活） | iOS has no DefaultOutput: the output unit is RemoteIO (the audio session is activated on iOS by d2r's hle_audio.c)
+    // iOS 没有 DefaultOutput：输出单元是 RemoteIO。先激活音频会话（audio_session.m：Playback、打断 / 线路变化处理），再建单元 | iOS has no DefaultOutput: the output unit is RemoteIO. Activate the audio session first (audio_session.m: Playback, interruption / route change handling), then create the unit
+    { void dm_audio_session_begin(void); dm_audio_session_begin(); }
     AudioComponentDescription d = {.componentType = kAudioUnitType_Output, .componentSubType = kAudioUnitSubType_RemoteIO, .componentManufacturer = kAudioUnitManufacturer_Apple};
 #else
     AudioComponentDescription d = {.componentType = kAudioUnitType_Output, .componentSubType = kAudioUnitSubType_DefaultOutput, .componentManufacturer = kAudioUnitManufacturer_Apple};
@@ -325,7 +327,7 @@ static void *audren_tick(void *a) {
         t += AUDREN_PERIOD_NS; uint64_t now = now_ns(); if (t > now) { struct timespec ts = {0, (long)(t - now)}; nanosleep(&ts, NULL); } else if (now - t > 200000000ull) t = now;
         if (atomic_load(&g_ren.started) && g_ren.event) {
             if (!hle_signal_system_event_try(g_ren.event) && !g_ren.bad_event) { g_ren.bad_event = 1; LOG("【红】音频渲染器事件未绑定，触发不了"); }
-            if (!g_ren.au) { pthread_mutex_lock(&g_ren.m); ren_mix(scratch, g_ren.period); pthread_mutex_unlock(&g_ren.m); }
+            if (!g_ren.au || atomic_load(&g_ren.au_paused)) { pthread_mutex_lock(&g_ren.m); ren_mix(scratch, g_ren.period); pthread_mutex_unlock(&g_ren.m); }   // 没声卡 / 声卡暂停中：静音消耗 | no device / device paused: consume silently
         }
         g_ren.ticks++;
     }
@@ -362,8 +364,18 @@ HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11S
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE", "渲染器开始：节拍事件开始触发、CoreAudio 开播", Result, h_ren_Start, void *h) {
-    (void)h; if (atomic_exchange(&g_ren.started, 1) == 0 && g_ren.au && AudioOutputUnitStart(g_ren.au)) die("audren：AudioUnit 启动失败");
+    (void)h; if (atomic_exchange(&g_ren.started, 1) == 0 && g_ren.au && !atomic_load(&g_ren.au_paused) && AudioOutputUnitStart(g_ren.au)) die("audren：AudioUnit 启动失败");   // 暂停中不起单元，恢复时再起 | not started while paused, started on resume
     return RES_OK;
+}
+// 前端 / 音频会话（audio_session.m：进后台、被打断）：渲染器的声卡单元停 / 起；停着时节拍线程照实时静音消耗（缓冲照归还，游戏音频节奏不卡）。
+// 起失败（会话还被别人占着）不致命：留在暂停态，下一次调 0 再试
+// Front end / audio session (audio_session.m: background, interruption): stop / start the renderer's audio unit; while stopped the tick thread consumes silently in real time (buffers are still returned, the game's audio pacing does not stall).
+// A failed start (the session still held by someone else) is not fatal: stay paused, retry on the next call with 0
+void dm_audren_suspend(int on) {
+    if (atomic_exchange(&g_ren.au_paused, on) == on) return;
+    if (!g_ren.au || !atomic_load(&g_ren.started)) return;   // 单元没建 / 渲染器没开始：只记状态，Start 时按状态起 | no unit / renderer not started: only the state is recorded, Start honours it
+    if (on) { AudioOutputUnitStop(g_ren.au); LOG("audren：出声暂停（后台 / 打断）"); }
+    else { OSStatus st = AudioOutputUnitStart(g_ren.au); if (st) { atomic_store(&g_ren.au_paused, 1); LOG("【红】audren：恢复出声失败（状态 %d），保持静音消耗，下次恢复再试", (int)st); } else LOG("audren：出声恢复"); }
 }
 HLE_FORCE("_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE", "渲染器停止", Result, h_ren_Stop, void *h) {
     (void)h; if (atomic_exchange(&g_ren.started, 0) == 1 && g_ren.au) AudioOutputUnitStop(g_ren.au);

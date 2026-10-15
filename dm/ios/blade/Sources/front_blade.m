@@ -1,12 +1,14 @@
 // 通用宿主的 iOS 前端（front.h 的实现，对应 Mac 的 dm/host/front_mac.m）：Metal 出图视图 + 通用虚拟手柄 + 软键盘输入框 + 场景生命周期。
 // 虚拟手柄：画在游戏画面之上、只画不收触点，触点由出图视图统一收；每根手指按落点归类——按钮圆内 = 该键，左半屏空处 = 左摇杆（浮动：落点为中心），
 // 右半屏空处 = 右摇杆；每次变化把整组状态经 dm_input_set 交给宿主（hle_hid.c 在游戏读手柄时落地）。键位 = dm_input.h 的 DM_BTN_*，摇杆 ±32767、上为正。
-// 不接触摸屏（dm_touch_set）：游戏只认手柄；DM_PAD_OVERLAY=0 不画控件（接实体手柄时）。
+// 不接触摸屏（dm_touch_set）：游戏只认手柄；DM_PAD_OVERLAY=0 不画控件。
+// 实体手柄（dm/host/gamepad_generic.m，GameController）：连上第一个时覆盖层自动藏起、只剩摇杆落点区；最后一个断开再显出来。失活时手柄键一并清零。
 // Generic host iOS front end (implements front.h, the counterpart of dm/host/front_mac.m on the Mac): Metal present view + generic virtual gamepad + software keyboard input box + scene lifecycle.
 // Virtual gamepad: drawn over the game picture, draws only and takes no touches; touches are collected by the present view. Each finger is classified by where it lands --
 // inside a button circle = that button, free space in the left half = left stick (floating: the landing point is the centre), free space in the right half = right stick;
 // on every change the whole state goes to the host through dm_input_set (hle_hid.c applies it when the game polls the controller). Buttons = DM_BTN_* of dm_input.h, sticks ±32767, up positive.
-// The touchscreen (dm_touch_set) is not wired: the game only accepts controllers; DM_PAD_OVERLAY=0 hides the widgets (when a physical controller is attached).
+// The touchscreen (dm_touch_set) is not wired: the game only accepts controllers; DM_PAD_OVERLAY=0 hides the widgets.
+// Physical controllers (dm/host/gamepad_generic.m, GameController): when the first one connects the overlay hides itself and only the stick landing zones remain; it reappears when the last one disconnects. Controller buttons are zeroed on resign active as well.
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
@@ -21,13 +23,13 @@
 static CAMetalLayer *g_layer;
 
 // ---- 虚拟手柄布局 | virtual gamepad layout ----
-enum { PB_A, PB_B, PB_X, PB_Y, PB_L, PB_R, PB_ZL, PB_ZR, PB_PLUS, PB_MINUS, PB_LS, PB_RS, PB_N };
-static const uint64_t k_bit[PB_N] = {DM_BTN_A, DM_BTN_B, DM_BTN_X, DM_BTN_Y, DM_BTN_L, DM_BTN_R, DM_BTN_ZL, DM_BTN_ZR, DM_BTN_PLUS, DM_BTN_MINUS, DM_BTN_LS, DM_BTN_RS};
-static const char *k_label[PB_N] = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "+", "−", "L3", "R3"};
+enum { PB_A, PB_B, PB_X, PB_Y, PB_L, PB_R, PB_ZL, PB_ZR, PB_PLUS, PB_MINUS, PB_LS, PB_RS, PB_UP, PB_DOWN, PB_LEFT, PB_RIGHT, PB_N };
+static const uint64_t k_bit[PB_N] = {DM_BTN_A, DM_BTN_B, DM_BTN_X, DM_BTN_Y, DM_BTN_L, DM_BTN_R, DM_BTN_ZL, DM_BTN_ZR, DM_BTN_PLUS, DM_BTN_MINUS, DM_BTN_LS, DM_BTN_RS, DM_BTN_UP, DM_BTN_DOWN, DM_BTN_LEFT, DM_BTN_RIGHT};
+static const char *k_label[PB_N] = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "+", "−", "L3", "R3", "▲", "▼", "◀", "▶"};
 typedef struct { CGPoint c; CGFloat r; } pad_circle;
 typedef struct { pad_circle btn[PB_N]; CGFloat stick_r; CGSize size; } pad_layout;
-// 按屏幕点数与安全区排：右下 A/B/X/Y 菱形，上沿 L ZL（左）R ZR（右）、+ −（中），L3 R3 小圆在菱形上方；尺寸以画面高为基准
-// Laid out from screen points and safe area: A/B/X/Y diamond bottom right, top edge L ZL (left) R ZR (right) + − (centre), small L3 R3 above the diamond; sizes relative to the picture height
+// 按屏幕点数与安全区排：右下 A/B/X/Y 菱形，上沿 L ZL（左）R ZR（右）、+ −（中），L3 R3 小圆在菱形上方，左侧中部十字键（左摇杆落点区之上）；尺寸以画面高为基准
+// Laid out from screen points and safe area: A/B/X/Y diamond bottom right, top edge L ZL (left) R ZR (right) + − (centre), small L3 R3 above the diamond, D-pad mid-left (above the left stick landing zone); sizes relative to the picture height
 static void pad_layout_make(pad_layout *L, CGSize sz, UIEdgeInsets in) {
     CGFloat H = sz.height, W = sz.width, r = fmax(18, H * 0.065), s = r * 0.8, bot = H - in.bottom, top = in.top, left = in.left, right = W - in.right;
     L->size = sz; L->stick_r = r * 2.3;
@@ -38,6 +40,9 @@ static void pad_layout_make(pad_layout *L, CGSize sz, UIEdgeInsets in) {
     L->btn[PB_R]  = (pad_circle){{right - 1.6 * s, top + 1.4 * s}, s}; L->btn[PB_ZR] = (pad_circle){{right - 4.4 * s, top + 1.4 * s}, s};
     L->btn[PB_MINUS] = (pad_circle){{W / 2 - 2.0 * s, top + 1.2 * s}, s * 0.85}; L->btn[PB_PLUS] = (pad_circle){{W / 2 + 2.0 * s, top + 1.2 * s}, s * 0.85};
     L->btn[PB_LS] = (pad_circle){{d.x - 3.4 * r, d.y - 3.2 * r}, s * 0.8}; L->btn[PB_RS] = (pad_circle){{d.x, d.y - 4.4 * r}, s * 0.8};
+    CGFloat q = r * 0.75; CGPoint c = CGPointMake(left + 3.2 * r, H * 0.5 - 0.3 * r);   // 十字键中心：左侧中部，在左摇杆空闲圈之上 | D-pad centre: mid-left, above the idle left-stick ring
+    L->btn[PB_UP] = (pad_circle){{c.x, c.y - 1.5 * q}, q}; L->btn[PB_DOWN] = (pad_circle){{c.x, c.y + 1.5 * q}, q};
+    L->btn[PB_LEFT] = (pad_circle){{c.x - 1.5 * q, c.y}, q}; L->btn[PB_RIGHT] = (pad_circle){{c.x + 1.5 * q, c.y}, q};
 }
 static int pad_hit(const pad_layout *L, CGPoint p) {
     int best = -1; CGFloat bd = 1e9;
@@ -79,7 +84,7 @@ static int pad_hit(const pad_layout *L, CGPoint p) {
 // ---- 出图视图：CAMetalLayer + 触点归类 | present view: CAMetalLayer + touch classification ----
 enum { ROLE_NONE, ROLE_BTN, ROLE_LS, ROLE_RS };
 typedef struct { UITouch *__unsafe_unretained t; int role, btn; CGPoint c; } slot_t;
-@interface DmBladeView : UIView { pad_layout _L; slot_t _slot[16]; DmPadOverlay *_ov; BOOL _hide; }
+@interface DmBladeView : UIView { pad_layout _L; slot_t _slot[16]; DmPadOverlay *_ov; BOOL _hide, _padOn; }   // _hide：DM_PAD_OVERLAY=0；_padOn：有实体手柄连着 | _hide: DM_PAD_OVERLAY=0; _padOn: a physical controller is connected
 @end
 @implementation DmBladeView
 + (Class)layerClass { return CAMetalLayer.class; }
@@ -90,6 +95,13 @@ typedef struct { UITouch *__unsafe_unretained t; int role, btn; CGPoint c; } slo
     pad_layout_make(&_L, f.size, UIEdgeInsetsZero);
     _ov = [[DmPadOverlay alloc] initWithFrame:self.bounds]; _ov.layout = &_L; _ov.hidden = _hide; _ov.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; [self addSubview:_ov];
     return self;
+}
+- (BOOL)overlayOff { return _hide || _padOn; }
+// 实体手柄连上 / 全部断开（gamepad_generic.m 在主队列回调）：藏 / 显覆盖层；藏着时触点只当摇杆，正按着的虚拟键松开 | A physical controller connected / all disconnected (gamepad_generic.m calls back on the main queue): hide / show the overlay; while hidden touches only count as sticks, held virtual buttons are released
+- (void)padPresent:(BOOL)on {
+    if (_padOn == on) return; _padOn = on; _ov.hidden = self.overlayOff;
+    if (on) { for (int i = 0; i < 16; i++) if (_slot[i].role == ROLE_BTN) _slot[i] = (slot_t){0}; }
+    [self publish]; LOG("前端：实体手柄%s，虚拟手柄覆盖层%s", on ? "已连接" : "全部断开", self.overlayOff ? "隐藏" : "显示");
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
@@ -110,12 +122,12 @@ static void stick_value(const pad_layout *L, CGPoint c, CGPoint p, int32_t *x, i
         else if (s->role == ROLE_LS) { stick_value(&_L, s->c, p, &lx, &ly); ls = YES; lc = s->c; lp = p; }
         else if (s->role == ROLE_RS) { stick_value(&_L, s->c, p, &rx, &ry); rs = YES; rc = s->c; rp = p; } }
     dm_input_set(bt, lx, ly, rx, ry);
-    _ov.held = bt; _ov.lsOn = ls; _ov.lsC = lc; _ov.lsP = lp; _ov.rsOn = rs; _ov.rsC = rc; _ov.rsP = rp; if (!_hide) [_ov setNeedsDisplay];
+    _ov.held = bt; _ov.lsOn = ls; _ov.lsC = lc; _ov.lsP = lp; _ov.rsOn = rs; _ov.rsC = rc; _ov.rsP = rp; if (!self.overlayOff) [_ov setNeedsDisplay];
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     (void)e;
     for (UITouch *t in ts) { int k = -1; for (int i = 0; i < 16; i++) if (!_slot[i].t) { k = i; break; } if (k < 0) continue;
-        CGPoint p = [t locationInView:self]; int b = _hide ? -1 : pad_hit(&_L, p); slot_t *s = &_slot[k]; s->t = t; s->c = p;
+        CGPoint p = [t locationInView:self]; int b = self.overlayOff ? -1 : pad_hit(&_L, p); slot_t *s = &_slot[k]; s->t = t; s->c = p;
         if (b >= 0) { s->role = ROLE_BTN; s->btn = b; } else s->role = p.x < self.bounds.size.width / 2 ? ROLE_LS : ROLE_RS; }
     [self publish];
 }
@@ -132,6 +144,12 @@ static void stick_value(const pad_layout *L, CGPoint c, CGPoint p, int32_t *x, i
 @end
 static DmBladeView *g_view;
 
+// 实体手柄（dm/host/gamepad_generic.m）：GameController 扩展手柄 → dm_pad_set；第一个连上 / 最后一个断开时回调这里藏 / 显覆盖层
+// Physical controllers (dm/host/gamepad_generic.m): GameController extended gamepad → dm_pad_set; calls back here when the first connects / the last disconnects to hide / show the overlay
+void dm_gamepad_start(void (*on_present)(int present)); void dm_gamepad_reset(void);
+void dm_audio_session_background(int on);   // dm/host/audio_session.m：进后台 / 回前台 → 渲染器声卡单元停 / 起（与打断合成） | dm/host/audio_session.m: background / foreground → stop / start the renderer's audio unit (combined with interruptions)
+static void pad_present(int on) { [g_view padPresent:on != 0]; }
+
 UIView *front_blade_view(CGRect bounds, CGFloat scale) {
     DmBladeView *v = [[DmBladeView alloc] initWithFrame:bounds]; g_view = v;
     g_layer = (CAMetalLayer *)v.layer;
@@ -140,6 +158,7 @@ UIView *front_blade_view(CGRect bounds, CGFloat scale) {
     g_layer.contentsScale = scale;
     g_layer.drawableSize = CGSizeMake(bounds.size.width * g_layer.contentsScale, bounds.size.height * g_layer.contentsScale);
     LOG("画面：窗口 %.0fx%.0f 点，出图 %.0fx%.0f 像素（游戏渲 1280x720，按窗口拉伸）", bounds.size.width, bounds.size.height, g_layer.drawableSize.width, g_layer.drawableSize.height);
+    dm_gamepad_start(pad_present);
     return v;
 }
 
@@ -204,9 +223,9 @@ void front_blade_focus(int ev) {
     static const char *k[] = {"sceneWillResignActive", "sceneDidEnterBackground", "sceneWillEnterForeground", "sceneDidBecomeActive"};
     LOG("前端：%s", k[ev & 3]);
     switch (ev) {
-        case 0: [g_view clearAll]; dm_focus_set(2); break;
-        case 1: dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); break;   // 挂起返回前在途 GPU 已清空 | in-flight GPU work is drained before the suspend returns
-        case 2: dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); break;
+        case 0: [g_view clearAll]; dm_gamepad_reset(); dm_focus_set(2); break;   // 实体手柄按着的键一并清零（松开事件在后台收不到） | controller buttons held are zeroed too (release events do not arrive in the background)
+        case 1: dm_focus_set(3); dm_audio_suspend(1); dm_audio_session_background(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); break;   // 挂起返回前在途 GPU 已清空 | in-flight GPU work is drained before the suspend returns
+        case 2: dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_session_background(0); dm_audio_suspend(0); dm_focus_set(2); break;
         case 3: dm_focus_set(1); break;
     }
 }

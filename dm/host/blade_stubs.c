@@ -59,7 +59,7 @@ void dm_ui_map_full(int on) { (void)on; } void dm_ui_ptr(int k, float x, float y
 void dm_ui_send_queue(const char *spec) { (void)spec; } void dm_ui_tab_go(void) {} uint64_t dm_ui_taps_base(void) { return 0; }
 void dm_ui_text_entered(const char *t) { (void)t; } void dm_ui_touch(int p, float x, float y) { (void)p; (void)x; (void)y; }
 void dm_touch_host_live(int op, float x, float y) { (void)op; (void)x; (void)y; } void dm_touch_host_live_enable(void) {}
-void dm_gamepad_start(void (*on_mode)(int)) { (void)on_mode; } void dm_gamepad_reset(void) {}
+// dm_gamepad_start / dm_gamepad_reset：实体手柄在 gamepad_generic.m（通用实现，Mac 与 iOS 共用），不再是空实现 | physical controllers live in gamepad_generic.m (generic, shared by Mac and iOS), no longer stubbed
 
 // ---- 状态查询 | state queries ----
 int dm_ingame_now(void) { return 1; }
