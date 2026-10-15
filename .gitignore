@@ -3,3 +3,4 @@
 /work/
 *.patched.bin
 *.img
+dm/host/dmhost_blade
