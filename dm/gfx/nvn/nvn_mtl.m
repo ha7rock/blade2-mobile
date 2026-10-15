@@ -138,6 +138,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
 static _Atomic int g_last_commit_error;
+static _Atomic int g_gpu_reset_pending;   // 有命令缓冲被 GPU 错误恢复丢掉：下次提交前把依赖「那帧 GPU 工作已做」的宿主推断全部作废 | a command buffer was discarded by a GPU error recovery: before the next submission drop every host inference that assumes that frame's GPU work happened
 static _Atomic int g_up_pending;
 
 static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // 驻留集专用锁：res_add 会在持 g_mu 的路径里调用（arena_new），不能共用 g_mu | Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
@@ -515,7 +516,7 @@ static int pend_hits(uint64_t a, uint64_t n) { if (g_pend_over) return 1; for (i
 typedef struct { uint64_t ser; uint16_t level, slice; } zskip_zero;
 static zskip_zero g_zskip_zero[4096]; static int g_zskip_n, g_zskip_count;
 static zskip_zero g_zskip_cand[8]; static uint8_t g_zskip_cand_ok[8];
-static void zskip_clear(void);
+static void zskip_clear(void); static void xv_relearn(const char *why);
 static int tbdr_on(void);
 static id g_cb;
 static BENC g_blit;
@@ -558,6 +559,11 @@ static int tbdr_on(void);
 
 static uint64_t g_sub_serial;   // 第几次提交（并行预编「每次提交只预测一次」用） | Submission index (used by the parallel precompile's 'predict only once per submission')
 void mtl_sub_begin(void) {
+    if (atomic_exchange(&g_gpu_reset_pending, 0)) {   // 那帧的清除 / 写回 / 遮挡计数全没发生：零源集合、跨帧不写回账本、可见性槽都重来，否则「宿主以为已清零」的目标会一直带着垃圾（实录：GPU 错误恢复后画面持续闪、地面贴图发黑）
+        // That frame's clears / stores / occlusion counts never happened: reset the zero-source set, the cross-frame no-store ledger and the visibility slots, otherwise targets the host "knows" are cleared keep garbage (observed: persistent flicker and black ground textures after a GPU error recovery)
+        zskip_clear(); xv_relearn("命令缓冲被 GPU 错误恢复丢弃"); vis_clear(); g_vis_counting = 0;
+        MLOG("【红】GPU 错误恢复（%.2f s）：已作废零源集合 / 跨帧不写回账本 / 可见性槽，这一帧的画面已丢", (now_ns() - g_t0_ns) / 1e9);
+    }
     mtl_init(); g_sub_serial++;
     if (tbdr_on() == 0 && g_ruler_pending) { g_ruler_truth = 0; g_ruler_pending = 0; MLOG("DM_NVN_RULER：切到被测模式"); }
     defer_drain();
@@ -845,7 +851,7 @@ uint64_t mtl_sub_commit(void) {
     NSString *cctx = @(cctx_snap());
     [FB_ON(o, g_cb) FB_SEL:^(FB_ARG cb) {
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
-        if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("【红】命令缓冲错误详情 fence=%llu：%s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("【红】出错那次提交的现场 fence=%llu：%s", (unsigned long long)fence, cctx.UTF8String); MLOG("【红】命令缓冲执行出错：%s", cb.error.localizedDescription.UTF8String); }
+        if (cb.error) { atomic_store(&g_last_commit_error, 1); atomic_store(&g_gpu_reset_pending, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("【红】命令缓冲错误详情 fence=%llu：%s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("【红】出错那次提交的现场 fence=%llu：%s", (unsigned long long)fence, cctx.UTF8String); MLOG("【红】命令缓冲执行出错：%s", cb.error.localizedDescription.UTF8String); }
         for (int i = 0; i < n; i++) {
             if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
             else if (ops[i].kind == 3) {   // 通过采样数：自清零以来各槽之和 | Samples passed: the sum of all slots since the reset
@@ -6085,9 +6091,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (!dr) return 0;
     int alloc_i = (int)(ticket % 3);
     if (g_present_alloc_fence[alloc_i]) {
-        pthread_mutex_lock(&g_pq_mu);
+        uint64_t w0 = now_ns(); pthread_mutex_lock(&g_pq_mu);
         while (g_pq_done < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
         pthread_mutex_unlock(&g_pq_mu);
+        { uint64_t wd = now_ns() - w0; static int n; if (wd > 50000000ull && n++ < 12) MLOG("出图：等上上次出图命令缓冲完成 %.0f ms（分配器 %d）", wd / 1e6, alloc_i); }
     }
 #if DM_NVN_M3
     CBUF cb = [g_q commandBuffer];   // 老接口：交画面记在命令缓冲上（presentDrawable），这一帧的绘制做完才上屏 | older API: presentation is recorded on the command buffer (presentDrawable), so the frame reaches the screen only after its drawing is done
@@ -6209,7 +6216,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
 static void present_repeat(id<CAMetalDrawable> dr) {   // 空节拍：把上一帧再出一次（见 g_last_frame 处说明） | empty tick: present the previous frame again (see the note at g_last_frame)
     id<MTLTexture> src = g_last_frame; if (!dr || !src) return;
     id<MTLTexture> dt = dr.texture; if (dt.width != src.width || dt.height != src.height || dt.pixelFormat != src.pixelFormat) return;
-    int i = (int)(g_rep_n++ % 2); if (atomic_load(&g_rep_busy[i])) return;   // 上上次的还没完成（极少）：这拍放弃 | the one before last has not completed yet (rare): skip this tick
+    int i = (int)(g_rep_n++ % 2); if (atomic_load(&g_rep_busy[i])) { static int n; if (n++ < 8) MLOG("重出图：两个槽都在途，这拍放弃（第 %d 次）", n); return; }   // 上上次的还没完成（极少）：这拍放弃 | the one before last has not completed yet (rare): skip this tick
     atomic_store(&g_rep_busy[i], 1);
     @autoreleasepool {
         [g_q4 waitForDrawable:dr];
@@ -6227,7 +6234,7 @@ static void present_repeat(id<CAMetalDrawable> dr) {   // 空节拍：把上一�
     (void)link;
     pthread_mutex_lock(&g_pq_mu);
     if (g_stall_t0) { uint64_t since = dm_focus_in_since(), t = now_ns();
-        MLOG("显示节拍恢复：这段停了 %.0f ms（其中激活中 %.0f ms），兜底丢了 %llu 帧（第 %llu 段）", (t - g_stall_t0) / 1e6, (t - (g_stall_t0 > since ? g_stall_t0 : since)) / 1e6, (unsigned long long)g_stall_drop, (unsigned long long)g_stall_n); g_stall_t0 = 0; }
+        MLOG("显示节拍恢复（%.2f s）：这段停了 %.0f ms（其中激活中 %.0f ms），兜底丢了 %llu 帧（第 %llu 段）", (now_ns() - g_t0_ns) / 1e9, (t - g_stall_t0) / 1e6, (t - (g_stall_t0 > since ? g_stall_t0 : since)) / 1e6, (unsigned long long)g_stall_drop, (unsigned long long)g_stall_n); g_stall_t0 = 0; }
     pthread_mutex_unlock(&g_pq_mu);
     pthread_mutex_lock(&g_link_mu);
     g_link_tick_ns = now_ns();
@@ -6243,8 +6250,9 @@ static void present_repeat(id<CAMetalDrawable> dr) {   // 空节拍：把上一�
     if (ticket > 1 && g_pq_done < ticket - 1) g_pq_done = ticket - 1;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
-    int submitted;
+    int submitted; uint64_t h0 = now_ns();
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
+    { uint64_t hd = now_ns() - h0; static int n; if (hd > 80000000ull && n++ < 12) MLOG("显示节拍回调内耗时 %.0f ms（票 %llu，%s）", hd / 1e6, (unsigned long long)ticket, submitted ? "已提交" : "未提交"); }
     if (!submitted) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
