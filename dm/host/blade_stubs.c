@@ -80,7 +80,7 @@ void dm_prof_mark(const char *seg) { if (g_flag.bootprof) LOG("prof %s", seg); }
 void dm_prof_add(int id, uint64_t ns, uint64_t bytes) { (void)id; (void)ns; (void)bytes; }
 
 // ---- 诊断（diag.c 未编入）| diagnostics (diag.c not compiled in) ----
-void probe_install(void) {} void ticks_install(void) {} void crash_sample_self(void) {} void inflate_bench_maybe(void) {}
+void ticks_install(void) {} void inflate_bench_maybe(void) {}   // probe_install：sampler_blade.c   // crash_sample_self：sampler_blade.c | crash_sample_self: sampler_blade.c
 void uimsg_subscribe(void (*fn)(const char *, const char *, const char *)) { (void)fn; }
 
 // ---- D2R 剪口才会到达的宿主调用：Blade 产物里没有这些门 | host calls only D2R cuts reach: Blade's build output has no such gates ----

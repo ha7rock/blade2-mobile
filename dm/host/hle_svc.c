@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <unistd.h>
 #include <sched.h>
+#include <pthread.h>
 #include <time.h>
 #ifndef DM_PROGRAM_ID
 #define DM_PROGRAM_ID 0x0100726014352000ull   // 暗黑 3.3.94012 的 title id | title id of Diablo 3.3.94012
@@ -97,6 +98,34 @@ static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++)
 // Free space / largest allocatable block call the allocator's own queries (sdk+0x2f9d78 / +0x2f9dbc, which go through CentralHeap::Query and take their own lock) and may only be called on a guest thread.
 // The values read are kept in g_gheap_last, and the red report on a null allocation carries the last readout directly (the allocator is not entered again at that moment). Units: total / free in MB, largest block in KB
 static module_t *mod_named(const char *n) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, n)) return &g_mod[i]; return NULL; }
+// DM_MEMSCAN=<ASCII 串>@<秒>[,…]：到时扫一遍客体堆与各模块映像找该串，记地址与前后 160 字节（找运行时才解出的名字串等；诊断用）
+// DM_MEMSCAN=<ASCII>@<seconds>[,...]: at that time scan the guest heap and the module images for the string and log addresses with 160 bytes of context (for names that only exist at runtime; diagnostic)
+static void memscan_one(const char *pat) {
+    size_t n = strlen(pat); int hits = 0;
+    struct { const char *name; const uint8_t *b; size_t sz; } rg[8]; int nr = 0;
+    if (g_heap && g_heap_cur) { rg[nr].name = "heap"; rg[nr].b = g_heap; rg[nr].sz = g_heap_cur; nr++; }
+    for (int i = 0; i < g_nmod && nr < 8; i++) { rg[nr].name = g_mod[i].name; rg[nr].b = g_mod[i].base; rg[nr].sz = g_mod[i].size; nr++; }
+    for (int r = 0; r < nr; r++) {
+        const uint8_t *b = rg[r].b, *e = b + rg[r].sz - n, *p = b;
+        while (p < e && hits < 40) {
+            p = memmem(p, (size_t)(e - p), pat, n); if (!p) break;
+            char ctx[400]; int o = 0; const uint8_t *c0 = p - 160 < b ? b : p - 160, *c1 = p + n + 160 > e + n ? e + n : p + n + 160;
+            for (const uint8_t *q = c0; q < c1 && o < (int)sizeof ctx - 2; q++) ctx[o++] = (*q >= 32 && *q < 127) ? (char)*q : (*q == 0 ? '|' : '.');
+            ctx[o] = 0; LOG("[memscan] %s %s+%#llx：%s", pat, rg[r].name, (unsigned long long)(p - b), ctx); hits++; p += n;
+        }
+    }
+    LOG("[memscan] %s：%d 处", pat, hits);
+}
+static void *memscan_thread(void *a) {
+    char *spec = a; double t0 = 0;
+    for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
+        char *at = strrchr(tok, '@'); if (!at) continue; *at = 0; double t = atof(at + 1);
+        if (t > t0) { usleep((useconds_t)((t - t0) * 1e6)); t0 = t; }
+        memscan_one(tok);
+    }
+    return NULL;
+}
+void dm_memscan_init(void) { const char *e = getenv("DM_MEMSCAN"); if (!e || !*e) return; pthread_t th; pthread_create(&th, NULL, memscan_thread, strdup(e)); pthread_detach(th); }
 static _Atomic unsigned long long g_gheap_last[3];
 int dm_guest_heap_stat(unsigned long long *total_mb, unsigned long long *free_mb, unsigned long long *maxblk_kb) {
 #ifdef DM_GENERIC_HOST
@@ -166,7 +195,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (size > g_heap_cur) rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE);
         else if (size < g_heap_cur) rc = mprotect(g_heap + size, g_heap_cur - size, PROT_NONE);
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
-        { static int said; if (!said && size) { said = 1; LOG("SetHeapSize：首次设堆成功 %zu MB（应用内存池 %llu MB − 映像 %zu MB；此前被拒 %d 次）", size >> 20, (unsigned long long)(app_pool() >> 20), image_bytes() >> 20, g_heap_rejects); } }
+        { static int said; if (!said && size) { said = 1; dm_memscan_init(); LOG("SetHeapSize：首次设堆成功 %zu MB（应用内存池 %llu MB − 映像 %zu MB；此前被拒 %d 次）", size >> 20, (unsigned long long)(app_pool() >> 20), image_bytes() >> 20, g_heap_rejects); } }
         g_heap_cur = size;
         regs[0] = 0; regs[1] = (uint64_t)g_heap; return 0;
     }

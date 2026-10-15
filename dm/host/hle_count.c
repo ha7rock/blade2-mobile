@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <libkern/OSCacheControl.h>
 #if !TARGET_OS_IPHONE
 #define HC_MAX 8192
@@ -27,12 +28,14 @@ static void hc_write(void) {
     for (int k = 0; k < 256; k++) if (atomic_load(&g_hsvc[k])) fprintf(f, "SVC\t%#x\t%llu\n", k, (unsigned long long)atomic_load(&g_hsvc[k]));
     fclose(f); LOG("DM_HLECOUNT：%u 条入口 → %s", g_nhc, pth);
 }
+// 每 5 秒也写一次（被 DM_WATCH 定时杀掉时 atexit 不跑） | Also written every 5 s (atexit does not run when DM_WATCH kills the process)
+static void *hc_flush_thread(void *a) { (void)a; for (;;) { sleep(5); hc_write(); } return NULL; }
 void *hlecount_wrap(const char *kind, const char *name, void *fn) {
     if (!hc_on() || !fn) return fn;
     if (g_hsealed) { static int once; if (!once++) LOG("【红】DM_HLECOUNT：封页后还有解析（%s），此后的入口不计数", name); return fn; }
     for (unsigned i = 0; i < g_nhc; i++) if (g_hc[i].fn == fn && !strcmp(g_hc[i].name, name)) return g_hcode + 12 * i;   // 同名同实现复用一个桩 | Same name and same implementation reuse one stub
     if (g_nhc == HC_MAX) die("DM_HLECOUNT 入口超过 %d", HC_MAX);
-    if (!g_hcode) { g_hcode = mmap(NULL, HC_MAX * 48, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (g_hcode == MAP_FAILED) die("DM_HLECOUNT mmap"); atexit(hc_write); }
+    if (!g_hcode) { g_hcode = mmap(NULL, HC_MAX * 48, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (g_hcode == MAP_FAILED) die("DM_HLECOUNT mmap"); atexit(hc_write); pthread_t th; pthread_create(&th, NULL, hc_flush_thread, NULL); pthread_detach(th); }
     unsigned i = g_nhc++; g_hc[i].kind = kind; g_hc[i].name = name; g_hc[i].fn = fn;
     uint32_t *w = g_hcode + 12 * i;                                  // 48 字节：5 条指令 + 1 空 + 两个 8 字节字面量（偏移 0x18 / 0x20） | 48 bytes: 5 instructions + 1 empty + two 8-byte literals (offsets 0x18 / 0x20)
     w[0] = 0x58000000 | ((0x18 / 4) << 5) | 16;                      // ldr x16, [pc+0x18]   → &计数 | ldr x16, [pc+0x18]   → &count

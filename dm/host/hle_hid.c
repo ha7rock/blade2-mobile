@@ -415,6 +415,14 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     { static uint64_t prev; if ((s->buttons & DM_BTN_L) && !(prev & DM_BTN_L)) { int n = atomic_fetch_add(&g_dm_l_presses, 1) + 1; if (n <= 3) LOG("取手柄处：「显示物品」键（L）交给了游戏，本进程第 %d 次", n); } prev = s->buttons; }   // 「显示物品」键（L）交给游戏的按下次数（首领掉落读数用，dm_bossrush.c） | number of presses of the 「显示物品」(Show Items) key (L) delivered to the game (used by the boss drop readout, dm_bossrush.c)
     if (km & PK_LSL) s->lx = -32767; if (km & PK_LSR) s->lx = 32767;   // 脚本摇杆伪键：推满（Horizon 摇杆 ±32767，上为正） | script stick pseudo-keys: push to full (Horizon stick ±32767, up is positive)
     if (km & PK_LSU) s->ly = 32767;  if (km & PK_LSD) s->ly = -32767;
+    // 摇杆方向键位：真机 hid 按摇杆位置自动置 NpadButton::StickL{Left,Up,Right,Down} / StickR*（bit 16–23，阈值取半程）。UE4 的 Gamepad_LeftStick_Up 等
+    // 「摇杆当按键」动作映射只认这些位（Blade 开局教程卡「Move Hero」绑的就是 LeftStickUp/Down/Left/Right 动作，少了这些位永远关不掉；轴映射的移动不受影响）
+    // Stick direction buttons: the real hid sets NpadButton::StickL{Left,Up,Right,Down} / StickR* (bits 16–23, half-range threshold) from the stick position. UE4's
+    // "stick as button" action mappings (Gamepad_LeftStick_Up etc.) only see these bits (Blade's opening tutorial card "Move Hero" binds the LeftStickUp/Down/Left/Right actions and never closes without them; axis-mapped movement is unaffected)
+    { const int th = 16384; uint64_t b = 0;
+      if (s->lx <= -th) b |= 1ull << 16; if (s->ly >= th) b |= 1ull << 17; if (s->lx >= th) b |= 1ull << 18; if (s->ly <= -th) b |= 1ull << 19;
+      if (s->rx <= -th) b |= 1ull << 20; if (s->ry >= th) b |= 1ull << 21; if (s->rx >= th) b |= 1ull << 22; if (s->ry <= -th) b |= 1ull << 23;
+      s->buttons |= b; }
     s->attributes = ATTR_CONNECTED;
     atomic_store_explicit(&g_sampled_right,(uint32_t)s->rx|((uint64_t)(uint32_t)s->ry<<32),memory_order_release);
     receipt(s, id, style, km, read_start_ns);
