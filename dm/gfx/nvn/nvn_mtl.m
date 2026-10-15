@@ -1555,15 +1555,41 @@ static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw,
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
 // DM_NVN_PASSDUMP=frame number, or start-end (inclusive at both ends)
 void dm_gfx_shot_at(long k, const char *path);
+static int pdr_on(void);
 static long g_pd_a0 = -2, g_pd_a1;   // DM_NVN_PASSDUMP 帧范围（黑帧触发器会改它） | DM_NVN_PASSDUMP frame range (the black-frame trigger changes it)
 static int passdump(void) {
 #ifdef NVN_RT_RANGE_TEST
     if (g_rr_checking) return 0;
 #endif
     if (g_pd_a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP"); g_pd_a0 = e ? atol(e) : -1; g_pd_a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : g_pd_a0; }
+    if (pdr_on()) return 1;
     long f = (long)atomic_load(&g_cur_frame); return g_pd_a0 >= 0 && f >= g_pd_a0 && f <= g_pd_a1;
 }
-#define PD(...) do { if (passdump()) { fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+// 通道转储环（DM_NVN_PASSRING=1）：转储行不打到 stderr，而是按帧存进最近 8 帧的内存环；画面触发器（见 REGLUM 处）命中时整环写成文件，
+// 这样能拿到「出事那一帧」自己的通道 / 绘制 / uniform 指纹（事后才知道哪帧出事，stderr 版做不到）
+// Pass-dump ring (DM_NVN_PASSRING=1): dump lines are not printed to stderr but stored per frame in an in-memory ring of the last 8 frames; when the picture trigger fires (see REGLUM) the whole ring is written to a file,
+// which yields the pass / draw / uniform fingerprints of the very frame that went wrong (only known after the fact, impossible with the stderr version)
+#define PDR_N 8
+static char *g_pdr[PDR_N]; static size_t g_pdr_len[PDR_N]; static uint64_t g_pdr_frame[PDR_N]; static int g_pdr_on = -1; static pthread_mutex_t g_pdr_mu = PTHREAD_MUTEX_INITIALIZER;
+#define PDR_CAP (4u << 20)
+static int pdr_on(void) { if (g_pdr_on < 0) { const char *e = getenv("DM_NVN_PASSRING"); g_pdr_on = e && !strcmp(e, "1"); } return g_pdr_on; }
+static void pdr_line(const char *line) {
+    uint64_t f = atomic_load(&g_cur_frame); int i = (int)(f % PDR_N);
+    pthread_mutex_lock(&g_pdr_mu);
+    if (!g_pdr[i]) g_pdr[i] = malloc(PDR_CAP);
+    if (g_pdr_frame[i] != f) { g_pdr_frame[i] = f; g_pdr_len[i] = 0; }
+    size_t n = strlen(line); if (g_pdr_len[i] + n + 1 < PDR_CAP) { memcpy(g_pdr[i] + g_pdr_len[i], line, n); g_pdr_len[i] += n; g_pdr[i][g_pdr_len[i]++] = '\n'; }
+    pthread_mutex_unlock(&g_pdr_mu);
+}
+static void pdr_flush(const char *path) {
+    FILE *f = fopen(path, "w"); if (!f) return;
+    pthread_mutex_lock(&g_pdr_mu);
+    uint64_t lo = ~0ull; for (int i = 0; i < PDR_N; i++) if (g_pdr[i] && g_pdr_frame[i] < lo) lo = g_pdr_frame[i];
+    for (uint64_t k = 0; k < PDR_N; k++) for (int i = 0; i < PDR_N; i++) if (g_pdr[i] && g_pdr_frame[i] == lo + k) fwrite(g_pdr[i], 1, g_pdr_len[i], f);
+    pthread_mutex_unlock(&g_pdr_mu); fclose(f);
+}
+#define PD(...) do { if (pdr_on()) { char pdl_[1400]; int pdn_ = snprintf(pdl_, sizeof pdl_, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); snprintf(pdl_ + pdn_, sizeof pdl_ - pdn_, __VA_ARGS__); pdr_line(pdl_); } \
+    else if (passdump()) { fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 static void blit_note(void) { if (g_enc) PD("E %llu 拷贝 / 缓冲更新结束渲染通道", g_stat_pass); }
 // DM_GFXUSE=<文件>：选角页稳定后（首次 OpenPanel MainMenuButtonRibbon 之后 1 秒起，需 DM_BOOTPROF=1）连续 30 帧里
 // GPU 实际读取的资源在客体内存中的区间（贴图存储、UBO / SSBO、顶点 / 索引缓冲），按（种类, 地址, 长度）去重，首见时记一行。
@@ -6136,10 +6162,20 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [FB_ON(o, cb) FB_SEL:^(FB_ARG f) {
         if (f.error) MLOG("【红】上屏命令缓冲错误：%s", f.error.description.UTF8String);
         if (rl_rb) { const uint8_t *q = rl_rb.contents; uint64_t sum = 0; uint8_t g[4096]; NSUInteger ng = 0;   // DM_NVN_REGLUM：均值 + 隔点灰度小图 | DM_NVN_REGLUM: mean + subsampled grayscale thumbnail
-            for (NSUInteger y = 0; y < rl_h; y += 4) for (NSUInteger x = 0; x < rl_w && ng < sizeof g; x += 4) { const uint8_t *px = q + 4 * (y * rl_w + x); g[ng++] = (uint8_t)((px[0] + px[1] + px[2]) / 3); }
+            for (NSUInteger ty = 0; ty < 36; ty++) for (NSUInteger tx = 0; tx < 64 && ng < sizeof g; tx++) { NSUInteger x = tx * rl_w / 64, y = ty * rl_h / 36; const uint8_t *px = q + 4 * (y * rl_w + x); g[ng++] = (uint8_t)((px[0] + px[1] + px[2]) / 3); }   // 64x36 灰度小图 | 64x36 grayscale thumbnail
             for (NSUInteger k = 0; k < rl_w * rl_h; k++) sum += q[4 * k] + q[4 * k + 1] + q[4 * k + 2];
             pthread_mutex_lock(rl_mu); fprintf(rl_f, "%llu\t%llu\t%.4f\t", rl_n, rl_tns, sum / (3.0 * rl_w * rl_h)); for (NSUInteger k = 0; k < ng; k++) fprintf(rl_f, "%02x", g[k]); fputc('\n', rl_f); fflush(rl_f); pthread_mutex_unlock(rl_mu);
-            double lum = sum / (3.0 * rl_w * rl_h); static double prev_lum; static int trig_n;   // 黑帧触发器 DM_NVN_GLITCH=目录：游戏帧亮度骤降（上帧 >15、本帧 < 上帧 35%）时存本帧像素、截后 3 帧、并把通道转储对准后 3 帧 | black-frame trigger DM_NVN_GLITCH=dir: when the game frame's brightness collapses (previous > 15, this < 35% of previous) save this frame's pixels, screenshot the next 3 frames and aim the pass dump at them
+            double lum = sum / (3.0 * rl_w * rl_h); static double prev_lum; static int trig_n;
+            {   // 画面触发器 2（DM_NVN_GLITCH 开着时）：小图 16x9 分块均值，某块「突变又恢复」(A-B-A) 即认为那一帧画错了（整帧亮度看不出的局部错画，如某物体一帧画到镜头前）→ 写出通道转储环
+                // Picture trigger 2 (with DM_NVN_GLITCH): 16x9 block means of the thumbnail; a block that jumps and reverts (A-B-A) means that frame was drawn wrong (local errors invisible to the whole-frame mean, e.g. an object drawn in front of the camera for one frame) → flush the pass-dump ring
+                static uint8_t tb[3][144]; static int tbn; static int trig2;
+                uint8_t cur[144]; for (int by = 0; by < 9; by++) for (int bx = 0; bx < 16; bx++) { unsigned sm = 0; for (int yy = 0; yy < 4; yy++) for (int xx = 0; xx < 4; xx++) sm += g[(by * 4 + yy) * 64 + bx * 4 + xx]; cur[by * 16 + bx] = (uint8_t)(sm / 16); }
+                static const char *gd2 = NULL; static int gd2_init; if (!gd2_init) { gd2_init = 1; gd2 = getenv("DM_NVN_GLITCH"); }
+                if (tbn >= 2 && gd2 && trig2 < 6) { int hits = 0; for (int k = 0; k < 144; k++) { int a = tb[0][k], b = tb[1][k], c = cur[k]; if (abs(b - a) > 20 && abs(c - b) > 20 && (b - a) * (c - b) < 0 && abs(c - a) < 8) hits++; }
+                    if (hits >= 3) { trig2++; char path[512]; snprintf(path, sizeof path, "%s/aba%d_present%llu_ring.txt", gd2, trig2, rl_n); pdr_flush(path);
+                        MLOG("【红】画面触发器：出图 %llu 的前一帧有 %d 块 A-B-A 错画（当前帧 %llu），通道转储环已写 %s", rl_n, hits, (unsigned long long)atomic_load(&g_cur_frame), path); } }
+                memcpy(tb[0], tb[1], 144); memcpy(tb[1], cur, 144); if (tbn < 2) tbn++;
+            }   // 黑帧触发器 DM_NVN_GLITCH=目录：游戏帧亮度骤降（上帧 >15、本帧 < 上帧 35%）时存本帧像素、截后 3 帧、并把通道转储对准后 3 帧 | black-frame trigger DM_NVN_GLITCH=dir: when the game frame's brightness collapses (previous > 15, this < 35% of previous) save this frame's pixels, screenshot the next 3 frames and aim the pass dump at them
             static const char *gd = NULL; static int gd_init; if (!gd_init) { gd_init = 1; gd = getenv("DM_NVN_GLITCH"); }
             if (gd && prev_lum > 15 && lum < prev_lum * 0.35 && trig_n < 4) { trig_n++;
                 char path[512]; snprintf(path, sizeof path, "%s/glitch%d_f%llu_black.ppm", gd, trig_n, rl_n); FILE *pf = fopen(path, "wb");
