@@ -174,6 +174,7 @@ void front_run(void (*guest)(void)) {
         // The game is a latency-sensitive user-initiated activity (consistent with always being in the foreground on the Switch), held until the process exits
         static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical) reason:@"game loop"];
         NSRect r = NSMakeRect(0, 0, 1280, 720);
+        { const char *e = getenv("DM_WINDOW"); unsigned ww = 0, wh = 0; if (e && sscanf(e, "%ux%u", &ww, &wh) == 2 && ww >= 320 && wh >= 200) r = NSMakeRect(0, 0, ww, wh); }   // DM_WINDOW=宽x高：按指定大小开窗（复现大窗口 / 最大化时的问题） | DM_WINDOW=WxH: open the window at that size (to reproduce issues seen with a large / maximized window)
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];

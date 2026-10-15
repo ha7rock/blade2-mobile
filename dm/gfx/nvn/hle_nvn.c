@@ -907,6 +907,12 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    // 真机：交换链里的贴图要等显示器放掉才可再取，隐含「画它那帧的 GPU 工作早已完成」，游戏据此复用每帧的 uniform / 顶点环（UE4 按帧数复用，不逐段围栏）。
+    // 宿主的出图只是入队，GPU 落后时游戏会比真机多跑在前面，环里的数据被下一帧覆盖而 GPU 还没读 → 整帧黑 / 特效顶点乱飞（录屏加重负载时实录到）。这里补上等 GPU 做完那一帧
+    // Real device: a swapchain image can be re-acquired only after the display releases it, which implies the GPU work of the frame drawn into it finished long ago; the game relies on that to recycle its per-frame
+    // uniform / vertex rings (UE4 recycles by frame count, not per-segment fences). The host's present only enqueues, so when the GPU falls behind the game runs further ahead than on the real device and the next
+    // frame overwrites ring data the GPU has not read yet → whole black frames / effect vertices flying everywhere (recorded with a screen recorder adding load). Wait here for the GPU to finish that frame
+    { uint64_t rf = *idx < 4 ? o->rfence[*idx] : 0; if (rf) { uint64_t w0 = now_ns(); if (!mtl_wait(rf, 5000000000ull)) { static int once; if (!once++) LOG("【红】AcquireTexture 等上次画这张的栅栏 %llu 超时 5 秒", (unsigned long long)rf); } g_pq_wait_ns += now_ns() - w0; } }
     if (s) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }   // 交换链贴图在此前的提交完成后可用 | The swapchain texture becomes available once the commits before this point have completed
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -1012,6 +1018,7 @@ static void tsummary(uint64_t frame) {
         py = cy; pk = ck; pw = cw; }
       pi = ci; pc = cc; pd = dr_; pf = frame; }
     uint64_t up, re, fa, pr; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr);
+    { void mtl_reup_report(void); mtl_reup_report(); }
     LOG("[nvn] 预排布贴图 首传 %llu 张、池内容变化重传 %llu 次；写保护缺页 %llu 次、宿主写前解保护 %llu 页；漏检 %llu（累计）", up, re, fa, pr, mtl_pkg_miss());
     memset(g_tn, 0, sizeof g_tn);
 }
@@ -1131,7 +1138,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     present_cfg(o);
     gfx_enter();
     uint64_t t0 = now_ns();
-    if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop);   // 只入队，立即返回 | enqueue only, return immediately
+    if (idx >= 0 && idx < o->ntex && idx < 4) { o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop); o->rfence[idx] = mtl_last_fence(); }   // 只入队，立即返回；记下画这张的提交栅栏 | enqueue only, return immediately; remember the fence of the submission that drew it
     gfx_leave();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);

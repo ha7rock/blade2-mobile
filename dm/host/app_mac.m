@@ -83,7 +83,10 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         // 双击起没有终端：日志落文件，上一次的留一份
         // A double-click start has no terminal: the log goes to a file, and the previous one is kept
         NSString *lf = [logd stringByAppendingPathComponent:@"host.log"];
-        [fm removeItemAtPath:[logd stringByAppendingPathComponent:@"host.prev.log"] error:nil];
+        // 留最近 6 次的日志（host.prev.log … host.prev5.log），一次排错往往要翻上一两次运行的记录 | keep the last 6 logs (host.prev.log ... host.prev5.log): troubleshooting often needs the record of one or two runs back
+        [fm removeItemAtPath:[logd stringByAppendingPathComponent:@"host.prev5.log"] error:nil];
+        for (int k = 4; k >= 1; k--) [fm moveItemAtPath:[logd stringByAppendingPathComponent:[NSString stringWithFormat:@"host.prev%d.log", k]] toPath:[logd stringByAppendingPathComponent:[NSString stringWithFormat:@"host.prev%d.log", k + 1]] error:nil];
+        [fm moveItemAtPath:[logd stringByAppendingPathComponent:@"host.prev.log"] toPath:[logd stringByAppendingPathComponent:@"host.prev1.log"] error:nil];
         [fm moveItemAtPath:lf toPath:[logd stringByAppendingPathComponent:@"host.prev.log"] error:nil];
         if (!isatty(2)) { freopen(lf.fileSystemRepresentation, "w", stderr); setvbuf(stderr, NULL, _IOLBF, 0); }
         // 不要系统的「窗口状态恢复」：上次被强退 / 崩过之后，系统会在启动时弹「上次意外退出，要重新打开窗口吗」的模态框——游戏没有可恢复的窗口，

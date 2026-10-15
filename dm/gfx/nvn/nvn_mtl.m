@@ -538,6 +538,7 @@ static void up_owner_check(const char *where) {
 // other threads (the present thread etc.) creating a command buffer do not touch the batch: they do not read or write textures uploaded in this batch; commands that need these textures all come after this replay submission (the batch is flushed before it)
 // Old-queue command buffers (readback / diagnostics / present; to be deleted once M4-4 and M4-5 are migrated away): uploads are already on the Metal 4 queue, and there is no ordering guarantee between the two queues -
 // wait for the upload to complete after flushing it, and only then can the old queue read the upload result (mtl_read_texels waited first and flushed afterwards, the readback beat the upload, 4 failures on t_nvn upload content)
+static id<MTLBuffer> g_rl_rb; static NSUInteger g_rl_x0, g_rl_y0, g_rl_w, g_rl_h; static FILE *g_rl_f; static pthread_mutex_t *g_rl_mu;   // DM_NVN_REGLUM 本帧待回读（编进出图命令缓冲） | DM_NVN_REGLUM pending readback for this frame (encoded into the present command buffer)
 static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); while (atomic_load(&g_up_pending)) usleep(200); } return [g_q commandBuffer]; }
 static post_op *g_post; static int g_npost, g_postcap;
 // 每次提交一个自动释放池：提交跑在客体线程上（长驻、无运行循环、从不排空隐式池），Metal 回放里自动释放的对象
@@ -937,7 +938,7 @@ static void serial_put(uint64_t k, id o) { pthread_mutex_lock(&g_smu); id old = 
 static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) defer_obj_release(old); hm_del_id(&g_by_serial, &k); g_ser_gen++; pthread_mutex_unlock(&g_smu); }
 // 预排布贴图的宿主记录：当前 MTLTexture、上传戳、上次检查时的全局写代号
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
-@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash; } @end   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
+@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash; int rt; uint32_t reups; uint64_t ser; uint32_t w, h, fmt, flags, lv; } @end   // rt：曾被挂为渲染目标 → 内容以 GPU 为准，不再按脏页从池重传 | rt: was attached as a render target → the GPU content is authoritative, no more dirty-page re-uploads from the pool   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
 @implementation NvPkg
 - (void)dealloc { res_remove(tex); }
 @end
@@ -1365,6 +1366,18 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
 static inline int tex_pool_src(const tex_t *t) {
     return t->mem && t->d.target != 10 && (t->has_layout || !(t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)));
 }
+// 重传排行（诊断）：各池来源贴图的重传次数，随「预排布贴图」统计行打前 6 名（看是谁在每帧改池内容） | Re-upload ranking (diagnostic): re-upload count per pool-sourced texture, the top 6 are printed with the periodic statistics line (shows who rewrites pool content every frame)
+static NvPkg *g_reup_tab[64]; static int g_reup_n;
+static void reup_note(NvPkg *pk) { for (int i = 0; i < g_reup_n; i++) if (g_reup_tab[i] == pk) return; if (g_reup_n < 64) g_reup_tab[g_reup_n++] = pk; }
+void mtl_reup_report(void) {
+    static uint32_t last[64]; char line[600]; int o = 0;
+    int idx[64]; for (int i = 0; i < g_reup_n; i++) idx[i] = i;
+    for (int i = 0; i < g_reup_n; i++) for (int j = i + 1; j < g_reup_n; j++) if (g_reup_tab[idx[j]]->reups - last[idx[j]] > g_reup_tab[idx[i]]->reups - last[idx[i]]) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    for (int k = 0; k < g_reup_n && k < 6 && o < (int)sizeof line - 80; k++) { NvPkg *pk = g_reup_tab[idx[k]]; uint32_t d = pk->reups - last[idx[k]]; if (!d) break;
+        o += snprintf(line + o, sizeof line - o, " ser=%llu %ux%u lv%u f%#x fl%#x:+%u", (unsigned long long)pk->ser, pk->w, pk->h, pk->lv, pk->fmt, pk->flags, d); }
+    for (int i = 0; i < g_reup_n; i++) last[i] = g_reup_tab[i]->reups;
+    if (o) MLOG("重传排行（本段）%s", line);
+}
 static id<MTLTexture> tex_mtl(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
@@ -1373,6 +1386,7 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
     if (packaged) {
         NvPkg *pk = have;
         if (pk) {   // 已上传：自上次检查后有过客体写才查覆盖页 | Already uploaded: check the covered pages only if there has been a guest write since the last check
+            if (pk->rt) return pk->tex;   // 曾作渲染目标：池里的是陈旧内容（GPU 写进的不会回到池），邻页的 CPU 写会误判为脏 → 若重传就把 GPU 画好的覆盖成垃圾（Blade：雾层时有时无地闪） | Was a render target: the pool holds stale content (GPU writes never reach the pool) and CPU writes to neighbouring pages look like dirt → a re-upload would clobber the GPU result with garbage (Blade: fog layer flickering on and off)
             uint64_t now = nvn_dirty_now();
             int tracked = nvn_dirty_tracked(t->mem, t->L.size);
             int clean = tracked && (now == pk->seen || !nvn_dirty_since(t->mem, t->L.size, pk->stamp));
@@ -1384,10 +1398,10 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
                 return pk->tex;
             }
             uint64_t st; id<MTLTexture> nt = pkg_upload(t, &st);   // 池内容变了（流式素材写进同一存储）：换新贴图，在途绘制仍读旧的 | Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
-            if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; defer_obj_release(old); res_add(nt); g_ser_gen++; pk->stamp = st; pk->seen = nvn_dirty_now(); g_pkg_reuploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size); }
+            if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; defer_obj_release(old); res_add(nt); g_ser_gen++; pk->stamp = st; pk->seen = nvn_dirty_now(); g_pkg_reuploads++; pk->reups++; reup_note(pk); if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size); }
             return pk->tex;
         }
-        pk = [NvPkg new];
+        pk = [NvPkg new]; pk->ser = t->serial; pk->w = t->d.width; pk->h = t->d.height; pk->fmt = t->d.format; pk->flags = t->d.flags; pk->lv = t->d.levels;
         pk->tex = pkg_upload(t, &pk->stamp);
         if (!pk->tex) return nil;
         pk->seen = nvn_dirty_now(); g_pkg_uploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size);
@@ -1888,6 +1902,10 @@ static MTLPixelFormat rt_color_fmt(id<MTLTexture> base, const view_t *v, int has
 // The view lives only until this submission completes (Metal 4 does not retain resources; the view shares storage with the base texture and is not made resident separately). Depth / stencil attachments do not change format
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v, int color) {
     id<MTLTexture> base = tex_mtl(t); a.texture = base;
+    if (base && tex_pool_src(t)) {   // 池来源贴图（UE4 缺省块线性布局、标志不像渲染目标）被挂为附件：从此 GPU 内容为准 | A pool-sourced texture (UE4 default block-linear layout, flags not like a render target) attached: from now on the GPU content is authoritative
+        id o = serial_get(t->serial);
+        if ([o isKindOfClass:[NvPkg class]] && !((NvPkg *)o)->rt) { ((NvPkg *)o)->rt = 1; static int n; if (n++ < 8) MLOG("池来源贴图被挂为渲染目标 ser=%llu %ux%u 级%u 格式 %#x 标志 %#x：此后不再按脏页重传", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.levels, t->d.format, t->d.flags); }
+    }
     if (has_v && v->set_levels) a.level = v->base_level;
     if (has_v && v->set_layers) { if (t->d.target == 2) a.depthPlane = v->min_layer; else a.slice = v->min_layer; }
     if (!color || !base) return;
@@ -6028,19 +6046,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         if (e && !rl) MLOG("【红】DM_NVN_REGLUM 参数或文件无效：%s", e); }
     if (rl && (src.pixelFormat == MTLPixelFormatRGBA8Unorm || src.pixelFormat == MTLPixelFormatBGRA8Unorm || src.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB || src.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB)) {
         NSUInteger x0 = (NSUInteger)(rr[0] * src.width), y0 = (NSUInteger)(rr[1] * src.height), w = (NSUInteger)(rr[2] * src.width) - x0, h = (NSUInteger)(rr[3] * src.height) - y0;
-        id<MTLBuffer> rb = [g_dev newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
-        id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-        [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x0, y0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:rb destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
-        [b endEncoding];
-        unsigned long long n = g_present_n, tns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; const uint8_t *q = rb.contents; uint64_t sum = 0;
-            uint8_t g[4096]; NSUInteger ng = 0;   // 隔点取样的灰度小图（每行 / 每列取 1/4，最多 4096 点），随均值一起记下，供逐帧图像相关分析 | Subsampled grayscale thumbnail (every 4th row / column, at most 4096 points), recorded along with the mean, for per-frame image correlation analysis
-            for (NSUInteger y = 0; y < h; y += 4) for (NSUInteger x = 0; x < w && ng < sizeof g; x += 4) { const uint8_t *px = q + 4 * (y * w + x); g[ng++] = (uint8_t)((px[0] + px[1] + px[2]) / 3); }
-            for (NSUInteger k = 0; k < w * h; k++) sum += q[4 * k] + q[4 * k + 1] + q[4 * k + 2];
-            pthread_mutex_lock(&rlmu); fprintf(rlf, "%llu\t%llu\t%.4f\t", n, tns, sum / (3.0 * w * h));
-            for (NSUInteger k = 0; k < ng; k++) fprintf(rlf, "%02x", g[k]);
-            fputc('\n', rlf); fflush(rlf); pthread_mutex_unlock(&rlmu); }];
-        [cb commit];
+        // 回读编进这次出图的命令缓冲（与游戏绘制同一条 Metal 4 队列、按提交顺序执行）：原先另开老队列的命令缓冲，和绘制不排序，机器忙时会在画面画完之前就拷，读到全黑 / 半帧——误报成「黑帧」
+        // The readback is encoded into this present's command buffer (same Metal 4 queue as the game's draws, executed in commit order): it used to open a command buffer on the old queue, unordered with the draws, and under load copied before the frame was drawn, reading black / half frames -- false "black frame" reports
+        g_rl_rb = [g_dev newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared]; g_rl_x0 = x0; g_rl_y0 = y0; g_rl_w = w; g_rl_h = h; g_rl_f = rlf; g_rl_mu = &rlmu;
     }
     // DM_NVN_SHOT=帧号[,帧号…]:路径（路径里的 %d 换成帧号）
     // DM_NVN_SHOT=frame number[,frame number...]:path (%d in the path is replaced with the frame number)
@@ -6084,6 +6092,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     CBUF cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
     if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
+    id<MTLBuffer> rl_rb = g_rl_rb; NSUInteger rl_w = g_rl_w, rl_h = g_rl_h; g_rl_rb = nil;
+    if (rl_rb) { BENC rb_enc = enc_b_begin(cb); [rb_enc copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(g_rl_x0, g_rl_y0, 0) sourceSize:MTLSizeMake(rl_w, rl_h, 1) toBuffer:rl_rb destinationOffset:0 destinationBytesPerRow:rl_w * 4 destinationBytesPerImage:rl_w * rl_h * 4]; enc_b_end(rb_enc); }
+    unsigned long long rl_n = g_present_n, rl_tns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); FILE *rl_f = g_rl_f; pthread_mutex_t *rl_mu = g_rl_mu;
     [cb endCommandBuffer];
 #endif
 #if !DM_NVN_M3
@@ -6091,6 +6102,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 #endif
     [FB_ON(o, cb) FB_SEL:^(FB_ARG f) {
         if (f.error) MLOG("【红】上屏命令缓冲错误：%s", f.error.description.UTF8String);
+        if (rl_rb) { const uint8_t *q = rl_rb.contents; uint64_t sum = 0; uint8_t g[4096]; NSUInteger ng = 0;   // DM_NVN_REGLUM：均值 + 隔点灰度小图 | DM_NVN_REGLUM: mean + subsampled grayscale thumbnail
+            for (NSUInteger y = 0; y < rl_h; y += 4) for (NSUInteger x = 0; x < rl_w && ng < sizeof g; x += 4) { const uint8_t *px = q + 4 * (y * rl_w + x); g[ng++] = (uint8_t)((px[0] + px[1] + px[2]) / 3); }
+            for (NSUInteger k = 0; k < rl_w * rl_h; k++) sum += q[4 * k] + q[4 * k + 1] + q[4 * k + 2];
+            pthread_mutex_lock(rl_mu); fprintf(rl_f, "%llu\t%llu\t%.4f\t", rl_n, rl_tns, sum / (3.0 * rl_w * rl_h)); for (NSUInteger k = 0; k < ng; k++) fprintf(rl_f, "%02x", g[k]); fputc('\n', rl_f); fflush(rl_f); pthread_mutex_unlock(rl_mu); }
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }];
 #if !DM_NVN_M3
