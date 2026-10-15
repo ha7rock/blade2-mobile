@@ -179,6 +179,7 @@ void front_run(void (*guest)(void)) {
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
         win.title = @APP_NAME; win.restorable = NO; g_win = win;
+        if (getenv("DM_WINDOW_TOP")) win.level = NSFloatingWindowLevel;   // DM_WINDOW_TOP=1：窗口置顶（自动化测试时不被别的窗口盖住——被盖住时显示节拍降到 1 Hz） | DM_WINDOW_TOP=1: keep the window on top (automated tests must not be occluded: an occluded window drops the display link to 1 Hz)
         NSView *v = win.contentView; g_view = v;
         v.wantsLayer = YES; v.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary; win.contentMinSize = NSMakeSize(640, 360);

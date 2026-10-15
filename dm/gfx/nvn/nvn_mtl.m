@@ -1545,12 +1545,14 @@ static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw,
 // DM_NVN_PASSDUMP=帧号 或 起-止（含两端）
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
 // DM_NVN_PASSDUMP=frame number, or start-end (inclusive at both ends)
+void dm_gfx_shot_at(long k, const char *path);
+static long g_pd_a0 = -2, g_pd_a1;   // DM_NVN_PASSDUMP 帧范围（黑帧触发器会改它） | DM_NVN_PASSDUMP frame range (the black-frame trigger changes it)
 static int passdump(void) {
 #ifdef NVN_RT_RANGE_TEST
     if (g_rr_checking) return 0;
 #endif
-    static long a0 = -2, a1; if (a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP"); a0 = e ? atol(e) : -1; a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : a0; }
-    long f = (long)atomic_load(&g_cur_frame); return a0 >= 0 && f >= a0 && f <= a1;
+    if (g_pd_a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP"); g_pd_a0 = e ? atol(e) : -1; g_pd_a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : g_pd_a0; }
+    long f = (long)atomic_load(&g_cur_frame); return g_pd_a0 >= 0 && f >= g_pd_a0 && f <= g_pd_a1;
 }
 #define PD(...) do { if (passdump()) { fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 static void blit_note(void) { if (g_enc) PD("E %llu 拷贝 / 缓冲更新结束渲染通道", g_stat_pass); }
@@ -6082,6 +6084,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 #endif
 #if TARGET_OS_OSX
     if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // 窗口模式按显示器垂直同步，防撕裂 | Windowed mode follows the display's vsync to prevent tearing
+    if (layer.framebufferOnly) layer.framebufferOnly = NO;   // drawable 要能被当作拷贝源（空节拍重出图留的上一帧副本就是从 drawable 拷的；framebufferOnly 的 drawable 不许读，拷出来是黑的 → 每个空节拍黑一拍） | drawables must be readable as copy sources (the last-frame copy kept for re-presenting on empty ticks is copied from the drawable; a framebufferOnly drawable cannot be read and the copy comes out black → one black refresh per empty tick)
 #endif
     present_pipeline(layer.pixelFormat);   // 和原路径一样，首帧编管线在取drawable之前 | Same as the original path: the first frame compiles the pipeline before taking the drawable
     if (g_grab_cb) grab_present(src, crop, layer.drawableSize);   // 整窗截图要的游戏画面（不加锁先看一眼，真取在函数里加锁） | Game picture needed by the whole-window screenshot (peek without the lock first; the real take locks inside the function)
@@ -6125,7 +6128,16 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         if (rl_rb) { const uint8_t *q = rl_rb.contents; uint64_t sum = 0; uint8_t g[4096]; NSUInteger ng = 0;   // DM_NVN_REGLUM：均值 + 隔点灰度小图 | DM_NVN_REGLUM: mean + subsampled grayscale thumbnail
             for (NSUInteger y = 0; y < rl_h; y += 4) for (NSUInteger x = 0; x < rl_w && ng < sizeof g; x += 4) { const uint8_t *px = q + 4 * (y * rl_w + x); g[ng++] = (uint8_t)((px[0] + px[1] + px[2]) / 3); }
             for (NSUInteger k = 0; k < rl_w * rl_h; k++) sum += q[4 * k] + q[4 * k + 1] + q[4 * k + 2];
-            pthread_mutex_lock(rl_mu); fprintf(rl_f, "%llu\t%llu\t%.4f\t", rl_n, rl_tns, sum / (3.0 * rl_w * rl_h)); for (NSUInteger k = 0; k < ng; k++) fprintf(rl_f, "%02x", g[k]); fputc('\n', rl_f); fflush(rl_f); pthread_mutex_unlock(rl_mu); }
+            pthread_mutex_lock(rl_mu); fprintf(rl_f, "%llu\t%llu\t%.4f\t", rl_n, rl_tns, sum / (3.0 * rl_w * rl_h)); for (NSUInteger k = 0; k < ng; k++) fprintf(rl_f, "%02x", g[k]); fputc('\n', rl_f); fflush(rl_f); pthread_mutex_unlock(rl_mu);
+            double lum = sum / (3.0 * rl_w * rl_h); static double prev_lum; static int trig_n;   // 黑帧触发器 DM_NVN_GLITCH=目录：游戏帧亮度骤降（上帧 >15、本帧 < 上帧 35%）时存本帧像素、截后 3 帧、并把通道转储对准后 3 帧 | black-frame trigger DM_NVN_GLITCH=dir: when the game frame's brightness collapses (previous > 15, this < 35% of previous) save this frame's pixels, screenshot the next 3 frames and aim the pass dump at them
+            static const char *gd = NULL; static int gd_init; if (!gd_init) { gd_init = 1; gd = getenv("DM_NVN_GLITCH"); }
+            if (gd && prev_lum > 15 && lum < prev_lum * 0.35 && trig_n < 4) { trig_n++;
+                char path[512]; snprintf(path, sizeof path, "%s/glitch%d_f%llu_black.ppm", gd, trig_n, rl_n); FILE *pf = fopen(path, "wb");
+                if (pf) { fprintf(pf, "P6\n%lu %lu\n255\n", (unsigned long)rl_w, (unsigned long)rl_h); for (NSUInteger k = 0; k < rl_w * rl_h; k++) { uint8_t px[3] = {q[4 * k + 2], q[4 * k + 1], q[4 * k]}; fwrite(px, 1, 3, pf); } fclose(pf); }
+                for (int k = 1; k <= 3; k++) { snprintf(path, sizeof path, "%s/glitch%d_f%llu_next%d.png", gd, trig_n, rl_n, k); dm_gfx_shot_at(k, path); }
+                long cf = (long)atomic_load(&g_cur_frame); g_pd_a0 = cf; g_pd_a1 = cf + 2;
+                MLOG("【红】黑帧触发器：出图 %llu 亮度 %.1f → %.1f（当前帧 %ld，通道转储对准 %ld–%ld，后 3 帧截图 → %s）", rl_n, prev_lum, lum, cf, cf, cf + 2, gd); }
+            prev_lum = lum; }
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }];
 #if !DM_NVN_M3
