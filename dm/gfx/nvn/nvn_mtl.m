@@ -545,7 +545,7 @@ static void up_owner_check(const char *where) {
 // other threads (the present thread etc.) creating a command buffer do not touch the batch: they do not read or write textures uploaded in this batch; commands that need these textures all come after this replay submission (the batch is flushed before it)
 // Old-queue command buffers (readback / diagnostics / present; to be deleted once M4-4 and M4-5 are migrated away): uploads are already on the Metal 4 queue, and there is no ordering guarantee between the two queues -
 // wait for the upload to complete after flushing it, and only then can the old queue read the upload result (mtl_read_texels waited first and flushed afterwards, the readback beat the upload, 4 failures on t_nvn upload content)
-static id<MTLBuffer> g_rl_rb; static NSUInteger g_rl_x0, g_rl_y0, g_rl_w, g_rl_h; static FILE *g_rl_f; static pthread_mutex_t *g_rl_mu;   // DM_NVN_REGLUM 本帧待回读（编进出图命令缓冲） | DM_NVN_REGLUM pending readback for this frame (encoded into the present command buffer)
+static id<MTLBuffer> g_rl_rb; static int g_rl_slot; static _Atomic int g_rl_busy[8]; static NSUInteger g_rl_x0, g_rl_y0, g_rl_w, g_rl_h; static FILE *g_rl_f; static pthread_mutex_t *g_rl_mu;   // DM_NVN_REGLUM 本帧待回读（编进出图命令缓冲） | DM_NVN_REGLUM pending readback for this frame (encoded into the present command buffer)
 static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); while (atomic_load(&g_up_pending)) usleep(200); } return [g_q commandBuffer]; }
 static post_op *g_post; static int g_npost, g_postcap;
 // 每次提交一个自动释放池：提交跑在客体线程上（长驻、无运行循环、从不排空隐式池），Metal 回放里自动释放的对象
@@ -4896,6 +4896,12 @@ frz_plain:;
         if (e && sscanf(e, "%f,%f,%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8) mtl_ui_ghost(1, v[0], v[1], &v[2], v[6], v[7]); } }
     if (dw && atomic_load(&g_ghost_on)) ghost_note(dw);
     if (enc_label_on() && !g_el_draws++ && pr->sh[1]) { memcpy(g_el_key, pr->sh[1]->key, 8); g_el_key[8] = 0; }
+    // 诊断 DM_NVN_DRAWSET=文件（缺省关）：每次带索引的绘制记一行「帧 顶点着色器键 索引缓冲 索引数 实例数 cb1 前 64 字节指纹」，供离线找「同一物体（网格 + 世界矩阵）前后帧都画、中间一帧没画 / 多画」（可见性 A-B-A）
+    // Diagnostic DM_NVN_DRAWSET=file (off by default): one line per indexed draw "frame vs-key index-buffer count instances cb1-first-64-byte hash", for finding offline "the same object (mesh + world matrix) drawn in the frames before and after but not in the middle one / extra in the middle one" (visibility A-B-A)
+    { static FILE *dsf; static int dsi = -1; if (dsi < 0) { const char *e = getenv("DM_NVN_DRAWSET"); dsi = e && (dsf = fopen(e, "w")) != NULL; }
+      if (dsi && di && pr->sh[0]) { const p_bind_buf *u = &S.ubo[0][1]; void *mb; uint64_t mo; const uint8_t *base; uint64_t h = 1469598103934665603ull; int ok = 0;
+        if (u->addr && u->size >= 64 && !pend_hits(u->addr, 64) && mtl_addr(u->addr, 64, &mb, &mo) && (base = [(__bridge id<MTLBuffer>)mb contents])) { for (int q = 0; q < 64; q++) h = (h ^ base[mo + q]) * 1099511628211ull; ok = 1; }
+        fprintf(dsf, "%llu %.16s %llx %d %d %016llx\n", (unsigned long long)atomic_load(&g_cur_frame), pr->sh[0]->key, (unsigned long long)di->ibuf, (int)di->count, (int)di->instances, ok ? (unsigned long long)h : 0ull); } }
     if (passdump()) {   // 通道首次绘制的特征（判读入是否可省：全屏、无混合、写满通道、不依赖深度）；DM_NVN_PASSDUMP_ALL 时每次绘制都记 | Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
         static uint64_t last_pass = ~0ull; static int all = -1; if (all < 0) all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
         if (all) PD("d %llu bv=%d bi=%d first=%d vs=%s fs=%s vc=%d inst=%d blend=%#x b0=%#llx dt=%d dw=%d df=%d cull=%d st=%d sf=%d,%d sop=%d,%d,%d/%d,%d,%d smask=%#x,%#x/%#x,%#x sref=%#x,%#x ib=%#llx it=%d cmask=%#x", g_stat_pass, di ? di->base_vertex : 0, di ? di->base_instance : 0, dw ? dw->first : 0, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
@@ -6082,7 +6088,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
              g_bp_up_bytes / 1048576.0, g_pkg_uploads, g_pkg_reuploads,
              g_up_total_ns / 1e6, g_bp_first_present / 1e9);
     }
-    PD("X ser=%llu", t->serial);
+    PD("X ser=%llu present=%llu frame=%llu", t->serial, (unsigned long long)g_present_n, (unsigned long long)frame);
     id<MTLTexture> src = tex_mtl(t);
     if (!src) { RED_ONCE(8, "出图贴图建不出 MTLTexture"); return 0; }
     // DM_NVN_REGLUM=x0,y0,x1,y1:文件（归一化坐标）：每次出图回读该区域，记「出图序号、出图时刻 ns、区域平均亮度、隔点灰度小图（十六进制）」（诊断：核动画速度与帧率无关）。
@@ -6097,7 +6103,14 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         NSUInteger x0 = (NSUInteger)(rr[0] * src.width), y0 = (NSUInteger)(rr[1] * src.height), w = (NSUInteger)(rr[2] * src.width) - x0, h = (NSUInteger)(rr[3] * src.height) - y0;
         // 回读编进这次出图的命令缓冲（与游戏绘制同一条 Metal 4 队列、按提交顺序执行）：原先另开老队列的命令缓冲，和绘制不排序，机器忙时会在画面画完之前就拷，读到全黑 / 半帧——误报成「黑帧」
         // The readback is encoded into this present's command buffer (same Metal 4 queue as the game's draws, executed in commit order): it used to open a command buffer on the old queue, unordered with the draws, and under load copied before the frame was drawn, reading black / half frames -- false "black frame" reports
-        g_rl_rb = [g_dev newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared]; g_rl_x0 = x0; g_rl_y0 = y0; g_rl_w = w; g_rl_h = h; g_rl_f = rlf; g_rl_mu = &rlmu;
+        // 回读缓冲必须在驻留集里（Metal 4 不自动驻留）：原先每帧新建、不进驻留集 → GPU 写不进去，读出全 0（16:40 之后的 reglum 全是 0）。改为固定 8 个、建时进驻留集并立即提交
+        // The readback buffer must be in the residency set (Metal 4 has no implicit residency): it used to be created per frame and never made resident → the GPU copy wrote nothing and every reglum line read 0. Now a fixed ring of 8, made resident on creation and committed at once
+        static id<MTLBuffer> ring[8]; static NSUInteger ring_len; int slot = (int)(g_present_n % 8);
+        if (g_rl_rb) { atomic_store(&g_rl_busy[g_rl_slot], 0); g_rl_rb = nil; }   // 上次出图提前返回、没用上的槽 | slot left over by an earlier present that returned early
+        if (ring_len != w * h * 4) { for (int i = 0; i < 8; i++) { if (ring[i]) res_remove(ring[i]); ring[i] = [g_dev newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared]; res_add(ring[i]); } ring_len = w * h * 4; res_commit(); }
+        if (!atomic_load(&g_rl_busy[slot])) { atomic_store(&g_rl_busy[slot], 1); g_rl_slot = slot;
+            g_rl_rb = ring[slot]; g_rl_x0 = x0; g_rl_y0 = y0; g_rl_w = w; g_rl_h = h; g_rl_f = rlf; g_rl_mu = &rlmu; }
+        else { static int nb; if (nb++ < 8) MLOG("【红】DM_NVN_REGLUM：回读槽 %d 仍在用，出图 %llu 不回读", slot, (unsigned long long)g_present_n); }
     }
     // DM_NVN_SHOT=帧号[,帧号…]:路径（路径里的 %d 换成帧号）
     // DM_NVN_SHOT=frame number[,frame number...]:path (%d in the path is replaced with the frame number)
@@ -6143,7 +6156,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     CBUF cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
     if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
-    id<MTLBuffer> rl_rb = g_rl_rb; NSUInteger rl_w = g_rl_w, rl_h = g_rl_h; g_rl_rb = nil;
+    id<MTLBuffer> rl_rb = g_rl_rb; NSUInteger rl_w = g_rl_w, rl_h = g_rl_h; int rl_slot = g_rl_slot; g_rl_rb = nil;
     if (rl_rb) { BENC rb_enc = enc_b_begin(cb); [rb_enc barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [rb_enc copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(g_rl_x0, g_rl_y0, 0) sourceSize:MTLSizeMake(rl_w, rl_h, 1) toBuffer:rl_rb destinationOffset:0 destinationBytesPerRow:rl_w * 4 destinationBytesPerImage:rl_w * rl_h * 4]; enc_b_end(rb_enc); }
     unsigned long long rl_n = g_present_n, rl_tns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); FILE *rl_f = g_rl_f; pthread_mutex_t *rl_mu = g_rl_mu;
     if (g_dm_present_link) {   // 留一份给空节拍重出图 | keep a copy for re-presenting on empty ticks
@@ -6171,8 +6184,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                 static uint8_t tb[3][144]; static int tbn; static int trig2;
                 uint8_t cur[144]; for (int by = 0; by < 9; by++) for (int bx = 0; bx < 16; bx++) { unsigned sm = 0; for (int yy = 0; yy < 4; yy++) for (int xx = 0; xx < 4; xx++) sm += g[(by * 4 + yy) * 64 + bx * 4 + xx]; cur[by * 16 + bx] = (uint8_t)(sm / 16); }
                 static const char *gd2 = NULL; static int gd2_init; if (!gd2_init) { gd2_init = 1; gd2 = getenv("DM_NVN_GLITCH"); }
-                if (tbn >= 2 && gd2 && trig2 < 6) { int hits = 0; for (int k = 0; k < 144; k++) { int a = tb[0][k], b = tb[1][k], c = cur[k]; if (abs(b - a) > 20 && abs(c - b) > 20 && (b - a) * (c - b) < 0 && abs(c - a) < 8) hits++; }
-                    if (hits >= 3) { trig2++; char path[512]; snprintf(path, sizeof path, "%s/aba%d_present%llu_ring.txt", gd2, trig2, rl_n); pdr_flush(path);
+                static int gmin = -1, gmax; if (gmin < 0) { const char *e = getenv("DM_NVN_GLITCH_MIN"), *x = getenv("DM_NVN_GLITCH_MAX"); gmin = e ? atoi(e) : 3; gmax = x ? atoi(x) : 6; }   // 诊断：触发所需最少块数（缺省 3）、最多触发次数（缺省 6） | diagnostic: minimum block count to fire (default 3), maximum number of firings (default 6)
+                if (tbn >= 2 && gd2 && trig2 < gmax) { int hits = 0; for (int k = 0; k < 144; k++) { int a = tb[0][k], b = tb[1][k], c = cur[k]; if (abs(b - a) > 20 && abs(c - b) > 20 && (b - a) * (c - b) < 0 && abs(c - a) < 8) hits++; }
+                    if (hits >= gmin) { trig2++; char path[512]; snprintf(path, sizeof path, "%s/aba%d_present%llu_ring.txt", gd2, trig2, rl_n); pdr_flush(path);
                         MLOG("【红】画面触发器：出图 %llu 的前一帧有 %d 块 A-B-A 错画（当前帧 %llu），通道转储环已写 %s", rl_n, hits, (unsigned long long)atomic_load(&g_cur_frame), path); } }
                 memcpy(tb[0], tb[1], 144); memcpy(tb[1], cur, 144); if (tbn < 2) tbn++;
             }   // 黑帧触发器 DM_NVN_GLITCH=目录：游戏帧亮度骤降（上帧 >15、本帧 < 上帧 35%）时存本帧像素、截后 3 帧、并把通道转储对准后 3 帧 | black-frame trigger DM_NVN_GLITCH=dir: when the game frame's brightness collapses (previous > 15, this < 35% of previous) save this frame's pixels, screenshot the next 3 frames and aim the pass dump at them
@@ -6183,7 +6197,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                 for (int k = 1; k <= 3; k++) { snprintf(path, sizeof path, "%s/glitch%d_f%llu_next%d.png", gd, trig_n, rl_n, k); dm_gfx_shot_at(k, path); }
                 long cf = (long)atomic_load(&g_cur_frame); g_pd_a0 = cf; g_pd_a1 = cf + 2;
                 MLOG("【红】黑帧触发器：出图 %llu 亮度 %.1f → %.1f（当前帧 %ld，通道转储对准 %ld–%ld，后 3 帧截图 → %s）", rl_n, prev_lum, lum, cf, cf, cf + 2, gd); }
-            prev_lum = lum; }
+            prev_lum = lum; atomic_store(&g_rl_busy[rl_slot], 0); }
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }];
 #if !DM_NVN_M3
