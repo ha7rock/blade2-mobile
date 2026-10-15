@@ -2121,7 +2121,8 @@ static void shmap_load(void) {
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; } @end   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 #include "nvn_pso_skey.h"
-@interface NvProg : NSObject { @public NvShader *sh[6]; char gskey[24]; } @end   // gskey：绑了几何着色器时的键（不加载，见 prog_get） | gskey: key of the bound geometry shader (not loaded, see prog_get)
+@interface NvProg : NSObject { @public NvShader *sh[6]; char gskey[24]; } @end
+static void attrfacts_note(NvShader *vs, int loc, int fmt);   // 定义在 encode_args 之前 | defined before encode_args   // gskey：绑了几何着色器时的键（不加载，见 prog_get） | gskey: key of the bound geometry shader (not loaded, see prog_get)
 @implementation NvProg @end
 // 预热项：后台建好、等提交线程领用。vs / fs 强引用（pso 里只是裸指针，后台字典随任务结束释放）
 // Warm-up entry: built in the background, waiting to be taken by the submit thread. vs / fs are strong references (in pso they are only raw pointers, and the background dictionary is released when the task ends)
@@ -2720,7 +2721,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
     const nvn_refl *rf = &vs->rf;
     k->topo = rf->writes_layer ? (uint8_t)g_cur_topo : 0;
-    for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 16 && a < S.nattr) { k->attr[a] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
+    for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 16 && a < S.nattr) { k->attr[a] = S.attr[a]; attrfacts_note(vs, rf->v[v].loc, S.attr[a].fmt); int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
 }
 // ---- 并行预编：首次遇到的管线原先在提交线程一条条同步编，一帧里连着缺 9 条 = 284 ms（真机重场面）。
 // 现在：一次提交里第一次缺管线时，顺着余下的命令往前扫一遍（只重放状态，不画），把后面还会缺的普通通道管线一并丢给后台并行编；
@@ -3023,6 +3024,25 @@ static inline int m3_use_seen(void *p, uint32_t u) {
 // DM_NVN_TEXFACTS=file: record the texture type actually bound to each texture slot of each shader (key \t slot \t type word) as answers for offline translation (dmsh_from_dump.py merges them into tex of nvn/shader_facts.tsv).
 // The translator cannot see texture descriptors offline and treats every slot as 2D by default: texture buffers (UE4 skinning's bone matrices Buffer<float4>), 3D / cube textures read 0 on Metal when the type does not match
 static void texraw_sel_note(id<MTLTexture> t, uint64_t ser);   // 定义在 td_dump 之前 | defined before td_dump
+// 顶点属性分量类型作答（与贴图类型同一文件，行格式「键 \t attr:<槽> \t uint|sint|float」）：翻译器离线不知道属性格式，缺省按浮点声明；
+// 整数属性（UE4 蒙皮的骨骼索引 RGBA8UI）按浮点声明后 Metal 把整数转成浮点值，着色器再 as_type<int> 就成了垃圾——主角身体整个消失
+// Vertex attribute component type answers (same file as texture types, line "key \t attr:<slot> \t uint|sint|float"): the translator cannot see attribute formats offline and declares float by default;
+// an integer attribute (UE4 skinning's bone indices RGBA8UI) declared as float makes Metal convert the integers to float values and the shader's as_type<int> yields garbage -- the whole character body vanished
+static MTLVertexFormat vfmt(int f);
+static void attrfacts_note(NvShader *vs, int loc, int fmt) {
+    static FILE *f; static int tried; static NSMutableSet *seen;
+    if (!tried) { tried = 1; const char *e = getenv("DM_NVN_TEXFACTS"); if (e) { f = fopen(e, "a"); seen = [NSMutableSet set]; } }
+    if (!f || !vs || !vs->key[0] || !fmt) return;
+    MTLVertexFormat m = vfmt(fmt); const char *cls = "float";
+    switch (m) { case MTLVertexFormatUChar: case MTLVertexFormatUChar2: case MTLVertexFormatUChar3: case MTLVertexFormatUChar4: case MTLVertexFormatUShort: case MTLVertexFormatUShort2: case MTLVertexFormatUShort3: case MTLVertexFormatUShort4:
+                 case MTLVertexFormatUInt: case MTLVertexFormatUInt2: case MTLVertexFormatUInt3: case MTLVertexFormatUInt4: cls = "uint"; break;
+                 case MTLVertexFormatChar: case MTLVertexFormatChar2: case MTLVertexFormatChar3: case MTLVertexFormatChar4: case MTLVertexFormatShort: case MTLVertexFormatShort2: case MTLVertexFormatShort3: case MTLVertexFormatShort4:
+                 case MTLVertexFormatInt: case MTLVertexFormatInt2: case MTLVertexFormatInt3: case MTLVertexFormatInt4: cls = "sint"; break;
+                 default: break; }
+    NSString *line = [NSString stringWithFormat:@"%.16s\tattr:%d\t%s", vs->key, loc, cls];
+    if ([seen containsObject:line]) return;
+    [seen addObject:line]; fprintf(f, "%s\n", line.UTF8String); fflush(f);
+}
 static void texfacts_note(NvShader *sh, int reg, MTLTextureType tt) {
     static FILE *f; static int tried; static NSMutableSet *seen;
     if (!tried) { tried = 1; const char *e = getenv("DM_NVN_TEXFACTS"); if (e) { f = fopen(e, "a"); seen = [NSMutableSet set]; } }
@@ -4721,6 +4741,11 @@ frz_plain:;
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
     if (!ps) { PD("N %llu 绘制提前退出@L4561", g_stat_pass + 1); return; }
     if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
+    // 诊断 DM_NVN_DT_ALWAYS=片元键,…：这些绘制的深度测试改成恒过（判「预通道与基础通道裁剪位置不一致」把几何挡掉的情况） | Diagnostic DM_NVN_DT_ALWAYS=fragment key,...: depth test of these draws forced to always pass (to tell whether prepass / base pass position mismatch is rejecting geometry)
+    { static char keys[6][24]; static int nk = -1; if (nk < 0) { nk = 0; const char *e = getenv("DM_NVN_DT_ALWAYS");
+          for (const char *q = e; q && *q && nk < 6; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 23) n = 23; memcpy(keys[nk], q, n); keys[nk++][n] = 0; } }
+      static int forced; int hit = 0; if (nk && pr->sh[1]) for (int i = 0; i < nk; i++) if (!strncmp(pr->sh[1]->key, keys[i], strlen(keys[i]))) hit = 1;
+      if (hit && S.ds.dt) { S.ds.dt = 0; g_dss_dirty = 1; forced = 1; } else if (forced && !hit) { forced = 0; g_dss_dirty = 1; } }
     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
     if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
     if (cur_ds != g_enc_dss) { enc_r_dss(en, cur_ds); g_enc_dss = cur_ds; }

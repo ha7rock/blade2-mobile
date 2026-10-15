@@ -49,11 +49,13 @@ import json
 # 同一槽见过多种类型时取最后一种并提示
 # Texture type answers: "key \t slot \t type word" recorded by the host via DM_NVN_TEXFACTS (buffer / 3D / cube ...; the translator defaults to 2D and Metal reads 0 when the type does not match -- UE4 skinning's bone matrices are a texture buffer)
 # When one slot was seen with several types the last one wins with a notice
-texfacts = {}
+texfacts, attrfacts = {}, {}
 tf = os.environ.get('DM_TEXFACTS', os.path.join(os.environ.get('DM_ROOT', os.path.expanduser('~/blade2-work')), 'texfacts.tsv'))
 if os.path.exists(tf):
     for ln in open(tf):
         c = ln.rstrip('\n').split('\t')
+        if len(c) == 3 and c[1].startswith('attr:'):   # 顶点属性分量类型 | vertex attribute component type
+            attrfacts.setdefault(c[0], {})[c[1][5:]] = c[2]; continue
         if len(c) == 3:
             prev = texfacts.setdefault(c[0], {}).get(c[1])
             if prev and prev != c[2]: print(f'贴图类型作答：{c[0]} 槽 {c[1]} 既见 {prev} 又见 {c[2]}，取 {c[2]}')
@@ -62,11 +64,11 @@ with open(os.path.join(NVN, 'shader_facts.tsv'), 'w') as f:
     f.write('# 翻译查询的作答表（dmsh_from_dump.py：计算线程组 / 共享内存从控制段解出；贴图类型来自宿主 DM_NVN_TEXFACTS 记录）| answer table (dmsh_from_dump.py: compute threadgroup / shared memory decoded from the control sections; texture types from the host DM_NVN_TEXFACTS record)\n')
     for st in ('vs', 'ps', 'cs'):
         for key, code, ctl in recs[st]:
-            facts = {'attr': {}, 'fout': {}, 'img': {}, 'tex': texfacts.get(key, {})}
+            facts = {'attr': attrfacts.get(key, {}), 'fout': {}, 'img': {}, 'tex': texfacts.get(key, {})}
             if st == 'cs':
                 x, y, z, shared = struct.unpack_from('<3I', ctl, 0x748) + struct.unpack_from('<I', ctl, 0x754)
                 facts.update({'local': [x, y, z], 'shared': (shared + 15) // 16 * 16})
-            elif not facts['tex']: continue
+            elif not facts['tex'] and not facts['attr']: continue
             f.write(key + '\t' + json.dumps(facts, sort_keys=True, separators=(',', ':')) + '\n')
 print(f'贴图类型作答：{sum(1 for k in texfacts if any(k == r[0] for st in recs for r in recs[st]))} 个着色器有记录（{tf}）')
 open(os.path.join(NVN, 'shader_map.tsv.conflicts.tsv'), 'w').write('# 无键冲突（转储按键去重） | no key conflicts (the dump is deduplicated by key)\ndm_ctl_sha16\tchosen\treason\n')
