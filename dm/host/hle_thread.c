@@ -84,6 +84,7 @@ static void *h_lookup(uint32_t h, int type) {       // 查不到即报（句柄�
     void *o = h_peek(h, type);
     return o;
 }
+static void *se_find_by_wh(uint32_t wh);
 static void *h_lookup(uint32_t h, int type);   // 同 h_get 但查不到不打日志 | same as h_get but silent when not found
 
 static thr_t *cur(void) {
@@ -635,6 +636,8 @@ static int svc_thread_inner(int num, uint64_t *regs) {
         pthread_mutex_lock(&G);
         unsigned i = (uint32_t)regs[0] - 0x1000;
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
+            if (g_flag.dbg && g_h[i].type == O_EVENT_W && se_find_by_wh((uint32_t)regs[0]))   // 服务层事件的写端被游戏关了（Detach 读端后 Destroy）：宿主按对象触发，不受影响 | The write end of a service-layer event closed by the game (destroy after detaching the read end): the host signals the object, unaffected
+                LOG("服务层 SystemEvent 写端 %#x 被游戏 CloseHandle（宿主继续按对象触发）", (uint32_t)regs[0]);
             event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
@@ -656,12 +659,26 @@ static int svc_thread_inner(int num, uint64_t *regs) {
 // ---------- SystemEvent of the service layer ----------
 // Real device: the service hands the read end of a kernel event to the client, and the guest waits on it through SDK nn::os. Host: on a guest thread, call the SDK's own
 // CreateSystemEvent(inter-process=true), and the SDK creates the kernel event through SVC 0x45; the write-end handle is recorded, after which any thread (including the host audio thread) can signal it.
-static struct { void *ev; uint32_t wh; } g_se[512];
+// 表里记的是内核事件对象本身（绑定时从写端句柄解析、多持一个引用），不是句柄：游戏拿到 SystemEvent 后可能 Detach 读端再 Destroy（Blade 的音频渲染器就这么做，
+// 写端句柄随之被关），对象只要读端还有人等就得继续能触发。
+// The table records the kernel event object itself (resolved from the write-end handle at bind time, with an extra reference held), not the handle: after receiving the SystemEvent the game may
+// detach the read end and destroy the rest (Blade's audio renderer does exactly that, closing the write-end handle), and the object must stay signalable as long as someone waits on the read end.
+static struct { void *ev; uint32_t wh; event_t *obj; } g_se[512];
 static int g_nse;
 static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t se_find(void *ev) {
     for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
     return 0;
+}
+static event_t *se_obj(void *ev) {
+    pthread_mutex_lock(&g_se_lock); event_t *o = NULL;
+    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) { o = g_se[i].obj; break; }
+    pthread_mutex_unlock(&g_se_lock); return o;
+}
+static void *se_find_by_wh(uint32_t wh) {   // 持 G 时也可调（只读旁表，另一把锁） | Callable while holding G too (reads the side table under its own lock)
+    pthread_mutex_lock(&g_se_lock); void *ev = NULL;
+    for (int i = 0; i < g_nse; i++) if (g_se[i].wh == wh) { ev = g_se[i].ev; break; }
+    pthread_mutex_unlock(&g_se_lock); return ev;
 }
 void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线程上调（要执行 SDK 代码） | Must be called on a guest thread (it has to execute SDK code)
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
@@ -673,29 +690,28 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
     uint32_t r = create(ev, autoclear, 1);
     if (r) die("CreateSystemEvent 失败 %#x", r);
     wh = getw(ev);
+    pthread_mutex_lock(&G); event_t *obj = h_peek(wh, O_EVENT_W); if (obj) obj->refs++; pthread_mutex_unlock(&G);
+    if (!obj) die("SystemEvent 绑定 %p：写端句柄 %#x 查无对象", ev, wh);
     pthread_mutex_lock(&g_se_lock);
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
-    g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
+    g_se[g_nse].ev = ev; g_se[g_nse].wh = wh; g_se[g_nse++].obj = obj;
     pthread_mutex_unlock(&g_se_lock);
 }
 void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时绑定（只能在客体线程上发生） | An unbound one is bound on the spot as manual-clear (can only happen on a guest thread)
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
     if (!wh) { hle_bind_system_event(ev, 0); pthread_mutex_lock(&g_se_lock); wh = se_find(ev); pthread_mutex_unlock(&g_se_lock); }
+    event_t *e = se_obj(ev); if (!e) die("SystemEvent %p 未绑定", ev);
     pthread_mutex_lock(&G);
-    event_t *e = h_get(wh, O_EVENT_W);
-    if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
     e->signaled = 1; wake_sync_waiters();
     pthread_mutex_unlock(&G);
 }
-// 容错版（宿主定时线程用，如 Blade 的音频渲染器节拍）：写端句柄已失效（游戏销毁了事件）返回 0、不中止；未绑定的也不就地绑定（宿主线程上不能执行 SDK 代码）
-// Tolerant variant (for host timer threads, e.g. Blade's audio renderer tick): returns 0 without aborting when the write-end handle is gone (the game destroyed the event); an unbound one is not bound on the spot either (SDK code cannot run on a host thread)
+// 容错版（宿主定时线程用，如 Blade 的音频渲染器节拍）：未绑定的返回 0、不中止，也不就地绑定（宿主线程上不能执行 SDK 代码）
+// Tolerant variant (for host timer threads, e.g. Blade's audio renderer tick): returns 0 without aborting for an unbound one, and does not bind on the spot either (SDK code cannot run on a host thread)
 int hle_signal_system_event_try(void *ev) {
-    pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
-    if (!wh) return 0;
+    event_t *e = se_obj(ev); if (!e) return 0;
     pthread_mutex_lock(&G);
-    event_t *e = h_lookup(wh, O_EVENT_W);
-    if (e) { e->signaled = 1; wake_sync_waiters(); }
+    e->signaled = 1; wake_sync_waiters();
     pthread_mutex_unlock(&G);
-    return e != NULL;
+    return 1;
 }
 int hle_system_event_bound(void *ev) { pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock); return wh != 0; }

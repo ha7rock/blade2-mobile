@@ -98,7 +98,7 @@ AArch64 上只有四类东西在苹果内核下不能原样跑，改写器用线
 
 - `Makefile.blade`：只编通用部分（装载 / SVC / 服务接管 / 图形层），不带任何 `dm_*.c` 暗黑功能文件、`diag.c`、`touch_mac.c`。
 - `blade_stubs.c`：通用文件里残留的 100 个 D2R 功能钩子的中性实现（过滤器原样放行、查询答「没有」、D2R 剪口才会到的宿主调用一律中止）。清单由 `tools/host_trial_build.sh` 的链接缺符号列表得出。
-- `hle_blade.c`：Blade 多用到的 SDK 接口——movie 媒体信息、hid 六轴 / 握持 / 手柄支持小程序、oe、time 时区规则、swkbd 配置、vi 缩放、web / err / pctl / diag，**音频渲染器**（第一版只维持协议：5 ms 定时触发系统事件、所有请求成功、不出声），联网一组一律「不可用」。
+- `hle_blade.c`：Blade 多用到的 SDK 接口——movie 媒体信息、hid 六轴 / 握持 / 手柄支持小程序、oe、time 时区规则、swkbd 配置、vi 缩放、web / err / pctl / diag，**音频渲染器**（在 SDK 接口层按 voice 混音：PcmInt16 / DSP-ADPCM 解码、线性插值重采样、音量 × 混音矩阵（含 BufferMixer 路由）叠成立体声，CoreAudio 出声或静音接收端按实时消耗；波形缓冲播完归还、已播样本数如实；`DM_AUDIO=1` 出声，`DM_AUDIO_OUT_DUMP=<文件>` 转储混音结果），联网一组一律「不可用」。
 - `hle_hid.c`：Joy-Con 双持 / 左 / 右三种样式答「没接」；`hle_fs.c`：`DeleteDirectory`、`CommitSaveData`、`GetDirectoryEntryCount`。
 - `tools/extract_game.sh`：按本游戏的 title / 版本从 XCI 取文件（prod.keys 里格式不对的行先过滤）。
 
@@ -152,7 +152,7 @@ tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_bu
 还没做 / 已知问题：
 0. **偶发 GPU hang**（进关卡时出现过一次 `kIOGPUCommandBufferCallbackErrorHang`，后续帧恢复）；`MemoryPoolMapVirtual` 现已实现映射表但本游戏没用到。
 1. **点光源阴影的画面验证**：Act 1 开头没有带阴影的点光源，只在标题场景（角色近景、无地面）用到；立方体图 6 个面已有几何、比较采样器正确，等遇到有接收面的场景再对比。
-2. **音频**：渲染器事件被游戏销毁（`音频渲染器事件的写端句柄已失效`），且只维持协议不出声。
+2. **音频**：已出声（Mac `DM_AUDIO=1`）。渲染器事件「写端失效」的根因是游戏 Detach 读端后 Destroy 临时 SystemEvent，宿主现在按内核事件对象触发而不按句柄。还没做：I3dl2 混响（只出干声）、ParseAdpcmHeader 之外的 SDK 纯计算都没动；音量偏大（开场曲与局内多 voice 叠加有削波），要对着真机录音核对增益口径。
 3. **TBDR 优化**（写回前瞻 / 读入可省 / 延迟通道）现在全关（`DM_NVN_TBDR=0`），是 D2R 调过的，Blade 上要重新验证后再开；`MemoryPoolMapVirtual` / `Downsample` 仍只报红。
 4. **iOS 壳**：补丁区在前的布局、16 GB 虚拟地址区、通用虚拟手柄。
 5. **验证工具**：`structck.py` / `equiv.py` 认识 `JA` 行、负偏移补丁区与新改写块。
