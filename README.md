@@ -3,7 +3,7 @@
 这是对 [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)（把 Switch 版《暗黑破坏神 II：狱火重生》原生跑在 iPhone 上的开源兼容层）的**方法论拆解**，以及把同一套方法**举一反三**用到本地另一款 Switch 游戏（Blade II，UE4 4.17）上的工程。
 `dm/` 是 d2r-mobile 的 `dm/` 目录原样拷贝（MIT，见 `LICENSE.d2r-mobile`）加上 Blade 的改动；改动都能用 `git log -p` 看到。
 
-状态（2026-10-14）：**分析完成、改写器已扩展到能改写 Blade 的全部三个模块、Mac 宿主编译通过**；运行阶段的进展见文末「现状与下一步」。
+状态（2026-10-15）：**Mac 宿主能进关卡正常游玩并出声；iOS 壳（`dm/ios/blade`）能为 iphoneos 编出完整 App，待真机验证**；细节见文末「现状与下一步」。
 游戏内容（程序、资源、改写产物）一律不进仓库。
 
 ---
@@ -124,6 +124,13 @@ W=~/blade2-work
 tools/run_mac.sh $O 100 DM_PRESENT_LINK=0 DM_MSL_DIR=$W/build/cache/metal_shader_cache DM_NVN_SHDUMP=$W/shdump \
   DM_PSO_MANIFEST=off DM_NVN_TBDR=0 DM_KEYS="A@6,A@10,A@14,A@18,A@24,A@30,A@36,A@55" DM_NVN_SHOT=3000:$W/run/shot_%d.png
 tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_build → 重编宿主
+
+# 5. iOS 壳（dm/ios/blade，不需要暗黑的 dm/ios 工程）：iphoneos 着色器库 → 生成工程 + 编译；没有签名身份时只做编译检查
+IOSOUT=$W/build/ios/dmsh_b J=8 $W/venv/bin/python3 -I dm/gfx/tools/dmsh_build.py $W/shpack $W/build/cache/metal_shader_cache
+cp dm/ios/local.env.example dm/ios/local.env   # 填 DM_TEAM_ID / DM_BUNDLE_ID / DM_DEVICE（见文件内说明）
+DM_OUT=$O dm/ios/blade/run.sh build && dm/ios/blade/run.sh install && dm/ios/blade/run.sh launch
+# RomFS：用「文件」App 把 Update/RomFS 的内容（含 BladeII/Content/Paks）拷进 App 的文件夹；日志在 App 的 Documents/boot.txt
+# 不用真机验 iOS 的装载路径：make -C dm/host -f Makefile.blade embed EMBED_S=$PWD/dm/ios/blade/Gen/embed.S && DM_HOST_BIN=dmhost_blade_embed tools/run_mac.sh $O 60
 ```
 
 ---
@@ -156,7 +163,12 @@ tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_bu
 1. **点光源阴影的画面验证**：Act 1 开头没有带阴影的点光源，只在标题场景（角色近景、无地面）用到；立方体图 6 个面已有几何、比较采样器正确，等遇到有接收面的场景再对比。
 2. **音频**：已出声（Mac `DM_AUDIO=1`）。渲染器事件「写端失效」的根因是游戏 Detach 读端后 Destroy 临时 SystemEvent，宿主现在按内核事件对象触发而不按句柄。还没做：I3dl2 混响（只出干声）、ParseAdpcmHeader 之外的 SDK 纯计算都没动；音量偏大（开场曲与局内多 voice 叠加有削波），要对着真机录音核对增益口径。
 3. **TBDR 优化**（写回前瞻 / 读入可省 / 延迟通道）现在全关（`DM_NVN_TBDR=0`），是 D2R 调过的，Blade 上要重新验证后再开；`MemoryPoolMapVirtual` / `Downsample` 仍只报红。
-4. **iOS 壳**：补丁区在前的布局、16 GB 虚拟地址区、通用虚拟手柄。
+4. **iOS 壳**（`dm/ios/blade`，2026-10-15 晚）：已能为 iphoneos arm64 编出完整的 App（Debug / Release，`CODE_SIGNING_ALLOWED=NO`，152 MB），没有真机 / 签名身份，没在手机上跑过。做了的：
+   - **补丁区在前的布局**：`gen_embed.py` 按 `PATCH_OFF < 0` 把文件切成 `__TEXT,__dm<名>x1`（补丁区，文件 [0, −PATCH_OFF)）/ `__TEXT,__dm<名>x0`（原 text）/ `__DM<名>W`（ro 余部 + data + bss + 键页）；`loader.c` iOS 分支按 x1 长度 == −PATCH_OFF 认出，保留「补丁区 + 映像」一块地址再 `vm_remap` 回原相对位置。Mac 上可用 `make -f Makefile.blade embed`（`-DDM_EMBED_IMAGE=1`）走同一条内嵌装载路径验证（映像编进 Mac 可执行文件，游戏照常进局）。
+   - **16 GB 虚拟地址区——不需要**：UE4 的 `AllocateAddressRegion(16 GB)`（`main+0x12ccb94` 的缺省常数，`main+0x6c28c18` 可配置）只在 `nn::os::IsVirtualAddressMemoryEnabled()` 为真时走（`main+0x12cca88` 的分支），而 Blade 的 npdm `SystemResourceSize = 0` 让它为假，走 `SetMemoryHeapSize(3650 MB)` 的普通堆路线。通用宿主的 `DM_SYSRES_MB` 缺省改成 0（`hle_svc.c`），`run_mac.sh` 不再设 `DM_ALIAS_GB=18`：alias 512 MB、整块预留 5 GB，Mac 实测进局无红；5 GB 在 iOS 不签「扩展虚拟寻址」时也放得下（上限 6 GB）。工程仍签 `increased-memory-limit`（3650 MB 堆的常驻）与 `extended-virtual-addressing`（地址余量；免费账号删掉那一行即可），不做剪口。
+   - **工程**：`dm/ios/blade/project.yml`（XcodeGen）+ `run.sh`；宿主源文件由 `gen_build.py` 从 `Makefile.blade` 展开（`-DDM_GENERIC_HOST=1` 等 `-D` 原样进 xcconfig），外壳只有 `Sources/main.m`（日志、找 RomFS、环境变量、提前装载、场景生命周期）与 `Sources/front_blade.m`（Metal 视图 + **通用虚拟手柄**：左摇杆浮动、右摇杆、A/B/X/Y/L/R/ZL/ZR/+/−/L3/R3，经 `dm_input_set` 进 `hle_hid.c`）。`ENABLE_DEBUG_DYLIB=NO`（Xcode 的调试 dylib 会把内嵌段与 `_mh_execute_header` 搬出主可执行文件）。
+   - **iphoneos 着色器库**：`dmsh_build.py` 的 `IOSOUT` 路径现在也出融合变体 `<顶点键>+<几何键>_b`（含 `-fpreserve-invariance`）并进内容缓存；301 个库 + 6 个融合变体 + 40 个采样变体。
+   - 还没做：真机上跑（音频会话 / 发热 / 内存上限读数）、实体手柄（`dm_gamepad.m` 是暗黑的，Blade 用 `blade_stubs.c` 的空实现）、触摸屏（游戏只认手柄，没接 `dm_touch_set`）。
 5. **验证工具**：`structck.py` / `equiv.py` 认识 `JA` 行、负偏移补丁区与新改写块。
 
 **此前（同日白天）的结果**：引擎循环先跑起来（900 帧 / 60 秒，画面空）时修掉的通用问题：
@@ -165,8 +177,8 @@ tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_bu
 |---|---|---|
 | 改写器拒绝 `br x18` / `blr x18` / `ldr x18,=lit` | UE4 / 新 clang 的代码形态 | 三种新改写块（见第三节） |
 | `b` 跳不到补丁区 | 映像 131 MB > ±128 MB | 两遍发射，补丁区放映像前 |
-| `StandardAllocator::Initialize` 中止 | UE4 要 16 GB 虚拟地址区，d2r 的 alias 区只有 512 MB | `DM_ALIAS_GB` 放大（iOS 上要么签扩展虚拟寻址权限，要么剪口改小） |
-| 按真机走普通堆而不是虚拟内存 | Blade 的 npdm `SystemResourceSize = 0` | `DM_SYSRES_MB=0`（d2r 写死 32 MB） |
+| `StandardAllocator::Initialize` 中止 | UE4 要 16 GB 虚拟地址区，d2r 的 alias 区只有 512 MB | 当时用 `DM_ALIAS_GB` 放大；后来发现下一行的 `DM_SYSRES_MB=0` 让游戏根本不走这条路（见五.4），alias 又回到 512 MB |
+| 按真机走普通堆而不是虚拟内存 | Blade 的 npdm `SystemResourceSize = 0` | `DM_SYSRES_MB=0`（d2r 写死 32 MB；通用宿主现在缺省 0） |
 | 构造函数里 `FMemory::Free` 空指针崩 | sdk 内 libc++ 的 `basic_string` 走 sdk 自己的 `operator new`，释放却走 UE4 的 Binned 分配器；真机 rtld 是**全局插入**（main 的定义优先） | 装载器改成按装载顺序全局解析符号 |
 | `StandardAllocator::Allocate` 接管崩 | d2r 写死了 `sdk+0x2f9974` | 改按符号名取 |
 | 目录枚举递归到栈溢出 | 我写的 `GetDirectoryEntryCount` 用 telldir/seekdir 搅乱了目录流 | 另开目录流计数 |
