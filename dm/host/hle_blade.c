@@ -9,6 +9,7 @@
 #include "hle.h"
 #include "front.h"
 #include <AudioToolbox/AudioToolbox.h>
+#include <TargetConditionals.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
@@ -299,7 +300,12 @@ static OSStatus ren_au_render(void *ctx, AudioUnitRenderActionFlags *f, const Au
     return noErr;
 }
 static int ren_au_open(int rate) {   // 立体声 16 位、渲染器采样率喂给 DefaultOutput（它自己转到设备采样率） | Stereo 16-bit at the renderer rate into DefaultOutput (it converts to the device rate itself)
+#if TARGET_OS_IPHONE
+    // iOS 没有 DefaultOutput：输出单元是 RemoteIO（音频会话由 d2r 的 hle_audio.c 在 iOS 上统一激活） | iOS has no DefaultOutput: the output unit is RemoteIO (the audio session is activated on iOS by d2r's hle_audio.c)
+    AudioComponentDescription d = {.componentType = kAudioUnitType_Output, .componentSubType = kAudioUnitSubType_RemoteIO, .componentManufacturer = kAudioUnitManufacturer_Apple};
+#else
     AudioComponentDescription d = {.componentType = kAudioUnitType_Output, .componentSubType = kAudioUnitSubType_DefaultOutput, .componentManufacturer = kAudioUnitManufacturer_Apple};
+#endif
     AudioComponent c = AudioComponentFindNext(NULL, &d);
     if (!c || AudioComponentInstanceNew(c, &g_ren.au)) die("audren：AudioUnit 建不出来");
     AudioStreamBasicDescription f = {.mSampleRate = rate, .mFormatID = kAudioFormatLinearPCM, .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,

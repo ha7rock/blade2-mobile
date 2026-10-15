@@ -3,16 +3,17 @@
 #   Gen/src/<扁平名>   源文件符号链接（排除 main.c 与 front_mac.m；main.c 另链到 Gen/main/main.c，以 -Dmain=dm_main 编）
 #   stdout            xcconfig 行：HEADER_SEARCH_PATHS（-I 目录 + 每个源文件所在目录，保证相对 include 照常解析）、
 #                     OTHER_CFLAGS（-D）、框架（Cocoa 换成 UIKit 侧已有，跳过）
-# 用法：gen_build.py <dm/host 目录> <Gen 目录>
+# 用法：gen_build.py <dm/host 目录> <Gen 目录> [Makefile 名 [目标]]（缺省 Makefile / dmhost；Blade 通用宿主：Makefile.blade dmhost_blade）
 # Take the host's source files / header paths / frameworks from the actually expanded compile commands of dm/host/Makefile (make -n -B dmhost) and generate the iOS project's build inputs,
 # without hand-copying lists: when the Makefile changes, the next iOS build follows automatically.
 #   Gen/src/<flat name>   symlinks to source files (excluding main.c and front_mac.m; main.c is linked separately to Gen/main/main.c and compiled with -Dmain=dm_main)
 #   stdout            xcconfig lines: HEADER_SEARCH_PATHS (-I directories + the directory of every source file, so relative includes resolve as usual),
 #                     OTHER_CFLAGS (-D), frameworks (Cocoa is replaced by what the UIKit side already has, skipped)
-# Usage: gen_build.py <dm/host dir> <Gen dir>
+# Usage: gen_build.py <dm/host dir> <Gen dir> [Makefile name [target]] (default Makefile / dmhost; Blade generic host: Makefile.blade dmhost_blade)
 import os, shlex, subprocess, sys
 host, gen = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
-cmd = subprocess.run(['make', '-s', '-n', '-B', '-C', host, 'dmhost'], capture_output=True, text=True, check=True).stdout
+mk, target = (sys.argv[3] if len(sys.argv) > 3 else 'Makefile'), (sys.argv[4] if len(sys.argv) > 4 else 'dmhost')
+cmd = subprocess.run(['make', '-s', '-n', '-B', '-C', host, '-f', mk, target], capture_output=True, text=True, check=True).stdout
 toks = shlex.split(next(l for l in cmd.splitlines() if l.lstrip().startswith('clang')))
 srcs, incs, defs, fws = [], [], [], []
 i = 0
@@ -38,5 +39,8 @@ for s in srcs:
     flat = os.path.relpath(s, os.path.dirname(host)).replace('/', '__')   # 不同目录同名文件不冲突 | Same-named files in different directories do not collide
     os.symlink(s, f'{gen}/src/{flat}')
 print('HEADER_SEARCH_PATHS = $(inherited) ' + ' '.join(f'"{d}"' for d in incs + dirs))
-print('OTHER_CFLAGS = $(inherited) ' + ' '.join(defs))
+# -D 里的字符串字面量（-DDM_ARGV0='"BladeII"' 经 shlex 成 -DDM_ARGV0="BladeII"）：xcconfig 要写成 \" 才能把引号传到编译器
+# String literals inside -D (-DDM_ARGV0='"BladeII"' becomes -DDM_ARGV0="BladeII" after shlex): xcconfig needs \" for the quotes to reach the compiler
+def xcq(d): return '"' + d.replace('"', '\\"') + '"' if '"' in d or ' ' in d else d   # 带引号 / 空格的整条再用 "…" 包成一个参数（-DAPP_NAME="Blade II Mobile"） | wrap ones with quotes / spaces in "…" so they stay one argument (-DAPP_NAME="Blade II Mobile")
+print('OTHER_CFLAGS = $(inherited) ' + ' '.join(xcq(d) for d in defs))
 print('DM_FRAMEWORKS = ' + ' '.join(f'-framework {f}' for f in fws if f != 'Cocoa'))
