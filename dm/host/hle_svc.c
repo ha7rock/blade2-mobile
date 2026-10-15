@@ -32,6 +32,18 @@
 // address regions are carved from the alias region -- d2r's alias is only 512 MB, and when it is too small StandardAllocator::Initialize aborts. The Mac host enlarges the alias
 // region with DM_ALIAS_GB=<GB> (address space only, no memory) and the whole reservation grows with it; unset, everything is identical to d2r. On iOS at most 6 GB can be reserved
 // without the "extended virtual addressing" entitlement: either sign that entitlement or cut the 16 GB the game asks for down.
+// 系统资源区（SystemResourceSize）缺省：d2r 写死 32 MB（暗黑的 npdm）；通用宿主缺省 0 = Blade 的 npdm，这时 nn::os::IsVirtualAddressMemoryEnabled 为假，
+// UE4 走 SetMemoryHeapSize 的普通堆路线（main+0x12cca88 的分支），从不走 AllocateAddressRegion(16 GB)（main+0x12ccb94 的缺省常数）——alias 区保持 512 MB，
+// 整块预留 5 GB，iOS 不签「扩展虚拟寻址」也放得下（Mac 实测：DM_ALIAS_GB 不设照常进局，见 README 五）
+// Default for the system resource area (SystemResourceSize): d2r hard-codes 32 MB (Diablo's npdm); the generic host defaults to 0 = Blade's npdm, in which case
+// nn::os::IsVirtualAddressMemoryEnabled is false and UE4 takes the plain SetMemoryHeapSize heap route (the branch at main+0x12cca88), never AllocateAddressRegion(16 GB)
+// (the default constant at main+0x12ccb94) -- the alias region stays 512 MB and the whole reservation 5 GB, which fits on iOS without the "extended virtual addressing" entitlement
+// (measured on Mac: the game enters a level with DM_ALIAS_GB unset, see README 五)
+#if DM_GENERIC_HOST
+#define DM_SYSRES_MB_DEFAULT 0
+#else
+#define DM_SYSRES_MB_DEFAULT 32
+#endif
 static uint64_t alias_cap(void) { static uint64_t v; if (!v) { const char *e = getenv("DM_ALIAS_GB"); double gb = e ? atof(e) : 0.5; if (gb < 0.5) gb = 0.5; v = (uint64_t)(gb * (1ull << 30)) & ~0xFFFFFFFull; } return v; }
 #define RESERVE (alias_cap() - 0x20000000ull + (5ull << 30))   // d2r：alias 512 MB 时正好 5 GB | d2r: exactly 5 GB with a 512 MB alias
 static uint8_t *g_as;              // ASLR 区基址 = 整块 | ASLR region base = the whole block
@@ -255,7 +267,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // 真机上它走的是 SetMemoryHeapSize + AllocateMemoryBlock 的普通堆路线，这里报 0 才与真机一致（DM_SYSRES_MB 可改；缺省 32 = d2r）
         // System resource size (npdm SystemResourceSize): non-zero makes the SDK consider "virtual address memory" available. Diablo's npdm has 32 MB; Blade II's npdm has 0 --
         // on the real device it takes the plain heap route (SetMemoryHeapSize + AllocateMemoryBlock), so reporting 0 matches the real device (DM_SYSRES_MB adjustable; default 32 = d2r)
-        case I_SysResTotal: { static long mb = -1; if (mb < 0) { const char *e = getenv("DM_SYSRES_MB"); mb = e ? atol(e) : 32; } v = (uint64_t)mb << 20; break; }
+        case I_SysResTotal: { static long mb = -1; if (mb < 0) { const char *e = getenv("DM_SYSRES_MB"); mb = e ? atol(e) : DM_SYSRES_MB_DEFAULT; } v = (uint64_t)mb << 20; break; }
         case I_SysResUsed: v = 0x400000; break;
         case I_DebuggerAttached: v = 0; break;
         case I_RandomEntropy: { uint64_t dm_entropy64(void); v = dm_entropy64(); break; }   // DM_DETCLOCK 开时为确定流（hle_os.c） | a deterministic stream when DM_DETCLOCK is on (hle_os.c)
