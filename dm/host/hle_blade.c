@@ -278,7 +278,8 @@ static void ren_mix(int16_t *out, int frames) {
     if (atomic_load(&g_ren.started))
         for (int i = 0; i < REN_VMAX; i++) { voice_t *v = &g_ren.v[i]; if (v->used && v->state == REN_PLAY) vmix(v, acc, frames); }
     int peak = 0;
-    for (int i = 0; i < frames; i++) for (int c = 0; c < 2; c++) { float s = acc[i][c]; int k = (int)(s > 32767 ? 32767 : s < -32768 ? -32768 : s); out[i * 2 + c] = (int16_t)k; if (k < 0) k = -k; if (k > peak) peak = k; }
+    static float gain = -1; if (gain < 0) { const char *e = getenv("DM_AUDIO_GAIN"); gain = e ? (float)atof(e) : 1.0f; if (gain <= 0) gain = 1.0f; }   // DM_AUDIO_GAIN：总输出增益（缺省 1.0；实测最吵的 10 秒削波约 1%，想保守可设 0.7） | DM_AUDIO_GAIN: master output gain (default 1.0; the loudest 10 s clip about 1%, set 0.7 to be conservative)
+    for (int i = 0; i < frames; i++) for (int c = 0; c < 2; c++) { float s = acc[i][c] * gain; int k = (int)(s > 32767 ? 32767 : s < -32768 ? -32768 : s); out[i * 2 + c] = (int16_t)k; if (k < 0) k = -k; if (k > peak) peak = k; }
     if (peak > g_ren.peak) g_ren.peak = peak;
     g_ren.frames += (uint64_t)frames;
     if (g_ren.dump) fwrite(out, 4, (size_t)frames, g_ren.dump);
