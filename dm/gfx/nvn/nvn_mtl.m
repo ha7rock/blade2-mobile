@@ -902,6 +902,11 @@ uint64_t mtl_sub_commit(void) {
 #else
     [g_cb endCommandBuffer];
     CBUF buffers[] = {g_cb};
+    // 诊断 DM_NVN_SERIAL=5（缺省关）：提交前等上一个提交在 GPU 上做完——GPU 上各提交互不重叠，但 CPU 录制 / 游戏写客体内存照常与 GPU 重叠（区分「GPU 间排序」与「CPU 写 vs GPU 在读」）
+    // Diagnostic DM_NVN_SERIAL=5 (off by default): before committing, wait until the previous submit has finished on the GPU -- submits never overlap on the GPU, while CPU recording / the game's guest-memory writes still overlap the GPU (separates GPU-GPU ordering from CPU writes vs in-flight GPU reads)
+    { static int s5 = -1; static uint64_t last_f = ~0ull; if (s5 < 0) { const char *e = getenv("DM_NVN_SERIAL"); s5 = e ? atoi(e) : 0; }
+      uint64_t cf = atomic_load(&g_cur_frame);   // 6 = 只在新一帧的第一个提交前等（帧内各提交仍可在 GPU 上重叠） | 6 = wait only before the first submit of a new frame (submits inside a frame may still overlap on the GPU); 7 = wait only before non-first submits of a frame
+      if (fence > 1 && (s5 == 5 || (s5 == 6 && cf != last_f) || (s5 == 7 && cf == last_f))) mtl_wait(fence - 1, UINT64_MAX); last_f = cf; }
     [g_q4 commit:buffers count:1 options:o];
     [g_q4 signalEvent:g_ev value:fence];
 #endif
