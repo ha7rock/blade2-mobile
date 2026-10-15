@@ -100,7 +100,12 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         return;
     }
     unsigned tileH = 0, tileD = 0;
-    if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2 + 7) / 8); }
+    if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2 + 7) / 8);
+        // 真机驱动的缺省布局：压缩格式（块宽 > 1）的块高最多 8 个 GOB——Blade（UE4，不走预排布参数）实测 BC1/BC3 256²–1024² 全部是 8，
+        // 未压缩格式照 1.5 规则到 16（tools/pooltex_th.py 按块间连续性打分核对）。deko3d 的 1.5 规则对压缩格式会挑 16，贴图呈 2×2 错位条纹。
+        // Real driver default layout: compressed formats (block width > 1) use a block height of at most 8 GOBs — measured on Blade (UE4, no packaged layout params): every BC1/BC3 256²–1024² is 8,
+        // uncompressed formats follow the 1.5 rule up to 16 (checked with tools/pooltex_th.py, which scores inter-block continuity). deko3d's 1.5 rule picks 16 for compressed formats and the texture shows 2×2 shifted stripes.
+        if (!d->pkg_block_h && t.bw > 1 && tileH > 3) tileH = 3; }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     o->tileH = tileH; o->tileD = tileD;
     unsigned levels = d->levels ? d->levels : 1;

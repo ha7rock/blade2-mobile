@@ -1270,6 +1270,12 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     nvn_dirty_protect(t->mem, t->L.size);
     *stamp = nvn_dirty_now();
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    {   // DM_NVN_POOLDUMP=目录：池内贴图首传时把存储原样（块线性）存下来，文件名带描述，用于离线核对块高规则（tools/pooltex_th.py） | DM_NVN_POOLDUMP=dir: on first upload save the storage of pool textures as is (block-linear), descriptor in the file name, for checking the block-height rule offline (tools/pooltex_th.py)
+        static const char *pd; static int pdn = -1; if (pdn < 0) { pd = getenv("DM_NVN_POOLDUMP"); pdn = 0; }
+        if (pd && pdn < 600 && t->d.target == 1 && t->L.size <= (8u << 20)) { unsigned th, td; nvn_tex_level_tiles(&t->d, 0, &th, &td);
+            char path[1024]; snprintf(path, sizeof path, "%s/%llu_%ux%u_l%u_f%#x_fl%#x_b%d_%d_%d_th%u.bin", pd, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.levels, t->d.format, t->d.flags, bpb, bw, bh, th);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(t->mem, 1, t->L.size, f); fclose(f); pdn++; } }
+    }
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;
     if (t->d.target == 9) layers *= 6;
     uint32_t upf; int ubpp = 0, unp = bc_unpack(t->d.format, &upf, &ubpp);   // 无 BC：解排布后在 CPU 上解压，暂存区按解压后的大小 | No BC: decompress on the CPU after deswizzling, with the staging area sized for the decompressed data
@@ -5723,7 +5729,9 @@ static NSMutableDictionary<NSNumber *, id<MTLTexture>> *g_texraw_sel;
 static void texraw_save(id<MTLTexture> t, uint64_t ser) {
         int bw, bh; NSUInteger w = t.width, h = t.height, dz = t.depth;
         size_t bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : t.pixelFormat == MTLPixelFormatRGBA32Float ? 16 : 4; (void)bw; (void)bh;
-        size_t row = w * bpp, img = row * h;
+        // BC 压缩格式：按 4x4 块存（BC1/BC4 每块 8 字节，其余 16）；首行头里的「每行字节」即块行字节 | BC formats: stored by 4x4 blocks (BC1/BC4 8 bytes per block, the rest 16); the header's bytes-per-row is then the block-row size
+        unsigned pfv = (unsigned)t.pixelFormat; int bc = pfv >= 130 && pfv <= 153; size_t blk = (pfv == 130 || pfv == 131 || pfv == 140 || pfv == 141) ? 8 : 16;
+        size_t row = bc ? (w + 3) / 4 * blk : w * bpp, img = bc ? row * ((h + 3) / 4) : row * h;
         NSUInteger ns = t.textureType == MTLTextureTypeCube ? 6 : t.textureType == MTLTextureTypeCubeArray ? t.arrayLength * 6 : t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;   // 立方体 / 数组：逐片存（深度按片数叠加） | cube / array: saved slice by slice (depth = slices stacked)
         id<MTLBuffer> buf = [g_dev newBufferWithLength:img * dz * ns options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];

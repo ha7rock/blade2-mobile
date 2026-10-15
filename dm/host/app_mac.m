@@ -18,6 +18,9 @@
 #define APP_NAME "D2R Mobile"   // 存档与日志目录名；老接口版构建时另给（host/Makefile CFLAGS_M3），两个包不共用存档 | name of the save and log directory; given separately when building the older-API version (host/Makefile CFLAGS_M3), so the two packages do not share saves
 #endif
 static NSString *const kRomfsKey = @"RomfsDir";
+#ifndef DM_ROMFS_MARKER
+#define DM_ROMFS_MARKER "data/build_manifest.psv"
+#endif
 
 // 这个文件夹是不是游戏资源：认 data/build_manifest.psv。选到上一两层（解包目录的根、Update）也认，往里找一层
 // Whether this folder is the game resources: recognized by data/build_manifest.psv. Choosing one or two levels up (the root of the unpacked directory, Update) is accepted too, looking one level in
@@ -25,8 +28,9 @@ static NSString *romfs_root(NSString *dir, NSString **why) {
     NSFileManager *fm = NSFileManager.defaultManager;
     for (NSString *sub in @[@"", @"RomFS", @"romfs", @"Update/RomFS"]) {
         NSString *d = sub.length ? [dir stringByAppendingPathComponent:sub] : dir;
-        if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@"data/build_manifest.psv"]]) {
-            if (![fm isReadableFileAtPath:[d stringByAppendingPathComponent:@"data/build_manifest.psv"]]) { if (why) *why = T("dmAppNoRead"); return nil; }
+        NSString *mark = @DM_ROMFS_MARKER;   // 资源文件夹的标志文件 / 目录（暗黑 data/build_manifest.psv；Blade BladeII/Content/Paks，Makefile.blade 给） | marker file / directory of the resource folder (Diablo data/build_manifest.psv; Blade BladeII/Content/Paks, from Makefile.blade)
+        if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:mark]]) {
+            if (![fm isReadableFileAtPath:[d stringByAppendingPathComponent:mark]]) { if (why) *why = T("dmAppNoRead"); return nil; }
             return d;
         }
     }
@@ -107,8 +111,15 @@ int dm_app_bootstrap(int *argc, char ***argv) {
             [ud setObject:rom forKey:kRomfsKey];
         }
         { void dm_custom_init(const char *dir); dm_custom_init(sup.fileSystemRepresentation); }   // 自定义设置文件的目录现在就给（同 iOS 壳）：不给的话要等存档挂上才知道在哪，而语言开关正是在挂存档那一刻读它改游戏语言的——晚了开关就不生效 | the directory of the custom settings file is given right now (same as the iOS shell): otherwise it is only known once the save is mounted, and the language switch is read to change the game language at exactly that moment - too late and the switch has no effect
+#if DM_GENERIC_HOST
+        // 通用宿主的 App 缺省：产品要出声；没有管线预热种子清单；TBDR 优化按 Mac 验证口径先关 | App defaults of the generic host: the product plays sound; no pipeline warm-up seed list; TBDR optimisations off as validated on Mac
+        if (!getenv("DM_AUDIO")) setenv("DM_AUDIO", "1", 1);
+        if (!getenv("DM_PSO_MANIFEST")) setenv("DM_PSO_MANIFEST", "off", 1);
+        if (!getenv("DM_NVN_TBDR")) setenv("DM_NVN_TBDR", "0", 1);
+#else
         if (!getenv("DM_TOUCH_DEFAULTS")) setenv("DM_TOUCH_DEFAULTS", "1", 1);   // 产品缺省同 iOS 包（hle_fs.c settings_seed：玩家没碰过的设置键补上——小地图放右上角、进局自动打开、显示物品用开关式等；已有的键不动）。命令行宿主缺省不做，那边要对 Switch 真值比图 | product defaults same as the iOS package (hle_fs.c settings_seed: fills in settings keys the player has never touched - minimap in the top-right corner, opened automatically on entering a game, show-items as a toggle, and so on; existing keys are left alone). The command-line host does not do this by default, since it has to be compared against Switch ground-truth images
         if (!getenv("DM_APP_SUPPORT")) setenv("DM_CLOUD_REAL", "1", 1);   // iCloud 同步（ios/Sources/cloud_ios.m，两端共用）只认玩家真实的存档目录；测试用的支持目录一律不同步 | iCloud sync (ios/Sources/cloud_ios.m, shared by both platforms) only recognises the player's real save directory; a support directory used for testing is never synced
+#endif
         setenv("DM_WINDOW", "1", 1); setenv("DM_APP", "1", 1);
         setenv("DM_SAVE", save.fileSystemRepresentation, 1); setenv("DM_TEMP", temp.fileSystemRepresentation, 1);
         setenv("DM_ROMFS", rom.fileSystemRepresentation, 1); setenv("DM_ROOT", sup.fileSystemRepresentation, 1);

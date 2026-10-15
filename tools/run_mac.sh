@@ -5,7 +5,7 @@
 #   DM_SYSRES_MB=0 (Blade's npdm SystemResourceSize) keeps UE4 on the plain heap route, so no 16 GB alias region is needed (DM_ALIAS_GB may stay at the 512 MB default).
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd); OUT=${1:?rewrite output dir}; SECS=${2:-90}; shift; shift 2>/dev/null
-W=${DM_ROOT:-$HOME/blade2-work}
+W=${DM_ROOT:-$HOME/blade2-work}; export DM_ROOT=$W
 export DM_ROMFS=${DM_ROMFS:-$W/data/switch/01009cc00e224000/v131072/Update/RomFS}
 export DM_SAVE=${DM_SAVE:-$W/run/save} DM_TEMP=${DM_TEMP:-$W/run/temp}
 mkdir -p "$DM_SAVE" "$DM_TEMP" "$W/run/log"

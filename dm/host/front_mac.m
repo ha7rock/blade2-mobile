@@ -129,15 +129,20 @@ static void push(void) {
     int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
     dm_input_set(g_btn, lx, ly, 0, g_wheel * 32767);
 }
+#ifdef DM_GENERIC_HOST
+#define DM_GENERIC_HOST_ 1   // 通用宿主：回车 / Esc 不交给暗黑的触屏页面层，暗黑的键位对照框也不弹 | generic host: Return / Esc are not handed to Diablo's touch page layer, and Diablo's key-map dialog is not shown
+#else
+#define DM_GENERIC_HOST_ 0
+#endif
 static int key_bit(unsigned short code) {
     switch (code) {
         case 38: return 0;  case 40: return 1;  case 32: return 2;  case 34: return 3;    // J K U I → A B X Y
         case 3: return 4;   case 5: return 5;                                            // F G → 按摇杆 | F G → press stick
         case 12: return 6;  case 14: return 7;  case 6: return 8;   case 8: return 9;    // Q E Z C → L R ZL ZR
-        case 36: return g_live ? 40 : 10; case 48: return 11;                            // 回车 Tab → + −（App 形态：回车交给 touch_mac.c 按当前页决定是 ＋ 还是确认，见那里） | Return Tab -> + - (App form: Return is handed to touch_mac.c, which decides by the current page whether it is + or confirm, see there)
+        case 36: return g_live && !DM_GENERIC_HOST_ ? 40 : 10; case 48: return 11;   // 通用宿主：回车就是 ＋ | generic host: Return is +                            // 回车 Tab → + −（App 形态：回车交给 touch_mac.c 按当前页决定是 ＋ 还是确认，见那里） | Return Tab -> + - (App form: Return is handed to touch_mac.c, which decides by the current page whether it is + or confirm, see there)
         case 24: case 69: return 10;                                                     // = 键（＋ 那个键）、小键盘 + → ＋ | the = key (the one with +) and keypad + -> +
         case 49: return 0;                                                               // 空格 → A（确认） | Space -> A (confirm)
-        case 53: return g_live ? 41 : -1;                                                // Esc → 返回（App 形态；局内没有面板时是开功能页，touch_mac.c） | Esc -> back (App form; with no panel open in game it opens the function page, touch_mac.c)
+        case 53: return g_live && !DM_GENERIC_HOST_ ? 41 : -1;                                                // Esc → 返回（App 形态；局内没有面板时是开功能页，touch_mac.c） | Esc -> back (App form; with no panel open in game it opens the function page, touch_mac.c)
         case 123: return 12; case 126: return 13; case 124: return 14; case 125: return 15; // ← ↑ → ↓
     }
     return -1;
@@ -172,7 +177,7 @@ void front_run(void (*guest)(void)) {
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
-        win.title = @"D2R Mobile"; win.restorable = NO; g_win = win;
+        win.title = @APP_NAME; win.restorable = NO; g_win = win;
         NSView *v = win.contentView; g_view = v;
         v.wantsLayer = YES; v.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary; win.contentMinSize = NSMakeSize(640, 360);
@@ -228,7 +233,7 @@ void front_run(void (*guest)(void)) {
                 return nil;
             }];
         }
-        if (getenv("DM_APP") && !getenv("DM_APP_ROMFS") && ![NSUserDefaults.standardUserDefaults boolForKey:@"KeysShown"]) { show_keys(); [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"KeysShown"]; }   // 第一次启动给一次键位对照（界面上的按键提示是手柄字母）；以后在「帮助」菜单里 | Show the key mapping once on first launch (button prompts on screen are gamepad letters); afterwards it is in the Help menu
+        if (!DM_GENERIC_HOST_ && getenv("DM_APP") && !getenv("DM_APP_ROMFS") && ![NSUserDefaults.standardUserDefaults boolForKey:@"KeysShown"]) { show_keys(); [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"KeysShown"]; }   // 第一次启动给一次键位对照（界面上的按键提示是手柄字母）；以后在「帮助」菜单里 | Show the key mapping once on first launch (button prompts on screen are gamepad letters); afterwards it is in the Help menu
         { const char *e;   // 测试（没人点窗口时用）：DM_TEST_WINSIZE=宽x高 设内容区大小；DM_TEST_FULLSCREEN_AT=<秒> 进全屏；DM_TEST_QUIT_AT=<秒> 走一次退出 | Tests (for when nobody is there to click the window): DM_TEST_WINSIZE=WxH sets the content size; DM_TEST_FULLSCREEN_AT=<seconds> enters full screen; DM_TEST_QUIT_AT=<seconds> goes through one quit
           int w, h; if ((e = getenv("DM_TEST_WINSIZE")) && sscanf(e, "%dx%d", &w, &h) == 2) { [win setContentSize:NSMakeSize(w, h)]; layout_game(); }
           if ((e = getenv("DM_TEST_FULLSCREEN_AT"))) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(e) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [win toggleFullScreen:nil]; });
