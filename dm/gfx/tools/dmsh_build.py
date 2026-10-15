@@ -15,7 +15,7 @@
 # Build output: <key>_b.metallib, <key>_b.json (replay reflection, including drv_reads, the runtime read offsets into driver segments c0 / c2), <key>_b.metal (MSL)
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
-import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
+import glob, ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
 HOME = os.path.expanduser('~')
 dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:]); cache_root = out
@@ -102,6 +102,8 @@ def cache_outputs(key, digest, cached=False):
         base = os.path.join(root, label) if cached else directory
         found = [n for n in names if os.path.exists(os.path.join(base, n))]
         if key + '_b.metallib' not in found or key + '_b.json' not in found: return None
+        # 融合变体 <顶点键>+<几何键>_b.*（finish 里出）一并进缓存，命中时与本键一起还原 | fused variants <vs key>+<gs key>_b.* (produced in finish) go into the cache too and are restored together with this key on a hit
+        found += sorted(os.path.basename(f) for f in glob.glob(os.path.join(base, glob.escape(key) + '+*_b.*')) if not f.endswith('.tmp'))
         files[label] = found
     return root, files
 
@@ -617,6 +619,11 @@ def finish(key, w, j, c1):
             subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', fair, '-o', flib + '.tmp'], check=True); os.replace(flib + '.tmp', flib)
         except subprocess.CalledProcessError as e: return '融合变体 metal 失败', str(e)[:160], None
         clone(fmsl, os.path.join(out, fkey + '_b.metal'))
+        if IOSOUT:   # 融合变体同样出 iOS 版（同一份 MSL，dm/ios/tools/ios_metal.py 的口径，含 -fpreserve-invariance）| the fused variant also gets an iOS build (same MSL, dm/ios/tools/ios_metal.py convention, including -fpreserve-invariance)
+            filib = os.path.join(IOSOUT, fkey + '_b.metallib')
+            try:
+                ios_metal.compile(fmsl, fmsl[:-6] + '.ios.air', filib + '.tmp'); os.replace(filib + '.tmp', filib)
+            except subprocess.CalledProcessError as e: return '融合变体 iOS metal 失败', str(e)[:160], None
         fentry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', patched)
         frefl = {'key': fkey + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': 'vs',
                  'entry': fentry.group(2) if fentry else 'main0', 'msl_entry_kind': 'vertex', 'threadgroup_size': None, 'c1': c1.hex(), 'notes': res['notes'] + [f'融合几何着色器 {gk}（直通写层号）'],
@@ -712,14 +719,14 @@ print(f'变体缓存：生成 {BF_STATS["generated"]}，命中 {BF_STATS["hit"]}
 for lvl in [k for k in st if k != 'ok']:
     for e, n in collections.Counter(r[2] for r in res if r[1] == lvl).most_common(10): print(f'  [{lvl}] {n:5d}  {e}')
 ok = [r[3] for r in res if r[1] == 'ok']
-rd = [x for x in ok if x['drv_reads']]
+rd = [x for x in ok if x.get('drv_reads')]   # 几何着色器条目只有分析结果、没有 drv_reads | geometry shader entries carry only the analysis result, no drv_reads
 print(f'运行时读驱动段的着色器 {len(rd)}（c0 {sum("0" in x["drv_reads"] for x in rd)}，c2 {sum("2" in x["drv_reads"] for x in rd)}）；读到回放层填不了的 {sum(bool(x["drv_unfillable"]) for x in ok)}')
-for e, n in collections.Counter(u for x in ok for u in x['drv_unfillable']).most_common(15): print(f'  填不了 {n:5d}  {e}')
+for e, n in collections.Counter(u for x in ok for u in x.get('drv_unfillable', ())).most_common(15): print(f'  填不了 {n:5d}  {e}')
 SLOTK = {'cbuf', 'samp', 'samp_tex', 'tex', 'img', 'tbuf', 'sbuf', 'ubo_ptr'}
 noreg = [x for x in ok if any(b['kind'] in SLOTK and b.get('reg') is None for b in x['bindings'])]
 unk = [x for x in ok if any(b['kind'] == '?' for b in x['bindings'])]
 print(f'绑定没解出槽号的着色器 {len(noreg)}，种类认不出的 {len(unk)}（运行时加载会报红）')
 for e, n in collections.Counter(f"{b['kind']} {b['msl_name'][:28]}" for x in noreg + unk for b in x['bindings'] if b['kind'] == '?' or (b['kind'] in SLOTK and b.get('reg') is None)).most_common(8): print(f'  {n:5d}  {e}')
-nt = collections.Counter(nn.split('（')[0] for x in ok for nn in x['notes'])
+nt = collections.Counter(nn.split('（')[0] for x in ok for nn in x.get('notes', ()))
 for e, n in nt.most_common(8): print(f'  查询无 PC 作答 {n:5d}  {e}')
 json.dump([{'key': r[0], 'st': r[1], 'err': r[2]} for r in res], open(os.path.join(out, '_b_build.json'), 'w'), ensure_ascii=False)
