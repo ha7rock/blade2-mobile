@@ -22,5 +22,13 @@ DM_WATCH ?= 120
 run: dmhost_blade
 	@test -n "$(DM_OUT)" || { echo "set DM_OUT=<rewrite build output dir>"; exit 1; }
 	DM_WINDOW=$${DM_WINDOW:-1} DM_WATCH=$(DM_WATCH) ./dmhost_blade "$(DM_OUT)" main sdk
+# 内嵌映像版（验 iOS 装载路径）：make -f Makefile.blade embed EMBED_S=<dm/ios/tools/gen_embed.py 出的 .S> [EMBED_LD='<它打印的 -segprot 参数>']
+# 出 dmhost_blade_embed：改写映像编在可执行文件的段里，装载器走 loader.c 的 iOS 分支（vm_remap 回原布局），产物目录只读表头 / 门表。跑法同上，DM_HOST_BIN=dmhost_blade_embed tools/run_mac.sh …
+# Embedded-image build (verifies the iOS load path): make -f Makefile.blade embed EMBED_S=<.S from dm/ios/tools/gen_embed.py> [EMBED_LD='<the -segprot flags it prints>']
+# Produces dmhost_blade_embed: the rewritten images are compiled into the executable's segments and the loader takes the iOS branch of loader.c (vm_remap back to the original layout); the build output dir is read only for table headers / gate tables. Run as above with DM_HOST_BIN=dmhost_blade_embed tools/run_mac.sh ...
+EMBED_LD ?= -Wl,-segprot,__DMmainW,rw,rw -Wl,-segprot,__DMsdkW,rw,rw
+embed: $(SRC) $(GFX) $(LIBDEFLATE) dm.h hle.h dm_input.h front.h $(GFX_H)
+	@test -n "$(EMBED_S)" || { echo "set EMBED_S=<embed.S from gen_embed.py>"; exit 1; }
+	clang $(CFLAGS) -DDM_EMBED_IMAGE=1 -I. -I../gfx/nvn/include -fobjc-arc -o dmhost_blade_embed $(SRC) $(GFX) $(LIBDEFLATE) $(EMBED_S) $(FRAMEWORKS) $(EMBED_LD)
 clean:
-	rm -f dmhost_blade
+	rm -f dmhost_blade dmhost_blade_embed

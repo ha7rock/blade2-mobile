@@ -290,7 +290,9 @@ void loader_hash_log(void) {
     }
 }
 
-#if TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE || DM_EMBED_IMAGE
+// DM_EMBED_IMAGE=1：Mac 上也走这条内嵌装载路径（make -f Makefile.blade embed EMBED_S=<gen_embed.py 的 .S>），不用真机就能验 iOS 的映像布局、重映射与重定位
+// DM_EMBED_IMAGE=1: take this embedded-image load path on the Mac too (make -f Makefile.blade embed EMBED_S=<.S from gen_embed.py>), to verify the iOS image layout, remapping and relocation without a device
 // iOS 不许运行时装入的代码执行，且苹果只许可执行文件有一个带执行权限的段（ITMS-90999）：映像由 dm/ios/tools/gen_embed.py 编进本可执行文件——
 // 代码两块（原 text、补丁区）是 __TEXT 里的节，W（ro 余部 + data + bss）是单独的 RW 段。三块在文件里不相邻；这里保留一块连续地址，
 // 按原相对位置 vm_remap 回去：代码页 copy=FALSE（与 __TEXT 共享同一批已签名页，r-x），W copy=TRUE（写时复制，用到才分页）。
@@ -332,8 +334,27 @@ static void map_image(module_t *m, const char *dir) {
     unsigned long z0, zw, z1;
     const uint8_t *x0 = getsectiondata(IMAGE_MH, "__TEXT", sx0, &z0), *w = getsectiondata(IMAGE_MH, dm, "__img", &zw), *x1 = getsectiondata(IMAGE_MH, "__TEXT", sx1, &z1);
     if (!x0 || !w || !x1) die("内嵌节 %s / %s / %s 缺失", sx0, dm, sx1);
-    if (z0 + zw != m->patch_off || (z0 & 0x3FFF) || (zw & 0x3FFF) || (z1 & 0x3FFF) || ((uintptr_t)x0 & 0x3FFF) || ((uintptr_t)w & 0x3FFF) || ((uintptr_t)x1 & 0x3FFF))
+    if ((z0 & 0x3FFF) || (zw & 0x3FFF) || (z1 & 0x3FFF) || ((uintptr_t)x0 & 0x3FFF) || ((uintptr_t)w & 0x3FFF) || ((uintptr_t)x1 & 0x3FFF))
         die("%s 内嵌节布局不符（x0 %#lx w %#lx x1 %#lx，PATCH_OFF %#llx）", m->name, z0, zw, z1, (unsigned long long)m->patch_off);
+    if (m->patch_off < 0) {
+        // 补丁区在映像前面（映像超过 128 MB，见 gen_embed.py 与下面 Mac 分支）：x1 = 整个补丁区（长度 = -PATCH_OFF），映像 = x0 + W。
+        // 保留「补丁区 + 映像」一块连续地址，映像基址 = 块首 + 补丁区长；三块按原相对位置 remap，与 Mac 分支的内存布局逐字节相同
+        // Patch area before the image (image over 128 MB, see gen_embed.py and the Mac branch below): x1 = the whole patch area (length = -PATCH_OFF), image = x0 + W.
+        // Reserve one contiguous block "patch area + image", image base = block start + patch length; the three pieces are remapped at their original relative positions, byte-identical in layout to the Mac branch
+        size_t pre = (size_t)-m->patch_off;
+        if (z1 != pre) die("%s 内嵌节布局不符：补丁区 x1 %#lx ≠ -PATCH_OFF %#zx", m->name, z1, pre);
+        m->size = z0 + zw;
+        vm_address_t blk = 0;
+        if (vm_allocate(mach_task_self(), &blk, pre + m->size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) die("%s 保留 %#zx 字节地址失败", m->name, pre + m->size);
+        vm_address_t base = blk + pre;
+        remap_at(m, blk, x1, z1, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        remap_at(m, base, x0, z0, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        remap_at(m, base + z0, w, zw, TRUE, VM_PROT_READ | VM_PROT_WRITE);
+        m->base = (uint8_t *)base; install_key_page(m);
+        LOG("%s: 补丁区在映像前面 %#zx 字节（映像 %#zx） | patch area below the image", m->name, pre, m->size);
+        return;
+    }
+    if (z0 + zw != (uint64_t)m->patch_off) die("%s 内嵌节布局不符（x0 %#lx + w %#lx ≠ PATCH_OFF %#llx）", m->name, z0, zw, (unsigned long long)m->patch_off);
     m->size = m->patch_off + z1;
     vm_address_t base = 0;
     if (vm_allocate(mach_task_self(), &base, m->size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) die("%s 保留 %#zx 字节地址失败", m->name, m->size);

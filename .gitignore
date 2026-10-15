@@ -4,3 +4,4 @@
 *.patched.bin
 *.img
 dm/host/dmhost_blade
+dm/host/dmhost_blade_embed
