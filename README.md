@@ -190,3 +190,17 @@ DM_OUT=$O dm/ios/blade/run.sh build && dm/ios/blade/run.sh install && dm/ios/bla
 | 图形层第一批调用报未实现 | UE4 的 NVN RHI 用缓冲对象 / 组合贴图句柄 / DrawElements 等 37 个入口 | 全部补上，落在 d2r 的录制 / 回放框架里 |
 | `GetSparseTileLayout` 后 memset 负长度崩 | 仓内 `nvn.h` 把该结构留成 1 字节占位 | 按真实布局 0x1c 字节清零 |
 | 开场视频 Tick 空指针 | movie 库在宿主下只空播，RHI 流对象从未建立 | 产品剪口：`0x3a29e40 → ret` |
+
+---
+
+## 版权与致谢 | Copyright and acknowledgements
+
+**你必须拥有正版游戏。** 本仓库只包含兼容层的源码、工具和不含任何游戏内容的安装壳。我们不提供、不认可、也不对任何第三方分发游戏主程序、游戏资源、密钥、着色器转储 / 编译产物或改写产物的行为负责；请只配合你自己合法拥有的 Switch 版《Blade II: The Return of Evil》使用。仓库里与游戏相关的只有**事实表**（着色器键的哈希、绑定类型、改写器的指令偏移），不含任何游戏代码或资源。这是一个独立的非商业项目，与 Action Square、任天堂没有关联，也未获其认可或赞助；Blade II 是其权利人的商标，Nintendo Switch 是任天堂的商标。
+
+**You must own the game.** This repository contains only the compatibility layer's source, tools and a content-free app shell. We do not provide, endorse, or take responsibility for any third-party distribution of the game program, game assets, keys, shader dumps / compiled shader libraries or rewrite outputs; use it only with your own legally owned Switch copy of *Blade II: The Return of Evil*. The only game-related files in the repository are **fact tables** (hashes of shader keys, binding types, instruction offsets for the rewriter); no game code or assets. This is an independent, non-commercial project, not affiliated with, endorsed by, or sponsored by Action Square or Nintendo; Blade II is a trademark of its owner and Nintendo Switch is a trademark of Nintendo.
+
+致谢 | Acknowledgements
+- **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)**（MIT）：本项目的全部基础。`dm/` 是它的 `dm/` 目录加上 Blade 的改动，许可证原样保留在 `LICENSE.d2r-mobile`；本项目的方法论、宿主、NVN→Metal 翻译层、离线着色器链、iOS 壳都来自它，许多修正（Metal 4 编码器屏障、按屏幕刷新率取出图档、内存池按需驻留）也直接吸收自它的后续提交。向作者致敬。| The whole foundation of this project. `dm/` is its `dm/` directory plus the Blade changes, with its license kept verbatim in `LICENSE.d2r-mobile`; the methodology, host, NVN→Metal translation layer, offline shader chain and iOS shell all come from it, and several fixes (Metal 4 encoder barriers, present pacing by screen refresh rate, on-demand memory-pool residency) were taken directly from its later commits. Our thanks to the author.
+- **Ryujinx**（Ryubing，MIT）：`dm/third_party/ryujinx` 原样携带其着色器翻译器，把 Switch 着色器翻成 SPIR-V。| Its shader translator is bundled unchanged in `dm/third_party/ryujinx` to translate Switch shaders to SPIR-V.
+- **deko3d**（zlib）：块线性贴图布局算法的出处。| Source of the block-linear texture layout algorithm.
+- **spirv-cross**（Apache-2.0）、**libdeflate**（MIT）、**NVIDIA FLIP**（BSD）：按各自许可证使用。| Used under their respective licenses.
