@@ -130,6 +130,10 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         // 下一轮 tools/shaders_iterate.sh 直接从这里补进映射表，不必靠脚本复现那个操作 | Shaders missing from the map are dumped by default into shdump/ under Application Support (control section + code only, a few KB each):
         // new shaders met in normal play (effects such as the parry sword flash that only appear on specific inputs) are picked up by the next tools/shaders_iterate.sh run without scripting that input
         if (!getenv("DM_NVN_SHDUMP")) { NSString *sd = [sup stringByAppendingPathComponent:@"shdump"]; setenv("DM_NVN_SHDUMP", sd.fileSystemRepresentation, 1); }
+        // 同理缺省记录贴图事实（着色器每个贴图寄存器在运行时真正绑定的贴图类型：2D / 立方 / 3D / 数组）：没有配对 PC 反射的着色器翻译时只能按 2D 猜，
+        // 猜错的寄存器采样出全零（Boss 斗篷一类材质发黑）；记录下来后下一轮迭代按事实出 | Likewise record texture facts by default (the texture type really bound to each texture register at runtime: 2D / cube / 3D / array):
+        // shaders without paired PC reflection can only be translated with a 2D guess, and a wrongly guessed register samples zeros (materials such as the boss cloak turn black); recorded, the next iterate uses the facts
+        if (!getenv("DM_NVN_TEXFACTS")) { NSString *tfp = [sup stringByAppendingPathComponent:@"texfacts.tsv"]; setenv("DM_NVN_TEXFACTS", tfp.fileSystemRepresentation, 1); }
         if (!getenv("DM_PSO_MANIFEST")) setenv("DM_PSO_MANIFEST", "off", 1);
         if (!getenv("DM_NVN_TBDR")) setenv("DM_NVN_TBDR", "0", 1);
 #else
