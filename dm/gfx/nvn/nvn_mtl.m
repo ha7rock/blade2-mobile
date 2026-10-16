@@ -227,9 +227,29 @@ static pthread_mutex_t g_deferred_mu = PTHREAD_MUTEX_INITIALIZER;
 //   defer_obj_unref   = only the reference I hold is no longer wanted, the object itself may still be in use (the view cache of a texture ID may hold the base texture itself): only drop the reference, leave the residency set alone.
 // Previously only the former existed: when the view cache was invalidated, a texture that 'is still the current storage of some serial' was also removed from the residency set. Invalidation used to happen only when the base texture was really replaced, so it was never hit;
 // after the transparency chain's in-place composite swapped the storage of two textures, each of the two live textures was removed once this way, and afterwards they are used as attachments and sampled every frame as usual - the GPU accesses non-resident memory.
+// ---------- 诊断 DM_NVN_LAGLOG=文件（缺省关）：GPU 落后量与每次提交复用了什么，逐行写文件（tools/lag_stat.py 统计 / 与黑帧对齐） ----------
+//   S 行（每次提交）：帧 栅栏 开工时已完成 提交时已完成 分配器槽 该槽上次栅栏 新建? 竞技场复用 竞技场新建 复用竞技场最小余量(已完成−其栅栏) 延迟释放登记 延迟释放落地 内联UB次数 字节 缓冲拷贝 上传冲刷 上传blit 重传贴图
+//   P 行（每次出图入队）：票号 帧 已提交栅栏 已完成栅栏 落后提交数 未完成的出图帧数；A 行（取交换链贴图）：帧 图号 等的栅栏 等前已完成 等待 ns；O 行：完成回调乱序；B 行：黑帧触发器（REGLUM 中央亮度 A-B-A）
+// 候选修正（缺省全关，只为对照测量）：DM_NVN_ARENA_SLACK=k 竞技场多等 k 个提交才复用；DM_NVN_DEFER_SLACK=k 延迟释放多等 k 个提交；DM_NVN_ALLOC_SLACK=k 命令分配器多等 k 个提交；
+//   DM_NVN_UB_ARENA=1 内联 uniform 更新在提交时先拷进竞技场（不让 GPU 晚读客体命令内存）；DM_NVN_GPU_SPIN=n 每帧第一个提交前让 GPU 空转 n 次（不开着色器校验也能把 GPU 拖慢）
+// ---------- Diagnostic DM_NVN_LAGLOG=file (off by default): GPU lag and what each submission reused, one line per event (tools/lag_stat.py summarizes / joins with black frames) ----------
+//   S (per submit): frame fence done_at_begin done_at_commit alloc_slot slot_prev_fence new? arena_reused arena_new min_reuse_margin(done-fence) defer_enqueued defer_drained ub_n ub_bytes b2b_n up_flushes up_blits reuploads
+//   P (per present enqueue): ticket frame submitted completed lag_submits unfinished_presents; A (swapchain acquire): frame idx waited_fence done_before wait_ns; O: out-of-order completion; B: black trigger (REGLUM centre A-B-A)
+// Candidate fixes (all off by default, measurement only): DM_NVN_ARENA_SLACK=k arenas reused only k submits later; DM_NVN_DEFER_SLACK=k deferred releases wait k more submits; DM_NVN_ALLOC_SLACK=k likewise for command allocators;
+//   DM_NVN_UB_ARENA=1 inline uniform updates are copied into the arena at submit time (the GPU no longer reads guest command memory late); DM_NVN_GPU_SPIN=n the GPU spins n iterations before each frame's first submit (slows the GPU without shader validation)
+static int g_lag_on = -1; static FILE *g_lag_f; static pthread_mutex_t g_lag_mu = PTHREAD_MUTEX_INITIALIZER;
+static int lag_on(void) { if (g_lag_on < 0) { const char *e = getenv("DM_NVN_LAGLOG"); g_lag_f = e && *e ? fopen(e, "w") : NULL; g_lag_on = g_lag_f != NULL; } return g_lag_on; }
+static void lag_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void lag_printf(const char *fmt, ...) { if (!lag_on()) return; va_list ap; va_start(ap, fmt); pthread_mutex_lock(&g_lag_mu); vfprintf(g_lag_f, fmt, ap); fflush(g_lag_f); pthread_mutex_unlock(&g_lag_mu); va_end(ap); }
+static int env_int_c(const char *k) { const char *e = getenv(k); return e ? atoi(e) : 0; }
+static int lag_slack(int which) { static int v[4] = {-1, -1, -1, -1}; static const char *k[4] = {"DM_NVN_ARENA_SLACK", "DM_NVN_DEFER_SLACK", "DM_NVN_ALLOC_SLACK", "DM_NVN_UB_ARENA"};
+    if (v[which] < 0) { v[which] = env_int_c(k[which]); if (v[which] < 0) v[which] = 0; if (v[which]) MLOG("%s=%d（诊断候选修正）", k[which], v[which]); } return v[which]; }
+static _Atomic uint64_t g_lag_defer, g_lag_drained, g_lag_ooo;
+static uint64_t g_lag_arena_reuse, g_lag_arena_new, g_lag_arena_minm = ~0ull, g_lag_ub_n, g_lag_ub_bytes, g_lag_b2b_n, g_lag_upflush, g_lag_upblits, g_lag_done_begin, g_lag_alloc_prev; static int g_lag_alloc_new;
 static void defer_obj_release_ex(id obj, int keep_resident) {
     if (!obj) return;
-    NvDeferredRelease *d = [NvDeferredRelease new]; d->object = obj; d->fence = g_fence + 1; d->keep_resident = keep_resident;
+    NvDeferredRelease *d = [NvDeferredRelease new]; d->object = obj; d->fence = g_fence + 1 + (uint64_t)lag_slack(1); d->keep_resident = keep_resident;
+    atomic_fetch_add(&g_lag_defer, 1);
     pthread_mutex_lock(&g_deferred_mu);
     if (!g_deferred) g_deferred = [NSMutableArray array];
     [g_deferred addObject:d];
@@ -245,6 +265,7 @@ static void defer_drain(void) {
         if (d->fence <= g_done) { [ready addObject:d]; [g_deferred removeObjectAtIndex:(NSUInteger)i]; }
     }
     pthread_mutex_unlock(&g_deferred_mu);
+    atomic_fetch_add(&g_lag_drained, ready.count);
     for (NvDeferredRelease *d in ready) {
         id obj = d->object;
         if (!d->keep_resident && [obj conformsToProtocol:@protocol(MTLResource)]) {
@@ -524,7 +545,19 @@ static vis_list *vis_snapshot(void) {
 // Target ranges of buffer writes (copies / inline uniform updates) already encoded in this submission but not yet executed on the GPU: reading these addresses on the CPU side at encode time yields old values (uv_proof avoids them when reading uniforms)
 #define PEND_MAX 256
 static uint64_t g_pend_lo[PEND_MAX], g_pend_hi[PEND_MAX]; static int g_npend, g_pend_over;
-static int pend_hits(uint64_t a, uint64_t n) { if (g_pend_over) return 1; for (int i = 0; i < g_npend; i++) if (a < g_pend_hi[i] && a + n > g_pend_lo[i]) return 1; return 0; }
+// 候选修正 DM_NVN_PEND_XSUB=1（缺省关）：上面的区间只管本次提交；前几次提交里编过、GPU 还没执行完的缓冲写（GPU 落后时）在 CPU 侧同样读到旧值。
+// 打开后提交时把本次的区间连同栅栏存进环（8 次），pend_hits 也查栅栏 > 已完成的那些
+// Candidate fix DM_NVN_PEND_XSUB=1 (off by default): the ranges above cover only this submission; buffer writes encoded in earlier submissions that the GPU has not executed yet (GPU behind) also read stale on the CPU.
+// When on, each commit stores its ranges with its fence in a ring (8 submissions) and pend_hits also checks those whose fence > completed
+static struct { uint64_t fence; int n, over; uint64_t lo[PEND_MAX], hi[PEND_MAX]; } g_pend_x[8];
+static uint64_t g_pend_x_hits;
+static int pend_xsub(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PEND_XSUB"); v = e && atoi(e) > 0; if (v) MLOG("DM_NVN_PEND_XSUB=1（诊断候选修正）"); } return v; }
+static int pend_hits(uint64_t a, uint64_t n) { if (g_pend_over) return 1; for (int i = 0; i < g_npend; i++) if (a < g_pend_hi[i] && a + n > g_pend_lo[i]) return 1;
+    if (pend_xsub()) for (int s = 0; s < 8; s++) { if (!g_pend_x[s].fence || g_pend_x[s].fence <= __atomic_load_n(&g_done, __ATOMIC_ACQUIRE)) continue;
+        if (g_pend_x[s].over) { g_pend_x_hits++; return 1; } for (int i = 0; i < g_pend_x[s].n; i++) if (a < g_pend_x[s].hi[i] && a + n > g_pend_x[s].lo[i]) { g_pend_x_hits++; return 1; } }
+    return 0; }
+static void pend_x_commit(uint64_t fence) { if (!pend_xsub()) return; int s = (int)(fence % 8); g_pend_x[s].fence = fence; g_pend_x[s].n = g_npend; g_pend_x[s].over = g_pend_over; memcpy(g_pend_x[s].lo, g_pend_lo, sizeof(uint64_t) * (size_t)g_npend); memcpy(g_pend_x[s].hi, g_pend_hi, sizeof(uint64_t) * (size_t)g_npend);
+    static uint64_t said; if (g_pend_x_hits != said && fence % 600 == 0) { said = g_pend_x_hits; MLOG("DM_NVN_PEND_XSUB：跨提交待执行写命中累计 %llu 次（栅栏 %llu）", (unsigned long long)g_pend_x_hits, (unsigned long long)fence); } }
 typedef struct { uint64_t ser; uint16_t level, slice; } zskip_zero;
 static zskip_zero g_zskip_zero[4096]; static int g_zskip_n, g_zskip_count;
 static zskip_zero g_zskip_cand[8]; static uint8_t g_zskip_cand_ok[8];
@@ -594,20 +627,21 @@ void mtl_sub_begin(void) {
     // 挑一个 GPU 已用完的分配器；都在用就新建；到上限才等最老的那个。超前量由游戏取交换链贴图处的等待约束，与旧接口相同。
     // Do not wait for the GPU mid-frame (hot real device: with a fixed rotation of 3, when the GPU cannot keep up every frame blocks here, and the submit thread runs at low frequency after waking, instruction count −18% but CPU time +49%):
     // pick an allocator the GPU has finished with; if all are in use create a new one; only at the cap wait for the oldest one. How far ahead it runs is bounded by the wait where the game acquires the swapchain texture, same as the old interface.
-    int alloc_i = -1; uint64_t done = g_done;
-    for (int i = 0; i < g_alloc_n; i++) if (g_alloc_fence[i] <= done) { alloc_i = i; break; }
+    int alloc_i = -1; uint64_t done = g_done; g_lag_done_begin = done; g_lag_alloc_new = 0;
+    for (int i = 0; i < g_alloc_n; i++) if (g_alloc_fence[i] + (uint64_t)lag_slack(2) <= done) { alloc_i = i; break; }
 #if DM_NVN_M3
     if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { alloc_i = g_alloc_n++; g_alloc_grown++; }
 #else
     if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_alloc4[g_alloc_n]) MDIE("新建 MTL4CommandAllocator 失败：%s", ae.localizedDescription.UTF8String);
-        alloc_i = g_alloc_n++; g_alloc_grown++; }
+        alloc_i = g_alloc_n++; g_alloc_grown++; g_lag_alloc_new = 1; }
 #endif
     if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait(g_alloc_fence[alloc_i], UINT64_MAX); }
-    g_alloc_cur = alloc_i;
+    g_alloc_cur = alloc_i; g_lag_alloc_prev = g_alloc_fence[alloc_i];
 #if !DM_NVN_M3
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
+    { void gpu_spin_frame(void); gpu_spin_frame(); }
 #endif
     g_commit_blocks = [NSMutableArray array];
     g_npost = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; g_npend = 0; g_pend_over = 0;
@@ -725,11 +759,22 @@ static BENC blit(void) { blit_note(); rp_end();
     return g_blit; }
 #endif
 
+// 诊断 DM_NVN_B2B_CHECK=1（缺省关，配 DM_NVN_LAGLOG）：≤16 字节的缓冲拷贝在编码时记下源内容，提交完成时再读源与目标，写 C 行——看 GPU 执行拷贝时源是否已被客体改写
+// 候选修正 DM_NVN_B2B_SNAP=n（缺省 0）：≤n 字节、源不在本提交待执行写里的缓冲拷贝，编码时 CPU 把源快照进竞技场，GPU 从快照拷（GPU 落后时客体改写源也不影响）
+// Diagnostic DM_NVN_B2B_CHECK=1 (off by default, with DM_NVN_LAGLOG): for buffer copies of <= 16 bytes record the source at encode time and re-read source and destination at completion (C lines): was the source rewritten by the guest before the GPU executed the copy
+// Candidate fix DM_NVN_B2B_SNAP=n (default 0): buffer copies of <= n bytes whose source is not a pending write of this submission are snapshotted into the arena by the CPU at encode time; the GPU copies from the snapshot
+typedef struct { uint64_t src, dst, n; uint8_t enc[16]; int pend; } b2b_rec;
+static b2b_rec g_b2b[64]; static int g_nb2b;
+static int b2b_env(int which) { static int v[2] = {-1, -1}; if (v[which] < 0) { v[which] = env_int_c(which ? "DM_NVN_B2B_SNAP" : "DM_NVN_B2B_CHECK"); if (v[which]) MLOG("%s=%d（诊断）", which ? "DM_NVN_B2B_SNAP" : "DM_NVN_B2B_CHECK", v[which]); } return v[which]; }
+static size_t arena_alloc(size_t n, id<MTLBuffer> *buf);
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
+    int src_pend = pend_hits(src, n);
+    if (b2b_env(0) && n <= 16 && g_nb2b < 64) { b2b_rec *r = &g_b2b[g_nb2b++]; r->src = src; r->dst = dst; r->n = n; r->pend = src_pend; memcpy(r->enc, (const void *)(uintptr_t)src, (size_t)n); }
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
     void *sb, *db; uint64_t so, dof;
     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
         MDIE("缓冲拷贝地址不在任何内存池内 src=%#llx dst=%#llx n=%#llx", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
+    if (!src_pend && n <= (uint64_t)b2b_env(1)) { id<MTLBuffer> ab; size_t off = arena_alloc((size_t)n, &ab); memcpy((uint8_t *)ab.contents + off, (const void *)(uintptr_t)src, (size_t)n); enc_b_copy_buffer(blit(), ab, off, (__bridge id<MTLBuffer>)db, dof, n); return; }
     enc_b_copy_buffer(blit(), (__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
 }
 
@@ -817,6 +862,31 @@ static int ub_skip(const char *key) {   // 本相要不要丢掉这个片元着�
     return 0;
 }
 void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); }
+#if !DM_NVN_M3
+// DM_NVN_GPU_SPIN=n（诊断，缺省关）：每帧第一个提交开头编一个计算编码器，一个线程组串行空转 n 次（前后都有队列级屏障 → 整帧在 GPU 上推迟），不开着色器校验也能让 GPU 落后
+// DM_NVN_GPU_SPIN=n (diagnostic, off by default): at the start of each frame's first submit, encode a compute encoder where one threadgroup spins n serial iterations (queue-level barriers on both sides → the whole frame is delayed on the GPU), so the GPU falls behind without shader validation
+void gpu_spin_frame(void) {
+    static int n = -1; static id<MTLComputePipelineState> ps; static id<MTL4ArgumentTable> at; static id<MTLBuffer> buf; static uint64_t last_f = ~0ull;
+    if (n < 0) { n = env_int_c("DM_NVN_GPU_SPIN"); if (n > 0) {
+        NSError *e = nil; static const char src[] = "#include <metal_stdlib>\nusing namespace metal;\nkernel void spin(device uint *b [[buffer(0)]], uint t [[thread_position_in_grid]]) { uint x = b[t], n = b[64]; for (uint i = 0; i < n; i++) x = x * 1664525u + 1013904223u + i; b[t] = x; }\n";
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src) options:nil error:&e]; id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"spin"] : nil; ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        buf = [g_dev newBufferWithLength:4096 options:MTLResourceStorageModeShared]; ((uint32_t *)buf.contents)[64] = (uint32_t)n; res_add(buf);
+        if (!ps || !at) { MLOG("【红】DM_NVN_GPU_SPIN：建不出空转管线 %s", e.localizedDescription.UTF8String); n = 0; } else { [at setAddress:buf.gpuAddress atIndex:0]; MLOG("DM_NVN_GPU_SPIN=%d：每帧 GPU 空转（诊断）", n); } } }
+    if (n <= 0) return;
+    uint64_t f = atomic_load(&g_cur_frame); if (f == last_f) return; last_f = f;
+    id<MTL4ComputeCommandEncoder> ce = [g_cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    [ce setArgumentTable:at]; [ce setComputePipelineState:ps];
+    [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    m4_end(ce);
+}
+#endif
+// DM_NVN_LAGLOG：取交换链贴图处的等待（hle_nvn.c 调） | DM_NVN_LAGLOG: the wait at swapchain acquire (called from hle_nvn.c)
+void mtl_lag_acquire(int idx, uint64_t rf, uint64_t done_before, uint64_t wait_ns) {
+    if (lag_on()) lag_printf("A\t%llu\t%d\t%llu\t%llu\t%llu\n", (unsigned long long)atomic_load(&g_cur_frame), idx, (unsigned long long)rf, (unsigned long long)done_before, (unsigned long long)wait_ns);
+}
+uint64_t mtl_done_fence(void) { return g_done; }
 // GPU 计时登记：提交前 gpu_tag_begin(帧)，完成时 gpu_tag_done(帧, GPU 起, GPU 止)（CACurrentMediaTime 基准秒）。
 // 旧队列命令缓冲走 gpu_tag_f；Metal 4 主提交在 mtl_sub_commit 的 feedback 里回填（换 Metal 4 时调用点全丢，「计时」行的 GPU 一栏成了空）
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
@@ -924,9 +994,11 @@ uint64_t mtl_sub_commit(void) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush();
     uint64_t fence = ++g_fence;
+    pend_x_commit(fence);
     if (g_vis_ring_i >= 0) g_vis_ring[g_vis_ring_i].fence = fence;
     // 完成后的 CPU 可见效果：拷贝一份操作表进回调
     // CPU-visible effects after completion: copy the op table into the callback
+    int nb2b = g_nb2b; b2b_rec *b2b = nb2b ? malloc(sizeof *b2b * (size_t)nb2b) : NULL; if (nb2b) memcpy(b2b, g_b2b, sizeof *b2b * (size_t)nb2b); g_nb2b = 0; uint64_t b2b_frame = atomic_load(&g_cur_frame);
     int n = g_npost; post_op *ops = n ? malloc(n * sizeof *ops) : NULL;
     if (n) memcpy(ops, g_post, n * sizeof *ops);
     NSArray<dispatch_block_t> *commit_blocks = [g_commit_blocks copy];
@@ -953,7 +1025,11 @@ uint64_t mtl_sub_commit(void) {
             else { uint64_t t = gpu_ticks(), rec[2] = {ops[i].type == 0 || ops[i].type == 0x10 ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }
         }
         free(ops);
-        pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+        for (int i = 0; i < nb2b; i++) { const b2b_rec *r = &b2b[i]; char e[40], s[40], d[40]; for (uint64_t k = 0; k < r->n; k++) { snprintf(e + 2 * k, 3, "%02x", r->enc[k]); snprintf(s + 2 * k, 3, "%02x", ((const uint8_t *)(uintptr_t)r->src)[k]); snprintf(d + 2 * k, 3, "%02x", ((const uint8_t *)(uintptr_t)r->dst)[k]); }
+            lag_printf("C\t%llu\t%llu\t%#llx\t%#llx\t%llu\t%d\t%s\t%s\t%s\n", (unsigned long long)b2b_frame, (unsigned long long)fence, (unsigned long long)r->src, (unsigned long long)r->dst, (unsigned long long)r->n, r->pend, e, s, d); }
+        free(b2b);
+        pthread_mutex_lock(&g_mu); uint64_t done_was = g_done; if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+        if (fence != done_was + 1 && lag_on()) { atomic_fetch_add(&g_lag_ooo, 1); lag_printf("O\t%llu\t%llu\n", (unsigned long long)fence, (unsigned long long)done_was); }   // DM_NVN_LAGLOG：完成回调不按栅栏顺序到（g_done 取最大值会越过未完成的提交） | completion arrived out of fence order (g_done = max would skip an unfinished submit)
         defer_drain();
     }];
     void arena_commit(uint64_t fence); arena_commit(fence);
@@ -974,6 +1050,13 @@ uint64_t mtl_sub_commit(void) {
 #endif
     cb_committed();
     g_alloc_fence[g_alloc_cur] = fence;
+    if (lag_on()) { static uint64_t reup0; uint64_t up_, ru; void mtl_pkg_stats(uint64_t *, uint64_t *); mtl_pkg_stats(&up_, &ru);
+        lag_printf("S\t%llu\t%llu\t%llu\t%llu\t%d\t%llu\t%d\t%llu\t%llu\t%lld\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)fence, (unsigned long long)g_lag_done_begin, (unsigned long long)g_done,
+                   g_alloc_cur, (unsigned long long)g_lag_alloc_prev, g_lag_alloc_new, (unsigned long long)g_lag_arena_reuse, (unsigned long long)g_lag_arena_new, g_lag_arena_minm == ~0ull ? -1ll : (long long)g_lag_arena_minm,
+                   (unsigned long long)atomic_exchange(&g_lag_defer, 0), (unsigned long long)atomic_exchange(&g_lag_drained, 0), (unsigned long long)g_lag_ub_n, (unsigned long long)g_lag_ub_bytes, (unsigned long long)g_lag_b2b_n,
+                   (unsigned long long)g_lag_upflush, (unsigned long long)g_lag_upblits, (unsigned long long)(ru - reup0));
+        reup0 = ru; }
+    g_lag_arena_reuse = g_lag_arena_new = 0; g_lag_arena_minm = ~0ull; g_lag_ub_n = g_lag_ub_bytes = g_lag_b2b_n = g_lag_upflush = g_lag_upblits = 0;
     g_cb = nil;
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
@@ -1223,6 +1306,7 @@ static void up_flush(void) {
     }
     [dc endEncoding]; g_up_ce = nil;
 #else
+    g_lag_upflush++; g_lag_upblits += (uint64_t)g_nup_blits;
     CENC b = g_nup_blits || g_nup_decs ? g_up_ce = [g_up_cb computeCommandEncoder] : nil;
     if (b) [b barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     for (int i = 0; b && i < g_nup_blits; i++) {
@@ -2704,7 +2788,8 @@ static NSMutableArray<NvArena *> *g_arenas; static NvArena *g_cur_arena; static 
 static NvArena *arena_new(void) {
     // for-in 循环变量不持有对象：先取强引用再从数组删，否则数组释放后返回的是野指针
     // The for-in loop variable does not retain the object: take a strong reference first and then remove it from the array, otherwise what is returned after the array releases it is a dangling pointer
-    for (NvArena *it in g_arenas) if (it->fence && it->fence <= g_done) { NvArena *r = it; [g_arenas removeObject:r]; r->fence = 0; r->used = 0; return r; }
+    for (NvArena *it in g_arenas) if (it->fence && it->fence + (uint64_t)lag_slack(0) <= g_done) { NvArena *r = it; [g_arenas removeObject:r]; g_lag_arena_reuse++; if (g_done - r->fence < g_lag_arena_minm) g_lag_arena_minm = g_done - r->fence; r->fence = 0; r->used = 0; return r; }
+    g_lag_arena_new++;
     NvArena *a = [NvArena new]; a->buf = [g_dev newBufferWithLength:4 << 20 options:MTLResourceStorageModeShared]; a->gpu = a->buf.gpuAddress; res_add(a->buf); return a;
 }
 void arena_begin(void) { if (!g_arenas) { g_arenas = [NSMutableArray array]; g_sub_arenas = [NSMutableArray array]; } g_cur_arena = nil; }
@@ -2716,6 +2801,17 @@ static size_t arena_alloc(size_t n, id<MTLBuffer> *buf) {
         [g_sub_arenas addObject:g_cur_arena];
     }
     size_t off = g_cur_arena->used; g_cur_arena->used += n; *buf = g_cur_arena->buf; return off;
+}
+// DM_NVN_UB_ARENA=1（候选修正，缺省关）：内联 uniform 更新的源数据在客体命令内存里，原先由 GPU 拷贝时才读——GPU 落后时客体可能已重写那段命令内存。
+// 改为提交时 CPU 先拷进本次提交的竞技场，GPU 从竞技场拷到目标
+// DM_NVN_UB_ARENA=1 (candidate fix, off by default): the source of an inline uniform update lives in guest command memory and used to be read only when the GPU executed the copy -- with the GPU behind, the guest may already have rewritten that command memory.
+// Instead the CPU copies it into this submission's arena at submit time and the GPU copies from the arena to the destination
+static void mtl_sub_update_arena(const void *src, uint64_t dst, uint64_t n) {
+    if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
+    void *db; uint64_t dof;
+    if (!mtl_addr(dst, n, &db, &dof)) MDIE("内联 uniform 更新目标不在任何内存池内 dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
+    id<MTLBuffer> ab; size_t off = arena_alloc((size_t)n, &ab); memcpy((uint8_t *)ab.contents + off, src, (size_t)n);
+    enc_b_copy_buffer(blit(), ab, off, (__bridge id<MTLBuffer>)db, dof, n);
 }
 
 // ---------- 绘制状态 ----------
@@ -5690,9 +5786,10 @@ void mtl_exec(const uint8_t *p) {
                     if (oq_diag()) { if (g_oqi.xbuf) CFRelease(g_oqi.xbuf); memset(&g_oqi, 0, sizeof g_oqi); g_oq_open = 1; g_oqi.sub0 = g_fence + 1; } }
                 break; }
             case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
-                PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); mtl_sub_copy(s_, d, n); break; }
+                PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); g_lag_b2b_n++; mtl_sub_copy(s_, d, n); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
-                PD("Y update_ub cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)((const uint8_t *)a + 16), (unsigned long long)d, (unsigned long long)n); mtl_sub_copy((uint64_t)((const uint8_t *)a + 16), d, n); break; }
+                PD("Y update_ub cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)((const uint8_t *)a + 16), (unsigned long long)d, (unsigned long long)n); g_lag_ub_n++; g_lag_ub_bytes += n;
+                if (lag_slack(3)) mtl_sub_update_arena((const uint8_t *)a + 16, d, n); else mtl_sub_copy((uint64_t)((const uint8_t *)a + 16), d, n); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
                 if (defer_begin_q(p)) break;
@@ -6216,6 +6313,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
              g_up_total_ns / 1e6, g_bp_first_present / 1e9);
     }
     PD("X ser=%llu present=%llu frame=%llu", t->serial, (unsigned long long)g_present_n, (unsigned long long)frame);
+    if (lag_on() && ticket != g_present_n) lag_printf("M\t%llu\t%llu\n", (unsigned long long)g_present_n, (unsigned long long)ticket);   // DM_NVN_LAGLOG：出图序号 ≠ 票号（对齐 REGLUM 用） | present number != ticket (for joining with REGLUM)
     id<MTLTexture> src = tex_mtl(t);
     if (!src) { RED_ONCE(8, "出图贴图建不出 MTLTexture"); return 0; }
     // DM_NVN_REGLUM=x0,y0,x1,y1:文件（归一化坐标）：每次出图回读该区域，记「出图序号、出图时刻 ns、区域平均亮度、隔点灰度小图（十六进制）」（诊断：核动画速度与帧率无关）。
@@ -6306,6 +6404,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
             for (NSUInteger k = 0; k < rl_w * rl_h; k++) sum += q[4 * k] + q[4 * k + 1] + q[4 * k + 2];
             pthread_mutex_lock(rl_mu); fprintf(rl_f, "%llu\t%llu\t%.4f\t", rl_n, rl_tns, sum / (3.0 * rl_w * rl_h)); for (NSUInteger k = 0; k < ng; k++) fprintf(rl_f, "%02x", g[k]); fputc('\n', rl_f); fflush(rl_f); pthread_mutex_unlock(rl_mu);
             double lum = sum / (3.0 * rl_w * rl_h); static double prev_lum; static int trig_n;
+            if (lag_on()) {   // DM_NVN_LAGLOG 黑帧触发器：中央区（小图第 4–31 行、第 8–55 列，避开大部分界面）均值 A-B-A，B < 0.35×min(A, C)（同 tools/reglum_black.py），记 B 行 | black trigger: centre mean A-B-A as in tools/reglum_black.py
+                static double cm[2]; static unsigned long long cn[2]; static int nc; double c = 0; for (int y = 4; y < 32; y++) for (int x = 8; x < 56; x++) c += g[y * 64 + x]; c /= 28 * 48;
+                if (nc >= 2 && cm[0] > 10 && c > 10 && cm[1] < 0.35 * fmin(cm[0], c)) { lag_printf("B\t%llu\t%.1f\t%.1f\t%.1f\n", cn[1], cm[0], cm[1], c); MLOG("【红】黑帧触发器（中央）：出图 %llu 中央亮度 %.1f → %.1f → %.1f", cn[1], cm[0], cm[1], c); }
+                cm[0] = cm[1]; cn[0] = cn[1]; cm[1] = c; cn[1] = rl_n; if (nc < 2) nc++; }
             {   // 画面触发器 2（DM_NVN_GLITCH 开着时）：小图 16x9 分块均值，某块「突变又恢复」(A-B-A) 即认为那一帧画错了（整帧亮度看不出的局部错画，如某物体一帧画到镜头前）→ 写出通道转储环
                 // Picture trigger 2 (with DM_NVN_GLITCH): 16x9 block means of the thumbnail; a block that jumps and reverts (A-B-A) means that frame was drawn wrong (local errors invisible to the whole-frame mean, e.g. an object drawn in front of the camera for one frame) → flush the pass-dump ring
                 static uint8_t tb[3][144]; static int tbn; static int trig2;
@@ -6573,6 +6675,10 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     uint64_t tk = ++g_pq_in;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
+    if (lag_on()) {   // DM_NVN_LAGLOG：出图入队时 GPU 落后多少（提交数 / 还没做完的出图帧数） | how far the GPU lags at present enqueue (submits / presented frames not finished)
+        static uint64_t pf[16], np; uint64_t done = g_done, fe = g_fence; pf[np++ % 16] = fe; int lf = 0; for (uint64_t k = 0; k < 16 && k < np; k++) if (pf[k] > done) lf++;
+        lag_printf("P\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n", (unsigned long long)tk, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)fe, (unsigned long long)done, (unsigned long long)(fe - done), lf);
+    }
     return tk;
 }
 // 丢弃期间不等：标志置上之后才入队的那一帧（出图线程正好走过了标志检查）没人取，等它就又卡住；它留给随后的 mtl_drain 清

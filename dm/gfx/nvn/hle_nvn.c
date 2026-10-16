@@ -887,6 +887,8 @@ static uint64_t g_frame;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
+static uint64_t g_pfence[16], g_np;   // DM_NVN_ACQ_DEPTH：最近 16 次出图各自的提交栅栏 | fences of the last 16 presents
+extern void mtl_lag_acquire(int idx, uint64_t rf, uint64_t done_before, uint64_t wait_ns); extern uint64_t mtl_done_fence(void);
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     win_t *o = (win_t *)w;
     *idx = o->ntex ? o->next++ % o->ntex : 0;
@@ -916,7 +918,13 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // Real device: a swapchain image can be re-acquired only after the display releases it, which implies the GPU work of the frame drawn into it finished long ago; the game relies on that to recycle its per-frame
     // uniform / vertex rings (UE4 recycles by frame count, not per-segment fences). The host's present only enqueues, so when the GPU falls behind the game runs further ahead than on the real device and the next
     // frame overwrites ring data the GPU has not read yet → whole black frames / effect vertices flying everywhere (recorded with a screen recorder adding load). Wait here for the GPU to finish that frame
-    { uint64_t rf = *idx < 4 ? o->rfence[*idx] : 0; if (rf) { uint64_t w0 = now_ns(); if (!mtl_wait(rf, 5000000000ull)) { static int once; if (!once++) LOG("【红】AcquireTexture 等上次画这张的栅栏 %llu 超时 5 秒", (unsigned long long)rf); } g_pq_wait_ns += now_ns() - w0; } }
+    // 诊断 DM_NVN_ACQ_DEPTH=k（缺省 0 = 只等这张图上次的栅栏，即 k = 交换链张数）：改为等「k 次出图之前那一帧」的栅栏（k=2 ≈ 真机：交换链 3 张时，能再取到第 N 张说明 N+1 已上屏、其 GPU 工作已完成）
+    // Diagnostic DM_NVN_ACQ_DEPTH=k (default 0 = wait only for this image's previous fence, i.e. k = swapchain length): wait instead for the fence of the frame presented k presents ago (k=2 ~ real device: with 3 images, image N can be re-acquired only once N+1 is on screen, so its GPU work is done)
+    { uint64_t rf = *idx < 4 ? o->rfence[*idx] : 0; static int depth = -1; if (depth < 0) { const char *e = getenv("DM_NVN_ACQ_DEPTH"); depth = e ? atoi(e) : 0; if (depth < 0 || depth > 15) depth = 0; if (depth) LOG("[nvn] DM_NVN_ACQ_DEPTH=%d（诊断候选修正）", depth); }
+      if (depth && g_np >= (uint64_t)depth) { uint64_t f2 = g_pfence[(g_np - (uint64_t)depth) % 16]; if (f2 > rf) rf = f2; }
+      uint64_t d0 = mtl_done_fence(), w0 = now_ns();
+      if (rf) { if (!mtl_wait(rf, 5000000000ull)) { static int once; if (!once++) LOG("【红】AcquireTexture 等上次画这张的栅栏 %llu 超时 5 秒", (unsigned long long)rf); } g_pq_wait_ns += now_ns() - w0; }
+      mtl_lag_acquire(*idx, rf, d0, now_ns() - w0); }
     if (s) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }   // 交换链贴图在此前的提交完成后可用 | The swapchain texture becomes available once the commits before this point have completed
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -1142,7 +1150,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     present_cfg(o);
     gfx_enter();
     uint64_t t0 = now_ns();
-    if (idx >= 0 && idx < o->ntex && idx < 4) { o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop); o->rfence[idx] = mtl_last_fence(); }   // 只入队，立即返回；记下画这张的提交栅栏 | enqueue only, return immediately; remember the fence of the submission that drew it
+    if (idx >= 0 && idx < o->ntex && idx < 4) { o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop); o->rfence[idx] = mtl_last_fence(); g_pfence[g_np++ % 16] = o->rfence[idx]; }   // 只入队，立即返回；记下画这张的提交栅栏 | enqueue only, return immediately; remember the fence of the submission that drew it
     gfx_leave();
     if (nvn_serial() == 3) mtl_wait(mtl_last_fence(), UINT64_MAX);   // 3 = 只等本帧游戏提交做完（不等出图命令缓冲）：区分「帧间游戏提交重叠」与「出图命令缓冲参与的重叠」 | 3 = wait only for this frame's game submissions (not the present command buffer): separates cross-frame game-submit overlap from overlap involving the present command buffer
     else if (nvn_serial() == 4) mtl_present_flush();   // 4 = 只等出图命令缓冲做完 | 4 = wait only for the present command buffer
