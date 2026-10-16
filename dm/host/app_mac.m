@@ -74,6 +74,10 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         NSString *bp = NSBundle.mainBundle.bundlePath;
         if (*argc > 1 || ![bp.pathExtension isEqualToString:@"app"]) return 0;
         NSFileManager *fm = NSFileManager.defaultManager;
+        {   // 另一个游戏实例在跑（自动化测试 / 忘了关的旧窗口）会分走 GPU，画面出现「GPU 落后」型的闪烁与黑帧：启动时提醒一次，仍允许继续 | Another running instance (automated test / forgotten window) steals GPU time and produces the "GPU behind" flicker / black frames: warn once at launch, still allow continuing
+            NSUInteger n = 0; for (NSRunningApplication *r in NSWorkspace.sharedWorkspace.runningApplications) if (r.processIdentifier != getpid() && [r.executableURL.lastPathComponent isEqualToString:@"BladeII"]) n++;
+            if (n) { NSAlert *a = [NSAlert new]; a.messageText = @APP_NAME; a.informativeText = [NSString stringWithFormat:getenv("DM_LANG") && !strncmp(getenv("DM_LANG"), "en", 2) ? @"%lu other instance(s) of the game are already running. They share the GPU and cause flicker; quit them first." : @"已有 %lu 个游戏实例在运行。它们会分走 GPU、造成画面闪烁，请先退出它们。", (unsigned long)n]; [a addButtonWithTitle:@"OK"]; [a runModal]; }
+        }
         if (!getenv("DM_LANG")) setenv("DM_LANG", [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"] ? "zh-Hans" : "en", 1);   // 命令行宿主一律简中；App 形态跟系统首选语言（提示框与游戏内同一个开关） | The command-line host is always Simplified Chinese; the App form follows the system's preferred language (dialogs and in-game text use the same switch)
         NSString *sup = [[NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@APP_NAME] copy];
         if (getenv("DM_APP_SUPPORT")) sup = @(getenv("DM_APP_SUPPORT"));   // 测试：存档等放到指定目录，不碰玩家那份 | Test: put saves and the rest in a given directory, leaving the player's own untouched
