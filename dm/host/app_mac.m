@@ -121,6 +121,11 @@ int dm_app_bootstrap(int *argc, char ***argv) {
 #if DM_GENERIC_HOST
         // 通用宿主的 App 缺省：产品要出声；没有管线预热种子清单；TBDR 优化按 Mac 验证口径先关 | App defaults of the generic host: the product plays sound; no pipeline warm-up seed list; TBDR optimisations off as validated on Mac
         if (!getenv("DM_AUDIO")) setenv("DM_AUDIO", "1", 1);
+        // 出图缺省走出图线程自取 drawable（垂直同步交给 CAMetalLayer），不用显示节拍回调：Mac 上回调在系统有别的负载（虚拟机 / 浏览器 / 构建）时整秒不来，
+        // 宿主为此准备的兜底（丢排队帧、重复旧帧）正是玩家看到的闪烁；自取路径下同一负载几乎不闪（2026-10-16 实测，同一版本、同一局内对照）
+        // Present defaults to the present thread acquiring drawables itself (vsync left to CAMetalLayer), not the display-link callback: on Mac the callback stops for whole seconds whenever the system carries other load (VM / browser / builds),
+        // and the host's fallbacks for that (dropping queued frames, re-presenting old ones) are exactly the flicker the player saw; on the self-driven path the same load barely flickers (measured 2026-10-16, same build, A/B within one session)
+        if (!getenv("DM_PRESENT_LINK")) setenv("DM_PRESENT_LINK", "0", 1);
         if (!getenv("DM_PSO_MANIFEST")) setenv("DM_PSO_MANIFEST", "off", 1);
         if (!getenv("DM_NVN_TBDR")) setenv("DM_NVN_TBDR", "0", 1);
 #else
