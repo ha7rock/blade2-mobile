@@ -7,7 +7,9 @@
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TAG=${1:?tag}; RS=${2:-55}; RD=${3:-60}; WATCH=${4:-120}
-W=$HOME/blade2-work; APP="$W/out/macapp/Blade II.app"; O=$W/run/aba/$TAG
+#   ABA_APP=<.app> (default ~/blade2-work/out/macapp/Blade II.app), ABA_OUT=<dir> (default ~/blade2-work/run/aba), ABA_SAVEDIR=<scratch save copy> (default ~/blade2-work/run/save_play),
+#   ABA_LAG=1 adds DM_NVN_LAGLOG=<out>/lag.txt; other BladeII processes seen during the run are logged to <out>/overlap.txt (a non-empty file = timing-contaminated run)
+W=$HOME/blade2-work; APP=${ABA_APP:-"$W/out/macapp/Blade II.app"}; O=${ABA_OUT:-$W/run/aba}/$TAG; SP=${ABA_SAVEDIR:-$W/run/save_play}
 CROP=${ABA_CROP:-2560:1400:640:248}
 # One game instance at a time (two agents share this Mac; a second instance kills / perturbs the first): mkdir lock ~/blade2-work/run/gpu.lock, stale lock (dead pid) removed
 LK=$W/run/gpu.lock
@@ -17,17 +19,20 @@ while pgrep -x BladeII > /dev/null; do sleep 3; done   # an instance started wit
 rm -rf "$O"; mkdir -p "$O"
 caffeinate -dimsu -t $((WATCH + 30)) &   # display sleep stops the display link (1 Hz) and ends screencapture early
 CAF=$!
-rm -rf $W/run/save_play; cp -r $W/run/save $W/run/save_play
+rm -rf "$SP"; cp -r $W/run/save "$SP"
 K="A@6,A@10,A@14,A@18,A@24,A@30,A@36"
 for i in $(seq 0 90); do K="$K,A@$(echo "55+$i*0.7" | bc)"; done
 K="$K,LSU@70+2,LSR@85+2"
 env | grep '^DM_\|^MTL_' | sort > "$O/env.txt"
-DM_WINDOW_TOP=1 DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE=$W/run/save_play \
+[ -n "${ABA_LAG:-}" ] && export DM_NVN_LAGLOG="$O/lag.txt"
+DM_WINDOW_TOP=1 DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE="$SP" \
 DM_WATCH=$WATCH DM_KEYS="$K" DM_NVN_REGLUM="0,0,1,1:$O/reglum.txt" DM_NVN_DRAWSET=${ABA_DRAWSET:+$O/drawset.txt} \
   "$APP/Contents/MacOS/BladeII" > "$O/stdout.log" 2> "$O/stderr.log" &
 UPNS='import time;print(time.clock_gettime_ns(time.CLOCK_UPTIME_RAW))'
 python3 -c "$UPNS" > "$O/t_launch.txt"
 PID=$!
+date +%s > "$O/t_launch_wall.txt"
+( while kill -0 $PID 2>/dev/null; do pgrep -x BladeII | grep -v "^$PID\$" | sed "s/^/$(date +%s) other pid /" >> "$O/overlap.txt"; sleep 2; done ) &
 if [ "$RD" -gt 0 ]; then
   sleep "$RS"
   python3 -c "$UPNS" > "$O/t_rec.txt"
