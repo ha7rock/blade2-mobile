@@ -20,13 +20,8 @@ void hle_bind_system_event(void *ev, int autoclear);   // hle_thread.c
 void hle_signal_system_event(void *ev);
 int hle_signal_system_event_try(void *ev);   // 容错版：句柄没了返回 0 | tolerant: returns 0 when the handle is gone
 
-// ---------- movie（subsdk0 的任天堂视频库，不装载）：d2r 已空播；UE4 的播放器还读媒体信息 ----------
-// ---------- movie (Nintendo video library in subsdk0, not loaded): d2r already plays empty; UE4's player also reads media info ----------
-HLE_FORCE("_ZN5movie9MediaData5ClearEv", "过场空播：空 MediaData", void, h_mv_Clear, void **self) { *self = 0; }
-HLE_FORCE("_ZN5movie9MediaDataC1ERKS0_", "过场空播：空 MediaData（拷贝构造）", void, h_mv_CopyCtor, void **self, void **other) { *self = *other; }
-HLE_FORCE("_ZN5movie9MediaDataaSERKS0_", "过场空播：空 MediaData（赋值）", void *, h_mv_Assign, void **self, void **other) { *self = *other; return self; }
-// FindString / FindInt32 / FindInt64 已在 hle_movie.c 里 | FindString / FindInt32 / FindInt64 are already in hle_movie.c
-HLE_FORCE("_ZNK5movie9MediaData8FindRectEPKcPiS3_S3_S3_", "过场空播：媒体信息一律「没有」", unsigned, h_mv_FindRect, const void *self, const char *key, int *l, int *t, int *r, int *b) { (void)self; (void)key; if (l) *l = 0; if (t) *t = 0; if (r) *r = 0; if (b) *b = 0; return 0; }
+// ---------- movie（subsdk0 的任天堂视频库，不装载）：全部在 hle_movie.c（通用宿主分支 = AVFoundation 真播放） ----------
+// ---------- movie (Nintendo video library in subsdk0, not loaded): all in hle_movie.c (generic-host branch = real playback via AVFoundation) ----------
 
 // ---------- nn::hid 六轴 / 握持方式 / 手柄支持小程序 / 震动信息 ----------
 // ---------- nn::hid six-axis / joy hold type / controller support applet / vibration info ----------
