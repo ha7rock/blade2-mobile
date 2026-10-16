@@ -126,6 +126,10 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         // Present defaults to the present thread acquiring drawables itself (vsync left to CAMetalLayer), not the display-link callback: on Mac the callback stops for whole seconds whenever the system carries other load (VM / browser / builds),
         // and the host's fallbacks for that (dropping queued frames, re-presenting old ones) are exactly the flicker the player saw; on the self-driven path the same load barely flickers (measured 2026-10-16, same build, A/B within one session)
         if (!getenv("DM_PRESENT_LINK")) setenv("DM_PRESENT_LINK", "0", 1);
+        // 不在映射表里的着色器缺省转储到应用支持目录 shdump/（只写控制段与代码区，几 KB 一条）：玩家正常游玩碰到的新着色器（弹反剑光等只在特定操作下才出现的特效）
+        // 下一轮 tools/shaders_iterate.sh 直接从这里补进映射表，不必靠脚本复现那个操作 | Shaders missing from the map are dumped by default into shdump/ under Application Support (control section + code only, a few KB each):
+        // new shaders met in normal play (effects such as the parry sword flash that only appear on specific inputs) are picked up by the next tools/shaders_iterate.sh run without scripting that input
+        if (!getenv("DM_NVN_SHDUMP")) { NSString *sd = [sup stringByAppendingPathComponent:@"shdump"]; setenv("DM_NVN_SHDUMP", sd.fileSystemRepresentation, 1); }
         if (!getenv("DM_PSO_MANIFEST")) setenv("DM_PSO_MANIFEST", "off", 1);
         if (!getenv("DM_NVN_TBDR")) setenv("DM_NVN_TBDR", "0", 1);
 #else
