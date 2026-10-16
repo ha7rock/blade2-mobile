@@ -51,31 +51,13 @@ PATCH_OFF = (len(IMG) + 0xFFFF) & ~0xFFFF
 # Networking cuts (excluded scope: Battle.net / online play): taken from a community offline fix (LFS Mod Offline Fix for v2228224, which differs from the official 94012 main in only these 7 words).
 # Measured: the system service layer (nifm offline / DNS black hole / account service) cannot get around it: the game itself sends Battle.net requests directly and allows offline play according to the "last online" time.
 CUTS = {
-    # Blade II（UE4 4.17，更新 v131072）main：开场视频播放器的 Tick（虚表 0x6aad850 第 2 槽，函数 0x3a29e40）→ 直接 ret。
-    # 该 Tick 无条件解引用播放器子对象 +0x10 的 RHI 流对象（0x3a29f94 / 0x3a2d390），而这个对象在宿主下从未建立（视频在复刻排除范围内，
-    # movie 库只空播）；跳过整个 Tick 后视频播放器不推进，由上层按「没有视频」继续。产品剪口，待 movie 协议补全后撤销
-    # Blade II (UE4 4.17, update v131072) main: the startup movie player's Tick (vtable 0x6aad850 slot 2, function 0x3a29e40) → return immediately.
-    # That Tick unconditionally dereferences the RHI stream object at +0x10 of the player sub-object (0x3a29f94 / 0x3a2d390), which is never created under the host
-    # (video is out of the reimplementation scope, the movie library only plays empty); with the whole Tick skipped the player does not advance and the layer above carries on as "no video". Product cut, to be reverted once the movie protocol is completed
-    '0379ac316b16fbc1a00d2f0dc139ffa9': [
-        (0x3a29e40, 'f70f1cf8', 'c0035fd6', '开场视频播放器 Tick（0x3a29e40 入口 str x23,[sp,#-0x40]!）→ ret：跳过视频播放器的每帧推进'),
-        # NVN 视频解码器「停止并销毁」（0x3411980）开头先调 Stop（0x3411770）：Stop 无条件 SignalEvent 解码器 +0x720/+0x5f8 并 WaitEvent +0x788/+0x660，
-        # 这四个事件只在解码器打开成功后（0x3410330，按 +0x522 守卫）才 InitializeEvent；宿主对 SetDataSource 一律答「打不开」，解码器从未打开，
-        # Stop 便对未初始化的事件上内部锁（锁字是垃圾 → ArbitrateLock 永远等）：GameThread 在关卡加载关闭播放器时卡死（实测卡在 Loading 画面）。
-        # 产品剪口：跳过这次 Stop（bl → nop）；其后释放 +0x400/+0x410 两个构造时初始化的数组照旧。宿主永不启动解码器，所以不漏掉真正的停止。
-        # The NVN movie decoder's stop-and-destroy (0x3411980) starts by calling Stop (0x3411770), which unconditionally SignalEvents decoder +0x720/+0x5f8 and WaitEvents +0x788/+0x660;
-        # those four events are only InitializeEvent'ed after a successful open (0x3410330, guarded by +0x522). The host answers "cannot open" to every SetDataSource, so the decoder never opens,
-        # and Stop takes the internal lock of uninitialized events (the lock word is garbage → ArbitrateLock waits forever): the GameThread deadlocks when the level load closes the player (measured: stuck on the Loading screen).
-        # Product cut: skip that Stop (bl → nop); the following release of the +0x400/+0x410 arrays (initialized in the constructor) proceeds as before. The host never starts a decoder, so no real stop is lost.
-        (0x3411998, '76ffff97', '1f2003d5', 'NVN 视频解码器停止并销毁（0x3411980）里的 bl Stop（0x3411770）→ nop：从未打开的解码器不做 Stop（事件未初始化会死锁）'),
-        # UE4 播放器虚表 0x6aad850 第 15 槽（0x3a2a9e0，关闭/收尾）：停掉解码器后遍历轨道表（+0x40/+0x80，计数 +0x90）对每条轨道调虚表 +0x70（取消选轨，w1=6 音频 / 0 视频），
-        # 该方法（0x3a2ddf0）无条件读播放器子对象 +0xe0 的流对象 [+0x10]（+0x408/+0x418 轨道数）；流对象只在解码器真正打开后才挂上，宿主下恒空 → 0x3a2de34 空指针读。
-        # 产品剪口：跳过这两段轨道遍历，直接到收尾（0x3a2abb8：状态清零 + 返回）。
-        # UE4 player vtable 0x6aad850 slot 15 (0x3a2a9e0, close/wrap-up): after stopping the decoder it walks the track table (+0x40/+0x80, count +0x90) calling vtable +0x70 on each track (deselect, w1=6 audio / 0 video);
-        # that method (0x3a2ddf0) unconditionally reads the stream object [+0x10] of the player sub-object +0xe0 (+0x408/+0x418 track counts); the stream is only attached once a decoder really opens, so under the host it is always null → null read at 0x3a2de34.
-        # Product cut: skip both track walks and go straight to the wrap-up (0x3a2abb8: state cleared + return).
-        (0x3a2aa70, '68a640b9', '52000014', 'UE4 播放器关闭（0x3a2a9e0）：ldr w8,[x19,#0xa4] → b 0x3a2abb8：跳过取消选轨的轨道遍历（流对象恒空）'),
-    ],
+    # Blade II（UE4 4.17，更新 v131072）main：原先有三条视频剪口（开场视频播放器 Tick 0x3a29e40 → ret、关闭里的 bl Stop 0x3411998 → nop、
+    # UE4 播放器关闭的取消选轨遍历 0x3a2aa70 → b 收尾），起因都是宿主对 SetDataSource 一律答「打不开」，解码器 / 流对象从未建立。
+    # movie 协议已补全（hle_movie.c 通用宿主分支：AVFoundation 真播放），三条按原计划撤销，播放器走原版路径。
+    # Blade II (UE4 4.17, update v131072) main: there used to be three video cuts (startup movie player Tick 0x3a29e40 → ret, the bl Stop inside close 0x3411998 → nop,
+    # the deselect-track walk of the UE4 player's close 0x3a2aa70 → b to the wrap-up), all because the host answered "cannot open" to every SetDataSource so the decoder / stream object never existed.
+    # The movie protocol is now complete (generic-host branch of hle_movie.c: real playback via AVFoundation), so all three are reverted as planned and the player takes the original path.
+    '0379ac316b16fbc1a00d2f0dc139ffa9': [],
     'db0507f36b84200ac05f75d76ed5026f': [
     # （放进所有产物共用的基础改写）：游戏显存分配器预算 260 MB → 512 MB
     # (Placed in the base rewrite shared by all build outputs): game video memory allocator budget 260 MB → 512 MB
