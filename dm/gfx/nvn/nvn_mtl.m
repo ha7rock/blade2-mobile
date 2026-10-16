@@ -493,7 +493,14 @@ typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t ad
 // and a report hands the slot table together with its buffer (retained) to the completion callback to sum and write back; after a report a new slot is used, so later draws are not counted into the reported value.
 // (Previously always wrote 0: occlusion query = 'fully occluded', campfires / light sources got culled - the character select screen calls ResetCounter 21 times per frame)
 typedef struct { void *buf; uint32_t slot; } vis_slot;
-typedef struct { int n; vis_slot s[]; } vis_list;
+// 诊断 DM_NVN_OQDIAG=1（缺省关）：每次遮挡查询（清零→报告）记下计数绘制的状态与所在通道的深度附件，另画两次同一包围盒到额外槽（翻转剔除面 / 关深度测试），完成回调里按类别统计结果为 0 的比例
+// Diagnostic DM_NVN_OQDIAG=1 (off by default): for every occlusion query (reset -> report) record the state of the counted draws and the depth attachment of their pass, and draw the same bounding box twice more into extra slots (flipped cull face / depth test off); the completion handler tallies the zero-result rate per category
+typedef struct { uint32_t nd_seen, nd, nd_novis, npass, nx; uint8_t dt, dw, df, cull, front, bias, hd, hs, dload, dmatch, xsub; uint16_t dfmt; uint64_t dser, pass, sub0; uint32_t dlv, dsl, xb[4], xc[4]; float vp[4], dr[2]; void *xbuf; const uint8_t *vptr, *uptr, *u1ptr; uint32_t vlen, ulen; uint64_t vh, uh, u1h, frame; uint64_t okey; uint32_t nidx; uint8_t vpend, upend, u1pend, ovl; uint64_t pre_v, pre_t, enc_ticks, enc_frame; } oq_info;
+static pthread_mutex_t g_oqpm = PTHREAD_MUTEX_INITIALIZER; enum { OQPN = 1 << 14 }; static uint64_t g_oqp_a[OQPN]; static uint32_t g_oqp_n[OQPN];   // 每个报告地址在途的报告数 | Reports in flight per report address
+static int oqp_add(uint64_t a, int d) { uint32_t h = (uint32_t)((a * 0x9E3779B97F4A7C15ull) >> 50) & (OQPN - 1); int r = -1; pthread_mutex_lock(&g_oqpm);
+    for (int k = 0; k < 16; k++) { uint32_t j = (h + k) & (OQPN - 1); if (!g_oqp_a[j] || g_oqp_a[j] == a) { g_oqp_a[j] = a; r = (int)g_oqp_n[j]; g_oqp_n[j] += d; break; } } pthread_mutex_unlock(&g_oqpm); return r; }
+static uint64_t oq_hash(const uint8_t *p, uint32_t n) { uint64_t h = 1469598103934665603ull; if (!p) return 0; for (uint32_t i = 0; i < n; i++) h = (h ^ p[i]) * 1099511628211ull; return h; }
+typedef struct { int n; oq_info oi; vis_slot s[]; } vis_list;
 #define VIS_SLOTS 8192
 typedef struct { __strong id<MTLBuffer> buf; uint64_t fence; } vis_buf;
 static int vis_accum(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_VIS_ACCUM"); v = e && !strcmp(e, "1"); } return v; }
@@ -504,8 +511,12 @@ static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_p
 static vis_slot *g_vs; static int g_nvs, g_vscap;      // 自上次清零以来的槽 | Slots since the last reset
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // 各计数器类型的报告 / 清零次数（诊断） | Report / reset counts per counter type (diagnostics)
 static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
+static int oq_diag(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_OQDIAG"); v = e ? atoi(e) : 0; } return v; }
+static int g_oq_open; static oq_info g_oqi;            // 诊断：当前查询（清零后、报告前）与它的记录 | Diagnostic: the current query (after reset, before report) and its record
+static uint64_t g_oqp_dser; static uint32_t g_oqp_dlv, g_oqp_dsl; static uint8_t g_oqp_dload; static uint16_t g_oqp_dfmt;   // 当前通道的深度附件 | Depth attachment of the current pass
+static uint64_t g_oqw_ser; static uint32_t g_oqw_lv, g_oqw_sl;   // 最近一次写深度的绘制所在通道的深度附件 | Depth attachment of the pass of the most recent depth-writing draw
 static vis_list *vis_snapshot(void) {
-    vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs;
+    vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs; l->oi = g_oqi; if (l->oi.xbuf) CFRetain(l->oi.xbuf);
     for (int i = 0; i < g_nvs; i++) { l->s[i] = g_vs[i]; CFRetain(g_vs[i].buf); }
     return l;
 }
@@ -858,6 +869,55 @@ static void vis_stat_note(uint64_t addr, uint64_t sum, int nslots) {
     if (tot % 20000 == 0) MLOG("DM_NVN_VISSTAT：报告 %llu 次，结果 0 的 %llu 次（其中无计数槽 %llu），非零→0→非零 %llu 次，0→非零→0 %llu 次，表满 %llu", (unsigned long long)tot, (unsigned long long)zero, (unsigned long long)noslot, (unsigned long long)flip_z, (unsigned long long)flip_nz, (unsigned long long)coll);
     pthread_mutex_unlock(&mu);
 }
+// DM_NVN_OQDIAG 的统计：按类别记总数 / 结果 0 数 / 「非零→0→非零」中间那次落在该类的次数；每 20000 次报告打一组行
+// DM_NVN_OQDIAG tallies: per category, total / zero results / times the middle report of a 'nonzero -> 0 -> nonzero' flip fell into that category; one group of lines per 20000 reports
+enum { OQA = 27, OQV = 10 };
+static const char *oq_attr_name[OQA] = {"nd", "nd_skip", "novis", "npass", "nslots", "dload", "dmatch", "df", "cull", "bias", "xsub", "hd", "front", "cls", "dfmt", "dr", "vchg", "uchg", "u1chg", "vpend", "upend", "u1pend", "ovl", "pre_ts0", "midchg", "lagfr", "nbox"};
+static void oq_stat_note(uint64_t addr, const oq_info *q, int nslots, uint64_t sum, uint64_t b, uint64_t c) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t tot, zero, flips, T[OQA][OQV], Z[OQA][OQV], F[OQA][OQV], ndet, ndet_nz;
+    enum { VN = 1 << 14 }; static uint64_t ka[VN], v0[VN], v1[VN], c0[VN], c1[VN], f0[VN], f1[VN], nflog; static uint8_t nv[VN], at0[VN][OQA], at1[VN][OQA];
+    uint8_t a[OQA];
+    int cls = !q->nx ? 0 : sum ? (b > sum ? 5 : 1) : !c ? 2 : !b ? 3 : 4;   // 0 没加测 1 非零 2 0 且屏上无覆盖 3 0 且两面都被挡 4 0 但背面能过（闭合盒不可能） 5 非零但背面过的比正面多 | 0 no extra 1 nonzero 2 zero, no on-screen coverage 3 zero, both faces occluded 4 zero but back faces pass (impossible for a closed box) 5 nonzero but back faces pass more than front
+    a[0] = q->nd > 3 ? 3 : q->nd; a[1] = q->nd_seen > q->nd ? 1 : 0; a[2] = q->nd_novis ? 1 : 0; a[3] = q->npass > 2 ? 2 : q->npass; a[4] = nslots > 2 ? 2 : nslots; a[5] = q->dload; a[6] = q->dmatch;
+    a[7] = q->df > 9 ? 9 : q->df; a[8] = q->cull; a[9] = q->bias; a[10] = q->xsub; a[11] = q->hd; a[12] = q->front; a[13] = cls;
+    a[14] = q->dfmt == MTLPixelFormatDepth32Float ? 1 : q->dfmt == MTLPixelFormatDepth32Float_Stencil8 ? 2 : q->dfmt == MTLPixelFormatDepth16Unorm ? 3 : q->dfmt ? 4 : 0;
+    a[15] = q->dr[0] == 0 && q->dr[1] == 1 ? 0 : 1;
+    a[16] = !q->vptr ? 2 : oq_hash(q->vptr, q->vlen) != q->vh; a[17] = !q->uptr ? 2 : oq_hash(q->uptr, q->ulen) != q->uh; a[18] = !q->u1ptr ? 2 : oq_hash(q->u1ptr, 16) != q->u1h;
+    a[19] = q->vpend; a[20] = q->upend; a[21] = q->u1pend; a[22] = q->ovl;
+    { uint64_t m[2]; memcpy(m, (const void *)addr, 16); a[23] = q->pre_t == 0 ? (q->pre_v == 0 ? 0 : 1) : 2; a[24] = m[0] != q->pre_v || m[1] != q->pre_t; }
+    { uint64_t lf = atomic_load(&g_cur_frame) - q->enc_frame; a[25] = lf > 9 ? 9 : (uint8_t)lf; }
+    a[26] = q->nidx == 36 ? 1 : q->nidx % 36 ? 0 : q->nidx / 36 > 9 ? 9 : (uint8_t)(q->nidx / 36);   // 一次绘制里的盒子数（36 个索引一盒；0 = 不是 36 的倍数）| boxes per draw (36 indices per box; 0 = not a multiple of 36)
+    pthread_mutex_lock(&mu);
+    tot++; if (!sum) zero++;
+    for (int i = 0; i < OQA; i++) { T[i][a[i]]++; if (!sum) Z[i][a[i]]++; }
+    uint32_t h = (uint32_t)((addr * 0x9E3779B97F4A7C15ull) >> 50) & (VN - 1); int k;
+    for (k = 0; k < 8; k++) { uint32_t j = (h + k) & (VN - 1); if (!ka[j] || ka[j] == addr) { h = j; break; } }
+    if (k < 8) { if (!ka[h]) { ka[h] = addr; nv[h] = 0; }
+        if (nv[h] >= 2 && v0[h] && !v1[h] && sum) { flips++; for (int i = 0; i < OQA; i++) F[i][at1[h][i]]++;
+            if (q->frame >= 3000 && nflog++ < 300) MLOG("DM_NVN_OQDIAG 翻转 addr=%#llx 帧 %llu/%llu/%llu 结果 %llu/%llu/%llu 覆盖 %llu/%llu/%llu 中间 cls=%u vchg=%u uchg=%u u1chg=%u",
+                (unsigned long long)addr, (unsigned long long)f0[h], (unsigned long long)f1[h], (unsigned long long)q->frame, (unsigned long long)v0[h], (unsigned long long)v1[h], (unsigned long long)sum,
+                (unsigned long long)c0[h], (unsigned long long)c1[h], (unsigned long long)c, at1[h][13], at1[h][16], at1[h][17], at1[h][18]); }
+        v0[h] = v1[h]; v1[h] = sum; c0[h] = c1[h]; c1[h] = c; f0[h] = f1[h]; f1[h] = q->frame; memcpy(at0[h], at1[h], OQA); memcpy(at1[h], a, OQA); if (nv[h] < 2) nv[h]++; }
+    {   // 按物体（包围盒 8 个顶点的内容指纹）跟踪结果序列：报告地址会在物体之间轮换，按地址的翻转统计混了不同物体 | Track the result sequence per object (content hash of the box's 8 vertices): report addresses rotate between objects, so per-address flip counts mix different objects
+        static uint64_t ok_[VN], of0[VN], of1[VN], os0[VN], os1[VN], oc1[VN], otot, oflip, oflip_c, oflip_adj, oseen; static uint8_t onv[VN], ocls1[VN];
+        uint64_t key = q->okey ? q->okey : 1; uint32_t hh = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 50) & (VN - 1); int kk;
+        for (kk = 0; kk < 16; kk++) { uint32_t j = (hh + kk) & (VN - 1); if (!ok_[j] || ok_[j] == key) { hh = j; break; } }
+        if (kk < 16 && q->frame >= 3000) { otot++; if (!ok_[hh]) { ok_[hh] = key; onv[hh] = 0; oseen++; }
+            if (onv[hh] >= 2 && os0[hh] && !os1[hh] && sum) { oflip++; if (oc1[hh]) oflip_c++; if (of1[hh] == of0[hh] + 1 && q->frame == of1[hh] + 1) oflip_adj++;
+                static int nl; if (nl++ < 200) MLOG("DM_NVN_OQDIAG 物体翻转 vh=%016llx 帧 %llu/%llu/%llu 结果 %llu/0/%llu 中间覆盖 %llu cls=%u 本次覆盖 %llu", (unsigned long long)key, (unsigned long long)of0[hh], (unsigned long long)of1[hh], (unsigned long long)q->frame, (unsigned long long)os0[hh], (unsigned long long)sum, (unsigned long long)oc1[hh], ocls1[hh], (unsigned long long)c); }
+            os0[hh] = os1[hh]; os1[hh] = sum; of0[hh] = of1[hh]; of1[hh] = q->frame; oc1[hh] = c; ocls1[hh] = (uint8_t)cls; if (onv[hh] < 2) onv[hh]++; }
+        if (tot % 20000 == 0) MLOG("DM_NVN_OQDIAG 按物体（帧≥3000）：报告 %llu 物体 %llu 非零→0→非零 %llu（中间覆盖>0 %llu，三帧相邻 %llu）", (unsigned long long)otot, (unsigned long long)oseen, (unsigned long long)oflip, (unsigned long long)oflip_c, (unsigned long long)oflip_adj); }
+    if (q->frame >= 3000 && ((!sum && ndet < 150) || (sum && ndet_nz < 40))) { if (sum) ndet_nz++; else ndet++;
+        MLOG("DM_NVN_OQDIAG 明细 addr=%#llx sum=%llu flipb=%llu nodt=%llu nslots=%d nd=%u/%u novis=%u npass=%u nx=%u d=ser%llu lv%u sl%u fmt%u load%u match%u df=%u dt=%u dw=%u cull=%u front=%u bias=%u hd=%u hs=%u vp=%g,%g,%g,%g dr=%g,%g xsub=%u frame=%llu vchg=%u uchg=%u",
+             (unsigned long long)addr, (unsigned long long)sum, (unsigned long long)b, (unsigned long long)c, nslots, q->nd, q->nd_seen, q->nd_novis, q->npass, q->nx, (unsigned long long)q->dser, q->dlv, q->dsl, q->dfmt, q->dload, q->dmatch,
+             q->df, q->dt, q->dw, q->cull, q->front, q->bias, q->hd, q->hs, q->vp[0], q->vp[1], q->vp[2], q->vp[3], q->dr[0], q->dr[1], q->xsub, (unsigned long long)q->frame, a[16], a[17]); }
+    if (tot % 20000 == 0) {
+        MLOG("DM_NVN_OQDIAG：报告 %llu 次 结果0 %llu 非零→0→非零 %llu", (unsigned long long)tot, (unsigned long long)zero, (unsigned long long)flips);
+        for (int i = 0; i < OQA; i++) { char ln[600]; size_t o = 0;
+            for (int v = 0; v < OQV; v++) if (T[i][v]) o += snprintf(ln + o, sizeof ln - o, " %d:%llu/%llu/%llu", v, (unsigned long long)T[i][v], (unsigned long long)Z[i][v], (unsigned long long)F[i][v]);
+            MLOG("DM_NVN_OQDIAG %s（值:总/0/翻转中间）%s", oq_attr_name[i], ln); } }
+    pthread_mutex_unlock(&mu);
+}
 uint64_t mtl_sub_commit(void) {
     defer_fallback();   // 推迟合并通道：提交结束仍有未回放的 P 绘制（正常路径不会到这里） | Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
     rp_flush();
@@ -884,6 +944,8 @@ uint64_t mtl_sub_commit(void) {
             else if (ops[i].kind == 3) {   // 通过采样数：自清零以来各槽之和 | Samples passed: the sum of all slots since the reset
                 vis_list *l = ops[i].vis; uint64_t sum = 0; int vis_nslots = l->n;
                 for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
+                if (oq_diag()) { uint64_t xb = 0, xc = 0; if (l->oi.xbuf) { const uint64_t *vv = ((__bridge id<MTLBuffer>)l->oi.xbuf).contents; for (uint32_t k = 0; k < l->oi.nx; k++) { xb += vv[l->oi.xb[k]]; xc += vv[l->oi.xc[k]]; } CFRelease(l->oi.xbuf); }
+                    oqp_add(ops[i].addr, -1); oq_stat_note(ops[i].addr, &l->oi, vis_nslots, sum, xb, xc); }
                 free(l); { static int all = -1; if (all < 0) { const char *e = getenv("DM_NVN_VIS_ALL"); all = e && !strcmp(e, "1"); } if (all && !sum) sum = 1; }   // 诊断 DM_NVN_VIS_ALL=1：遮挡查询一律「可见」（判是不是查询结果把东西剔掉了） | Diagnostic DM_NVN_VIS_ALL=1: every occlusion query answers 'visible' (to tell whether query results are culling things)
                 uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
                 vis_stat_note(ops[i].addr, sum, vis_nslots);
@@ -2060,6 +2122,8 @@ static RENC rp_begin_ex(int clear_only) {
         }
     }
     if (!any) { RED_ONCE(4, "渲染目标都建不出 MTLTexture"); return nil; }
+    if (oq_diag()) { id<MTLTexture> t = pd.depthAttachment.texture; g_oqp_dser = t && R.rt.depth ? R.rt.depth->serial : 0; g_oqp_dlv = (uint32_t)pd.depthAttachment.level; g_oqp_dsl = (uint32_t)pd.depthAttachment.slice;
+        g_oqp_dload = !t ? 0 : pd.depthAttachment.loadAction == MTLLoadActionLoad ? 1 : pd.depthAttachment.loadAction == MTLLoadActionClear ? 2 : 3; g_oqp_dfmt = t ? (uint16_t)t.pixelFormat : 0; }
     // 分层渲染：首绘程序的顶点阶段写层号时，没按视图选定单层的 3D / 数组附件整体挂上（renderTargetArrayLength = 各附件层数的最小值；
     // 任一附件是普通 2D 贴图则不分层）。顶点不写层号的通道照旧挂第 0 层 / 视图选的那一层
     // Layered rendering: when the vertex stage of the first draw's program writes the layer index, 3D / array attachments that the view did not pin to one layer are attached whole
@@ -4717,6 +4781,7 @@ static void ghost_flush(void) {   // 渲染通道结束前：把认到的图标�
     for (int i = 0; i < g_gh.n; i++) free(g_gh.c[i].S_); g_gh.n = 0;
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
+    if (g_oq_open) g_oqi.nd_seen++;
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     if (g_ruler_truth == 0) {   // 尺子负对照（DM_NVN_RULER_NEG=<片元键>）：被测模式下丢掉该着色器的绘制，尺子必须报不等价 | Ruler negative control (DM_NVN_RULER_NEG=<fragment key>): in the mode under test drop this shader's draws, and the ruler must report non-equivalence
@@ -4906,6 +4971,26 @@ frz_plain:;
         case 4: case 7: mp = MTLPrimitiveTypeTriangle; break; case 5: mp = MTLPrimitiveTypeTriangleStrip; break;
         default: RED_ONCE(19, "图元类型 %d 未实现", prim); return;
     }
+    if (oq_diag() && S.ds.dw && S.ds.dt && g_pass.hd) { g_oqw_ser = g_oqp_dser; g_oqw_lv = g_oqp_dlv; g_oqw_sl = g_oqp_dsl; }
+    if (g_oq_open) { oq_info *q = &g_oqi;
+        if (!q->nd) { q->dt = S.ds.dt; q->dw = S.ds.dw; q->df = S.ds.df; q->cull = S.poly.cull; q->front = S.poly.front; q->bias = (S.poly.offset_en & 4) != 0; q->hd = g_pass.hd; q->hs = g_pass.hs;
+            q->dser = g_oqp_dser; q->dlv = g_oqp_dlv; q->dsl = g_oqp_dsl; q->dload = g_oqp_dload; q->dfmt = g_oqp_dfmt;
+            q->dmatch = !g_oqw_ser ? 0 : g_oqw_ser == g_oqp_dser && g_oqw_lv == g_oqp_dlv && g_oqw_sl == g_oqp_dsl ? 1 : 2;
+            if (S.has_vp) memcpy(q->vp, S.vp[0], sizeof q->vp); q->dr[0] = S.dr[0]; q->dr[1] = S.dr[1];
+            q->frame = atomic_load(&g_cur_frame); q->nidx = dw ? dw->count : di->count;
+            { void *mb; uint64_t mo; int st = S.nattr ? S.attr[0].stream : -1;
+              if (st >= 0 && st < 16 && S.vbuf[st].address) { uint32_t n = S.vbuf[st].size > 256 ? 256 : (uint32_t)S.vbuf[st].size;
+                  if (mtl_addr(S.vbuf[st].address, n, &mb, &mo)) { q->vptr = (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo; q->vlen = n; q->vh = oq_hash(q->vptr, n); q->vpend = pend_hits(S.vbuf[st].address, n) ? 1 : 0;
+                      if (n >= 96 && S.stream[st].stride == 12) { float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f}; const float *fv = (const float *)q->vptr;   // 物体键：盒子尺寸（平移无关）+ 粗格中心 | Object key: box size (translation-invariant) + coarse center cell
+                          for (int k = 0; k < 8; k++) for (int c3 = 0; c3 < 3; c3++) { float x = fv[k * 3 + c3]; if (x < mn[c3]) mn[c3] = x; if (x > mx[c3]) mx[c3] = x; }
+                          int64_t kv[6]; for (int c3 = 0; c3 < 3; c3++) { kv[c3] = llroundf((mx[c3] - mn[c3]) * 10.0f); kv[3 + c3] = llroundf((mx[c3] + mn[c3]) * 0.5f / 300.0f); }
+                          q->okey = oq_hash((const uint8_t *)kv, sizeof kv); } } }
+              const p_bind_buf *u = &S.ubo[0][0];
+              if (u->addr && u->size) { uint32_t n = u->size > 4096 ? 4096 : (uint32_t)u->size;
+                  if (mtl_addr(u->addr, n, &mb, &mo)) { q->uptr = (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo; q->ulen = n; q->uh = oq_hash(q->uptr, n); q->upend = pend_hits(u->addr, n) ? 1 : 0; } }
+              u = &S.ubo[0][1];
+              if (u->addr && u->size >= 16 && mtl_addr(u->addr, 16, &mb, &mo)) { q->u1ptr = (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo; q->u1h = oq_hash(q->u1ptr, 16); q->u1pend = pend_hits(u->addr, 16) ? 1 : 0; } } }
+        q->nd++; if (!g_enc_has_vis) q->nd_novis++; if (q->pass != g_pass.serial) { q->npass++; q->pass = g_pass.serial; } }
     if (g_vis_counting) {   // 遮挡查询计数：本通道新槽（报告 / 清零后也换新槽） | Occlusion query counting: a new slot for this render pass (also switch to a new slot after a report / reset)
         if (!g_enc_has_vis) RED_ONCE(34, "遮挡查询计数开始时所在通道没挂可见性缓冲（首次清零发生在通道中途），该通道的采样不计");
         else {
@@ -4966,6 +5051,17 @@ frz_plain:;
     rr_snap(dw,di);
 #endif
     udc_note_draw(pr);
+    // DM_NVN_OQDIAG：查询绘制另画两次到额外槽——1 翻转剔除面（正面剔除 ↔ 背面剔除）2 关深度测试（= 包围盒在屏上的覆盖采样数）。无颜色 / 深度写的通道里只改可见性计数
+    // DM_NVN_OQDIAG: query draws are drawn twice more into extra slots - 1 flipped cull face (front <-> back), 2 depth test off (= the box's on-screen sample coverage). In a pass without color / depth writes this only changes visibility counts
+    int oq_cw = 0; for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i] && ((S.chmask.mask >> (4 * i)) & 0xf)) oq_cw = 1;
+    int oq_rep = oq_diag() && g_oq_open && g_vis_cur >= 0 && g_enc_has_vis && !S.ds.dw && !oq_cw && g_vis_n + 2 <= VIS_SLOTS && g_oqi.nx < 4 && (!g_oqi.xbuf || g_oqi.xbuf == (__bridge void *)g_vis) ? 3 : 1;
+    if (oq_rep == 1 && g_oq_open && oq_diag() && g_vis_cur >= 0) { static int n; if (n++ < 5) MLOG("DM_NVN_OQDIAG：查询绘制没加测（dw=%d cmask=%#x nx=%u）", (int)S.ds.dw, S.chmask.mask, g_oqi.nx); }
+    for (int oq_i = 0; oq_i < oq_rep; oq_i++) {
+    if (oq_i == 1) { if (!g_oqi.xbuf) g_oqi.xbuf = (void *)CFBridgingRetain(g_vis); g_oqi.xb[g_oqi.nx] = g_vis_n++; enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_oqi.xb[g_oqi.nx] * 8);
+        enc_r_cull(en, S.poly.cull == NVN_FACE_FRONT ? MTLCullModeBack : S.poly.cull == NVN_FACE_BACK ? MTLCullModeFront : MTLCullModeNone); }
+    if (oq_i == 2) { g_oqi.xc[g_oqi.nx] = g_vis_n++; g_oqi.nx++; enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_oqi.xc[g_oqi.nx - 1] * 8);
+        enc_r_cull(en, S.poly.cull == NVN_FACE_FRONT ? MTLCullModeFront : S.poly.cull == NVN_FACE_BACK ? MTLCullModeBack : MTLCullModeNone);
+        ds_st sv = S.ds; S.ds.dt = 0; S.ds.dw = 0; id<MTLDepthStencilState> alt = dss_get(g_pass.hd, g_pass.hs); S.ds = sv; enc_r_dss(en, alt); }
     // 0 个图元的绘制（游戏会发 count=0）不画任何像素，跳过编码；Metal 规定计数必须非零，校验层否则当场中止（营地 / 野外 / 战斗页实测）
     // A draw with 0 primitives (the game does send count=0) draws no pixels, so skip encoding; Metal requires the count to be non-zero, otherwise the validation layer aborts on the spot (measured on the camp / wilderness / combat pages)
     if (dw && prim == 7) {   // 四边形：共享索引 0,1,2,0,2,3 | Quads: shared indices 0,1,2,0,2,3
@@ -4989,6 +5085,8 @@ frz_plain:;
         if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ((__bridge id<MTLBuffer>)mb).length - mo,
                 (di->instances ? di->instances : 1) * gf, di->base_vertex, di->base_instance * gf); }
     }
+    }
+    if (oq_rep > 1) { enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_vis_cur * 8); enc_r_dss(en, g_enc_dss); }
     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
 }
 static nvn_hmap g_cps = {.klen = sizeof(void *)};
@@ -5579,7 +5677,8 @@ void mtl_exec(const uint8_t *p) {
             case OP_FENCE_SYNC: { uint64_t sp; memcpy(&sp, a, 8); sync_t *fs = (sync_t *)(uintptr_t)sp; fs->fenced = 1; fs->fence = g_fence + 1; break; }   // Blade：命令缓冲里的围栏 = 本次提交完成（提交时 ++g_fence） | Blade: fence inside a command buffer = this submission completes (++g_fence at commit)
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
-                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }
+                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { if (oq_diag()) { g_oqi.xsub = g_oqi.sub0 != g_fence + 1; uint64_t r2[2]; memcpy(r2, (const void *)ad, 16); g_oqi.pre_v = r2[0]; g_oqi.pre_t = r2[1]; g_oqi.enc_ticks = gpu_ticks(); g_oqi.enc_frame = atomic_load(&g_cur_frame); int pn = oqp_add(ad, 1); g_oqi.ovl = pn > 0 ? 1 : pn < 0 ? 2 : 0; } post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1;
+                    if (oq_diag()) { g_oq_open = 0; if (g_oqi.xbuf) CFRelease(g_oqi.xbuf); memset(&g_oqi, 0, sizeof g_oqi); } }
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); g_cnt_reset[t & 31]++; PD("Q reset type=%llu cmd=%p", (unsigned long long)t, p);
@@ -5587,7 +5686,8 @@ void mtl_exec(const uint8_t *p) {
 #ifdef NVN_RT_RANGE_TEST
                     rr_reset();
 #endif
-                    g_vis_on = 1; g_vis_counting = 1; vis_clear(); }
+                    g_vis_on = 1; g_vis_counting = 1; vis_clear();
+                    if (oq_diag()) { if (g_oqi.xbuf) CFRelease(g_oqi.xbuf); memset(&g_oqi, 0, sizeof g_oqi); g_oq_open = 1; g_oqi.sub0 = g_fence + 1; } }
                 break; }
             case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
                 PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); mtl_sub_copy(s_, d, n); break; }
