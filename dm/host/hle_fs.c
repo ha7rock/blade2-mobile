@@ -234,6 +234,9 @@ static Result err_res(const char *op, const char *path) {
     if (errno == EEXIST) return RES_PATH_EXISTS;
     LOG("fs %s %s 失败 errno=%d", op, path, errno); return RES_FAIL;
 }
+// 客体路径（"rom:/…"）→ 宿主文件路径，只读查找（不建）：给宿主自己打开游戏文件的剪口用（hle_movie.c 的视频解复用）。1 = 找到
+// Guest path ("rom:/...") -> host file path, read-only lookup (no creation): for cuts where the host opens a game file itself (video demux in hle_movie.c). 1 = found
+int dm_fs_host_path(const char *guest, char *out, size_t n) { PATH_LOCK(); return host_path(guest, out, n, NULL); }
 // 名字解析与创建/改名/列举同锁，别名与 xattr 对客体一起发布。
 // Name resolution shares one lock with create/rename/enumerate, aliases and xattr are published to the guest together.
 #define HP_EX(path, create) PATH_LOCK(); char hp[1024]; int ro = 0; if (!host_path_ex(path, hp, sizeof hp, &ro, create)) return err_res("path", path)

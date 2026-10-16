@@ -49,6 +49,7 @@ void dm_3d_scale_hot(int hot);      // 过热时把 3D 渲染比例降到 0.70�
 ssize_t dm_data_pread(int fd, void *buf, size_t n, off_t off);   // 资源档案的读：有「.holes」区段表的剔零档案按表换算（hle_fs.c） | Resource archive reads: zero-stripped archives with a ".holes" extent table are translated through the table (hle_fs.c)
 void dm_data_note_fd(int fd, const char *hostpath);
 int dm_overlay_file(const char *rel, char *out, size_t n);   // 覆盖层里的文件：DM_ROMFS_OVERLAY 可以有多层（冒号分隔，前面的优先），逐层找 <层>/<rel>，找到写进 out 返回 1（hle_fs.c） | File in the overlay: DM_ROMFS_OVERLAY may have several layers (colon-separated, earlier ones take priority); look for <layer>/<rel> layer by layer, and on a hit write it to out and return 1 (hle_fs.c)
+int dm_fs_host_path(const char *guest, char *out, size_t n);   // 客体路径（"rom:/…"）→ 宿主文件路径，只读查找，1 = 找到（hle_fs.c） | Guest path ("rom:/...") -> host file path, read-only lookup, 1 = found (hle_fs.c)
 void dm_set_opmode(int m);          // 变化时按游戏打开的开关推送通知 30 / 31 | On change, push notification 30 / 31 according to the switches the game has turned on
 // 焦点（1 前台 / 2 失焦 / 3 后台）：前端在生命周期变化时调，变化即推送通知 15
 // Focus (1 foreground / 2 focus lost / 3 background): called by the front end on lifecycle changes; a change pushes notification 15
