@@ -204,3 +204,5 @@ DM_OUT=$O dm/ios/blade/run.sh build && dm/ios/blade/run.sh install && dm/ios/bla
 - **Ryujinx**（Ryubing，MIT）：`dm/third_party/ryujinx` 原样携带其着色器翻译器，把 Switch 着色器翻成 SPIR-V。| Its shader translator is bundled unchanged in `dm/third_party/ryujinx` to translate Switch shaders to SPIR-V.
 - **deko3d**（zlib）：块线性贴图布局算法的出处。| Source of the block-linear texture layout algorithm.
 - **spirv-cross**（Apache-2.0）、**libdeflate**（MIT）、**NVIDIA FLIP**（BSD）：按各自许可证使用。| Used under their respective licenses.
+
+| 闪烁 / 抖动（Mac 窗口，2026-10-16 收口） | 三个独立原因叠加，分别有数据：① 串流 / 电视把显示器报成 30 Hz，60 帧游戏每帧只能显示半拍 → 整局 33 ms 一帧；② 出图走显示回调路径时，系统有其它负载（虚拟机、构建、浏览器）回调整秒不来，宿主的兜底（丢排队帧、重出旧帧、空 drawable）就是黑闪；③ 没见过的着色器被跳过绘制，物体整个变黑，看起来像闪。 | ① 出图帧率按窗口所在屏幕的刷新率取整除档（30 Hz 屏 → 30，120 Hz → 60）；② Mac 缺省改为出图线程自取 drawable（`DM_PRESENT_LINK=0`），垂直同步交给 CAMetalLayer；③ App 缺省把没见过的着色器转储到应用支持目录，`tools/shaders_iterate.sh` 补进映射表。三项都做完后：60 Hz 与 120 Hz 的 HDMI 显示器上通关第一关均无闪烁（玩家实测）。120 Hz 下理论上仍有「1 拍 / 3 拍交替」的微抖（递交未锁到刷新格点），实测不可察觉，留作后续。 |
