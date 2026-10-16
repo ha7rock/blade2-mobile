@@ -1113,14 +1113,15 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 | 
 // Present is fixed at 60 Hz: the adaptive mechanism stepped down at frame 60 in 24/24 real-device logs and never came back up, so for this phase 60 fps is the hard floor.
 // DM_PRESENT_HZ=0 (uncapped frame rate) serves only as an explicit performance profiling switch: some of the game's UI logic counts frames (with the same save, uncapped gives
 // 4181 SaveIndicatorPanel entries and capped at 60 fps gives 0, which matches the ground truth), so uncapped is a semantically wrong way to run and must not be used as a criterion / cross-check / default. Unit tests set it directly with nvn_present_config
-static int g_hz = -1, g_display_mode;
+static int g_hz = -1, g_display_mode, g_hz_auto;   // g_hz_auto：有窗口、没用 DM_PRESENT_HZ 钉住——帧率跟着窗口所在屏的刷新率取整除档（每帧重读，换屏即换） | g_hz_auto: window present and not pinned by DM_PRESENT_HZ: the frame rate follows the evenly dividing tier of the screen the window is on (re-read every frame)
+double mtl_display_refresh(void); double dm_pace_hz(double screen_hz, double floor_hz);
 void nvn_present_config(int hz, int display_mode) { g_hz = hz; g_display_mode = display_mode; }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
     // With a window the default is still display interval mode; without a window the default is game mode. Environment variables can override the fixed 60 Hz.
     int scr = mtl_display_hz();
-    const char *e = getenv("DM_PRESENT_HZ"); g_hz = e ? atoi(e) : 60;
+    const char *e = getenv("DM_PRESENT_HZ"); g_hz = e ? atoi(e) : 60; g_hz_auto = !e && scr > 0;
     if (!g_hz) LOG("[nvn] 【警告】DM_PRESENT_HZ=0：不限帧率，帧节奏非真机，界面逻辑可能偏离（仅供性能剖析，不能用于判据 / 对拍）");
     // 剪口（有意偏离原版行为）：DM_PRESENT_INTERVAL=display 时不按游戏设的出图间隔，每个节拍出一帧，
     // 固定 60 帧硬底；逻辑 25 拍不变，且客户端按帧计数的界面逻辑不受影响——
@@ -1136,8 +1137,8 @@ static void present_cfg(const win_t *o) {
 }
 static uint64_t present_period(const win_t *o) {
     present_cfg(o);
-    int itv = g_display_mode ? 1 : o->interval > 0 ? o->interval : 1, hz = g_hz;
-    return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    int itv = g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; double hz = g_hz_auto ? dm_pace_hz(mtl_display_refresh(), 60) : g_hz;
+    return hz > 0 ? (uint64_t)(itv * 1e9 / hz) : 0;
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {

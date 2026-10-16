@@ -6155,6 +6155,25 @@ static _Atomic uint64_t g_drawable_ns;   // 出图里等 nextDrawable 的累计�
 uint64_t mtl_drawable_ns_take(void) { return atomic_exchange(&g_drawable_ns, 0); }
 // 有窗口时屏幕的最高刷新率（Hz）；无窗口返回 0。Mac 用 CoreGraphics 显示模式（线程安全的 C 接口，出图配置在游戏线程上读）
 // Maximum refresh rate (Hz) of the screen when there is a window; returns 0 without a window. Mac uses CoreGraphics display modes (thread-safe C interface; the present configuration is read on the game thread)
+#include "nvn_pace.h"
+// 窗口所在屏的刷新率（前端 front_display_refresh 给；没有前端时取主屏）与出图帧率档：刷新率的整数分之一里不低于目标（60 / 省电 30）的最小一档——
+// 每帧在屏上停整数个刷新周期，没有交替抖动。60 / 120 Hz 屏 → 60；144 → 72；**30 Hz 屏（电视）→ 30**：固定按 60 出图时每帧只能显示半个周期，系统把最短显示时长凑成两拍，
+// 游戏节拍器又按 60 排，结果整局 33 ms 一帧、每帧都记掉帧，看起来是「闪 / 抖」（2026-10-16 实测：窗口在 30 Hz 的「Mi TV」上）。移植自上游 d2r-mobile 44a6770
+// Refresh rate of the screen the window is on (from the front end's front_display_refresh; main display without a front end) and the present-rate tier: the smallest integer fraction of the refresh
+// rate not below the target (60 / power-saving 30) -- each frame stays an integer number of refreshes, no alternating judder. 60 / 120 Hz → 60; 144 → 72; **30 Hz screen (TV) → 30**: presenting at a fixed 60
+// shows each frame for half a refresh, the system rounds the minimum display duration up to two refreshes while the game pacer still schedules at 60: 33 ms per frame all game long, every frame counted
+// as dropped, perceived as flicker / judder (measured 2026-10-16: window on the 30 Hz "Mi TV"). Ported from upstream d2r-mobile 44a6770
+__attribute__((weak)) double front_display_refresh(char *name, size_t n) { if (name && n) *name = 0; return 0; }
+double mtl_display_refresh(void) {
+    double hz = front_display_refresh(NULL, 0); if (hz > 0) return hz;
+#if TARGET_OS_OSX
+    CGDisplayModeRef m = CGDisplayCopyDisplayMode(CGMainDisplayID()); hz = m ? CGDisplayModeGetRefreshRate(m) : 0; if (m) CGDisplayModeRelease(m); return hz;
+#else
+    static double cached; if (cached <= 0) { Class c = NSClassFromString(@"UIScreen"); id sc = c ? [c valueForKey:@"mainScreen"] : nil; cached = sc ? [[sc valueForKey:@"maximumFramesPerSecond"] doubleValue] : 0; } return cached;
+#endif
+}
+double dm_pace_hz(double screen_hz, double floor_hz) { return nvn_pace_hz(screen_hz, floor_hz); }
+double mtl_pace_hz(void) { return dm_pace_hz(mtl_display_refresh(), mtl_fps_target() == 30 ? 30 : 60); }
 int mtl_display_hz(void) {
     if (!front_metal_layer()) return 0;
 #if TARGET_OS_OSX
@@ -6566,7 +6585,9 @@ static void present_repeat(id<CAMetalDrawable> dr) {   // 空节拍：把上一�
 static CAMetalDisplayLink *g_link; static CFRunLoopRef g_link_rl; static int g_link_started;
 static int g_link_owns_layer, g_classic_busy;   // 持 g_pq_mu：图层挂着节拍对象期间 nextDrawable 会抛异常，自取 drawable 的出图线程与节拍对象互斥 | Under g_pq_mu: nextDrawable throws while the layer has the display link object attached, so the present thread that takes its own drawable and the display link object are mutually exclusive
 static int link_on(void) { return g_dm_present_link && g_link != nil; }
-static CAFrameRateRange link_range(int mode) { return mode == 3 ? CAFrameRateRangeMake(30, 30, 30) : mode == 2 ? CAFrameRateRangeMake(60, 120, 120) : CAFrameRateRangeMake(60, 60, 60); }
+static CAFrameRateRange link_range(int mode) {   // 1 / 3 按屏幕刷新率选整除的那一档（mtl_pace_hz）；2 不变 | 1 / 3 pick the evenly dividing tier by screen refresh rate (mtl_pace_hz); 2 unchanged
+    if (mode == 2) return CAFrameRateRangeMake(60, 120, 120);
+    float r = (float)mtl_pace_hz(); return CAFrameRateRangeMake(r, r, r); }
 static int g_link_mode = 1;   // 节拍对象当前的模式：1 / 2 同 g_dm_present_link，3 = 省电模式 30 Hz | Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
 static void *link_main(void *arg) {   // 显示节拍线程：切到节拍模式时起，切回 0 时退出 | Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;

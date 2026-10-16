@@ -5,6 +5,7 @@
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−.
 #import <Cocoa/Cocoa.h>
+#include <pthread.h>
 #include <sys/sysctl.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
@@ -22,6 +23,24 @@ void dm_touch_host_live_enable(void); void dm_touch_host_live(int op, float nx, 
 static int g_live;   // App 形态（或 DM_TOUCH_LIVE=1）：鼠标进我们的触屏状态机；否则照旧当原版触摸屏的一个触点 | App form (or DM_TOUCH_LIVE=1): the mouse goes into our touch state machine; otherwise it stays a single touch point of the original touch screen as before
 static CAMetalLayer *g_layer;
 static NSWindow *g_win;
+
+// 窗口所在那块屏的名字与刷新率（主线程读 AppKit，存一份给出图线程）：出图节拍按它选整除的帧率（nvn_mtl.m mtl_pace_hz）。窗口换屏、屏幕参数变时重读。
+// 刷新率取显示模式的值，读不到（0）时取屏幕的最高帧率。移植自上游 d2r-mobile 44a6770
+// Name and refresh rate of the screen the window is on (read from AppKit on the main thread, a copy kept for the present thread): present pacing picks an evenly dividing frame rate from it
+// (nvn_mtl.m mtl_pace_hz). Re-read when the window moves to another screen or screen parameters change. The refresh rate comes from the display mode, falling back to the screen's maximum frame rate. Ported from upstream 44a6770
+static pthread_mutex_t g_scr_mu = PTHREAD_MUTEX_INITIALIZER; static double g_scr_hz; static char g_scr_name[128];
+static void screen_note(void) {
+    NSScreen *sc = g_win.screen ?: NSScreen.mainScreen; if (!sc) return;
+    CGDirectDisplayID id_ = [sc.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+    CGDisplayModeRef m = CGDisplayCopyDisplayMode(id_); double hz = m ? CGDisplayModeGetRefreshRate(m) : 0; if (m) CGDisplayModeRelease(m);
+    if (hz <= 0) hz = (double)sc.maximumFramesPerSecond;
+    pthread_mutex_lock(&g_scr_mu); int same = hz == g_scr_hz && !strcmp(g_scr_name, sc.localizedName.UTF8String ?: "");
+    g_scr_hz = hz; snprintf(g_scr_name, sizeof g_scr_name, "%s", sc.localizedName.UTF8String ?: "?"); pthread_mutex_unlock(&g_scr_mu);
+    if (!same) LOG("屏幕：%s，刷新率 %.2f Hz（最高 %ld 帧）→ 出图按整除档", g_scr_name, hz, (long)sc.maximumFramesPerSecond);
+}
+double front_display_refresh(char *name, size_t n) {
+    pthread_mutex_lock(&g_scr_mu); double hz = g_scr_hz; if (name && n) snprintf(name, n, "%s", g_scr_name); pthread_mutex_unlock(&g_scr_mu); return hz;
+}
 static NSView *g_view;
 // 窗口不是 16:9（拉伸窗口、全屏到 16:10 的屏）：游戏画面保持 16:9 居中，四周留黑边；鼠标位置按游戏画面这一块算
 // The window is not 16:9 (stretched window, full screen on a 16:10 display): the game picture stays 16:9 and centred with black bars around it; the mouse position is computed against the game picture
@@ -179,6 +198,9 @@ void front_run(void (*guest)(void)) {
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
         win.title = @APP_NAME; win.restorable = NO; g_win = win;
+        screen_note();   // 出图节拍按窗口所在屏的刷新率取档（30 Hz 电视 → 30） | present pacing follows the refresh rate of the screen the window is on (30 Hz TV → 30)
+        [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidChangeScreenNotification object:win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n_) { (void)n_; screen_note(); }];
+        [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n_) { (void)n_; screen_note(); }];
         if (getenv("DM_WINDOW_TOP")) win.level = NSFloatingWindowLevel;   // DM_WINDOW_TOP=1：窗口置顶（自动化测试时不被别的窗口盖住——被盖住时显示节拍降到 1 Hz） | DM_WINDOW_TOP=1: keep the window on top (automated tests must not be occluded: an occluded window drops the display link to 1 Hz)
         NSView *v = win.contentView; g_view = v;
         v.wantsLayer = YES; v.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
