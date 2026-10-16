@@ -133,6 +133,12 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         // 同理缺省记录贴图事实（着色器每个贴图寄存器在运行时真正绑定的贴图类型：2D / 立方 / 3D / 数组）：没有配对 PC 反射的着色器翻译时只能按 2D 猜，
         // 猜错的寄存器采样出全零（Boss 斗篷一类材质发黑）；记录下来后下一轮迭代按事实出 | Likewise record texture facts by default (the texture type really bound to each texture register at runtime: 2D / cube / 3D / array):
         // shaders without paired PC reflection can only be translated with a 2D guess, and a wrongly guessed register samples zeros (materials such as the boss cloak turn black); recorded, the next iterate uses the facts
+        // 画面触发器缺省开：每帧把游戏画面回读成 64x36 小图（回读编在出图命令缓冲里，几乎不占 CPU），某块「突变又恢复」(A-B-A) 就把三帧小图和接下来两帧全尺寸截图存到应用支持目录 glitch/（每局最多 6 次）。
+        // 逐帧亮度行不落盘（/dev/null）。玩家报「闪」时不必复现，直接看这些图定性 | Picture trigger on by default: each frame the game picture is read back as a 64x36 thumbnail (the readback is encoded in the present command buffer, near-zero CPU);
+        // a block that jumps and reverts (A-B-A) saves the three thumbnails and full-size screenshots of the next two frames to glitch/ under Application Support (at most 6 per session). Per-frame luminance lines are not kept (/dev/null).
+        // When the player reports "flicker" there is no need to reproduce it: these pictures classify it
+        if (!getenv("DM_NVN_REGLUM")) setenv("DM_NVN_REGLUM", "0,0,1,1:/dev/null", 1);
+        if (!getenv("DM_NVN_GLITCH")) { NSString *gd = [sup stringByAppendingPathComponent:@"glitch"]; [fm createDirectoryAtPath:gd withIntermediateDirectories:YES attributes:nil error:NULL]; setenv("DM_NVN_GLITCH", gd.fileSystemRepresentation, 1); }
         if (!getenv("DM_NVN_TEXFACTS")) { NSString *tfp = [sup stringByAppendingPathComponent:@"texfacts.tsv"]; setenv("DM_NVN_TEXFACTS", tfp.fileSystemRepresentation, 1); }
         if (!getenv("DM_PSO_MANIFEST")) setenv("DM_PSO_MANIFEST", "off", 1);
         if (!getenv("DM_NVN_TBDR")) setenv("DM_NVN_TBDR", "0", 1);
