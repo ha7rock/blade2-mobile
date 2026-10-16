@@ -46,4 +46,4 @@ cat > "$APP/Contents/Info.plist" <<PL
 </dict></plist>
 PL
 codesign --force --sign - --deep "$APP" > /dev/null 2>&1 || { echo "🔴 签名失败"; exit 3; }
-echo "✅ $APP（$(du -sh "$APP" | cut -f1)）：双击启动，第一次选游戏资源文件夹 Update/RomFS"
+echo "✅ ${APP}（$(du -sh "$APP" | cut -f1)）：双击启动，第一次选游戏资源文件夹 Update/RomFS"
