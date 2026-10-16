@@ -62,7 +62,17 @@ static class SwshXlate
         {
             int slot = TexSlot(handle, cbufSlot);
             string t = slot >= 0 ? Get("tex", slot) ?? Get("img", slot) : null;
-            if (t == null) { Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 2D"); return SamplerType.Texture2D; }
+            if (t == null)
+            {
+                // 没有任何类型事实时的缺省按阶段分：顶点着色器按「缓冲贴图」——UE4 顶点阶段取的只有缓冲（蒙皮骨骼矩阵、实例数据、形变目标），Blade 记录到的顶点阶段事实
+                // 全是 buffer / 3d / cube，按 2D 猜会让骨骼矩阵读成 0、死亡动画的敌人缩成一团黑；Ryujinx 自己对无法知道类型的 1D 取样也默认缓冲。像素阶段仍按 2D（采样指令自带维度，缺省只影响少数查询）
+                // Stage-aware default when no type fact exists: vertex shaders default to "texture buffer" -- the UE4 vertex stage only fetches buffers (skinning bone matrices, instance data, morph targets);
+                // every vertex-stage fact recorded for Blade is buffer / 3d / cube, and a 2D guess reads bone matrices as 0 so a dying enemy collapses into a black lump; Ryujinx itself assumes buffer for 1D fetches of unknown type.
+                // The pixel stage keeps 2D (sampling instructions carry their own dimension; the default only affects a few queries)
+                bool vs = _job["stage"] is JsonNode sn && (string)sn == "vs";
+                Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 {(vs ? "缓冲（顶点阶段缺省）" : "2D")}");
+                return vs ? SamplerType.TextureBuffer : SamplerType.Texture2D;
+            }
             return t switch
             {
                 "1d" => SamplerType.Texture1D, "1darray" => SamplerType.Texture1D | SamplerType.Array,
