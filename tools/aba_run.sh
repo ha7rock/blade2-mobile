@@ -9,6 +9,11 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 TAG=${1:?tag}; RS=${2:-55}; RD=${3:-60}; WATCH=${4:-120}
 W=$HOME/blade2-work; APP="$W/out/macapp/Blade II.app"; O=$W/run/aba/$TAG
 CROP=${ABA_CROP:-2560:1400:640:248}
+# One game instance at a time (two agents share this Mac; a second instance kills / perturbs the first): mkdir lock ~/blade2-work/run/gpu.lock, stale lock (dead pid) removed
+LK=$W/run/gpu.lock
+while ! mkdir "$LK" 2>/dev/null; do p=$(cat "$LK/pid" 2>/dev/null); if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LK"; continue; fi; sleep 3; done
+echo $$ > "$LK/pid"; echo "$TAG" > "$LK/tag"; trap 'rm -rf "$LK"' EXIT
+while pgrep -x BladeII > /dev/null; do sleep 3; done   # an instance started without the lock (older script): let it finish
 rm -rf "$O"; mkdir -p "$O"
 caffeinate -dimsu -t $((WATCH + 30)) &   # display sleep stops the display link (1 Hz) and ends screencapture early
 CAF=$!
