@@ -6,6 +6,8 @@
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <dlfcn.h>
+#import <objc/runtime.h>
+static void al_install(void);   // 分配账 | allocation ledger
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
@@ -353,6 +355,7 @@ void mtl_init(void) {
     if (latency && atoi(latency) > 0) g_present_latency = atoi(latency);
     g_res_check_on = getenv("DM_RES_CHECK") != NULL;
     g_dev = MTLCreateSystemDefaultDevice();
+    if (g_dev) al_install();   // 分配账（见 res_census 上方） | allocation ledger (see above res_census)
     if (!g_dev) MDIE("没有 Metal 设备");
     if (!g_dev.hasUnifiedMemory) MDIE("需要统一内存设备（零拷贝内存池）");
     g_q = [g_dev newCommandQueue];
@@ -1633,6 +1636,55 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred release queue, residency set object count, registered memory pool count / peak / tracking table capacity, cumulative texture re-uploads, game heap total / free / largest allocatable block (host dm_guest_heap_stat), and how far from the system memory limit (iOS only).
 // Purpose: to pin down "crashes with no log" -- the system gives no notice before killing a process for memory, and only readouts left beforehand can show which number kept climbing.
 // Called by the frame hook every 300 frames; printed when resident or GPU allocated changed by >= 64 MB, or game heap free space or largest allocatable block changed by >= 16 MB (the main heap normally has only about 100 MB left), otherwise one line every 3000 frames; capped at 400 lines per run. All integers (the frame hook runs on the small stack of a guest thread, so no floating-point formatting)
+// ---------- 分配账（诊断常开，开销极小） ----------
+// 给 Metal 设备对象的 newBufferWithLength / newBufferWithBytes / newBufferWithBytesNoCopy / newTextureWithDescriptor 换上计数版：按调用点（返回地址）累计次数与字节。
+// 内存读数行打出时同时打一行「分配账」：本段新建字节、各命令分配器占用、新建最多的前 6 个调用点。用途：显存只涨不落时直接看是谁在建（2026-10-17：窗口失焦后显存每秒涨 300 MB、7 分钟到 24 GB 被看门狗杀，驻留集对象数却不变）
+// ---------- Allocation ledger (always-on diagnostic, negligible cost) ----------
+// The Metal device's newBufferWithLength / newBufferWithBytes / newBufferWithBytesNoCopy / newTextureWithDescriptor are replaced with counting versions: count and bytes per call site (return address).
+// Whenever the memory line is printed, an "allocation ledger" line follows: bytes created in this period, command allocator usage, the 6 call sites that created the most. Purpose: when GPU memory only grows, see directly who creates it
+// (2026-10-17: after the window lost focus, GPU memory grew 300 MB/s and reached 24 GB in 7 minutes, killed by the watchdog, while the residency set object count stayed flat)
+typedef struct { void *site; uint64_t n, bytes, n_last, bytes_last; } al_site;
+static al_site g_al[128]; static int g_al_n; static pthread_mutex_t g_al_mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_al_total, g_al_total_last;
+static void al_note(void *site, uint64_t bytes) {
+    pthread_mutex_lock(&g_al_mu); g_al_total += bytes;
+    int i; for (i = 0; i < g_al_n; i++) if (g_al[i].site == site) break;
+    if (i == g_al_n && g_al_n < 128) g_al[g_al_n++] = (al_site){site, 0, 0, 0, 0};
+    if (i < g_al_n) { g_al[i].n++; g_al[i].bytes += bytes; }
+    pthread_mutex_unlock(&g_al_mu);
+}
+static id (*g_al_nb)(id, SEL, NSUInteger, MTLResourceOptions);
+static id al_nb(id self, SEL c, NSUInteger n, MTLResourceOptions o) { id r = g_al_nb(self, c, n, o); al_note(__builtin_return_address(0), n); return r; }
+static id (*g_al_nbb)(id, SEL, const void *, NSUInteger, MTLResourceOptions);
+static id al_nbb(id self, SEL c, const void *p, NSUInteger n, MTLResourceOptions o) { id r = g_al_nbb(self, c, p, n, o); al_note(__builtin_return_address(0), n); return r; }
+static id (*g_al_nbnc)(id, SEL, void *, NSUInteger, MTLResourceOptions, id);
+static id al_nbnc(id self, SEL c, void *p, NSUInteger n, MTLResourceOptions o, id d) { id r = g_al_nbnc(self, c, p, n, o, d); al_note(__builtin_return_address(0), n); return r; }
+static id (*g_al_nt)(id, SEL, MTLTextureDescriptor *);
+static id al_nt(id self, SEL c, MTLTextureDescriptor *d) { id r = g_al_nt(self, c, d); al_note(__builtin_return_address(0), r ? (uint64_t)[(id<MTLTexture>)r allocatedSize] : 0); return r; }
+static void al_install(void) {
+    Class k = [g_dev class];
+#define AL_SW(sel_, fn_, var_) { Method m_ = class_getInstanceMethod(k, @selector(sel_)); if (m_) var_ = (void *)method_setImplementation(m_, (IMP)fn_); else MLOG("分配账：设备类没有 %s", #sel_); }
+    AL_SW(newBufferWithLength:options:, al_nb, g_al_nb)
+    AL_SW(newBufferWithBytes:length:options:, al_nbb, g_al_nbb)
+    AL_SW(newBufferWithBytesNoCopy:length:options:deallocator:, al_nbnc, g_al_nbnc)
+    AL_SW(newTextureWithDescriptor:, al_nt, g_al_nt)
+#undef AL_SW
+}
+static void al_report(unsigned long long frame) {
+    char line[1200]; int o = 0; int idx[128];
+    pthread_mutex_lock(&g_al_mu);
+    for (int i = 0; i < g_al_n; i++) idx[i] = i;
+    for (int i = 0; i < g_al_n; i++) for (int j = i + 1; j < g_al_n; j++) if (g_al[idx[j]].bytes - g_al[idx[j]].bytes_last > g_al[idx[i]].bytes - g_al[idx[i]].bytes_last) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    for (int k = 0; k < g_al_n && k < 6 && o < (int)sizeof line - 160; k++) { al_site *a = &g_al[idx[k]]; uint64_t db = a->bytes - a->bytes_last, dn = a->n - a->n_last; if (!dn) break;
+        Dl_info di; const char *nm = "?"; unsigned long off = 0; if (dladdr(a->site, &di) && di.dli_sname) { nm = di.dli_sname; off = (unsigned long)((const char *)a->site - (const char *)di.dli_saddr); }
+        o += snprintf(line + o, sizeof line - o, " %s+%#lx：%llu 次 %.1f MB；", nm, off, (unsigned long long)dn, db / 1048576.0); }
+    for (int i = 0; i < g_al_n; i++) { g_al[i].n_last = g_al[i].n; g_al[i].bytes_last = g_al[i].bytes; }
+    uint64_t tot = g_al_total - g_al_total_last; g_al_total_last = g_al_total;
+    pthread_mutex_unlock(&g_al_mu);
+    uint64_t asz = 0; for (int i = 0; i < g_alloc_n; i++) if (g_alloc4[i]) asz += g_alloc4[i].allocatedSize;
+    uint64_t usz = 0, psz = 0; for (int i = 0; i < 3; i++) { if (g_up_alloc4[i]) usz += g_up_alloc4[i].allocatedSize; if (g_present_alloc4[i]) psz += g_present_alloc4[i].allocatedSize; }
+    for (int i = 0; i < 2; i++) if (g_rep_alloc4[i]) psz += g_rep_alloc4[i].allocatedSize;
+    MLOG("分配账 至帧 %llu：本段新建 %.1f MB；命令分配器 主 %llu 个 %.1f MB / 上传 %.1f MB / 出图 %.1f MB；新建最多：%s", frame, tot / 1048576.0, (unsigned long long)g_alloc_n, asz / 1048576.0, usz / 1048576.0, psz / 1048576.0, o ? line : " 无");
+}
 static void res_census(unsigned long long frame, unsigned long long rss_mb) {
     @autoreleasepool {
         unsigned long nl[2] = {0, 0}, nr[2] = {0, 0}; unsigned long long bl[2] = {0, 0}, br[2] = {0, 0};   // [0] 贴图 [1] 缓冲；l = 在驻留集里，r = 已退役未销毁 | [0] textures [1] buffers; l = in the residency set, r = retired but not destroyed
@@ -1661,6 +1713,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb, int heap_
 #endif
     MLOG("内存 至帧 %llu：常驻 %llu MB，显卡已分配 %llu MB，延迟释放队列 %lu，驻留集 %lu 个，内存池 %d 个（峰值 %d / 跟踪表容量 %d），贴图重传累计 %llu 次；游戏堆 %llu MB，余量 %llu MB，最大可分配块 %llu KB%s；离系统内存上限还有 %s", frame, rss_mb, gpu, nd, nr, live, peak, cap, (unsigned long long)g_pkg_reuploads,
         heap_mb, heap_free_mb, heap_maxblk_kb, heap_ok ? "" : "（未读到）", avail);
+    al_report(frame);
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }

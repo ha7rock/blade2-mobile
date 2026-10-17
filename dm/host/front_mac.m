@@ -227,7 +227,8 @@ void front_run(void (*guest)(void)) {
           { NSMenu *hm = add(ui("dmAppMenuHelp")); [[hm addItemWithTitle:@(ui("dmAppKeysTitle")) action:@selector(keys:) keyEquivalent:@""] setTarget:ctl]; [[hm addItemWithTitle:@(ui("dmAppShareLog")) action:@selector(share:) keyEquivalent:@""] setTarget:ctl]; }
           NSApp.mainMenu = bar; }
         { void dm_gamepad_start(void (*on_mode)(int pad)); dm_gamepad_start(NULL); }   // 手柄（与 iOS 壳共用 ios/Sources/dm_gamepad.m）：连上即用，与键盘并存 | Gamepad (ios/Sources/dm_gamepad.m, shared with the iOS shell): works as soon as it is connected, alongside the keyboard
-        if (back) [win orderBack:nil]; else { [win makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; }
+        if (getenv("DM_WINDOW_HIDE")) [win orderOut:nil];   // DM_WINDOW_HIDE=1（诊断）：窗口根本不上屏，复现「窗口被完全盖住」时的出图行为（失焦后显存每秒涨 300 MB 的那局） | DM_WINDOW_HIDE=1 (diagnostic): the window is never put on screen, reproducing the present behaviour of a fully covered window (the session whose GPU memory grew 300 MB/s after losing focus)
+        else if (back) [win orderBack:nil]; else { [win makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; }
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // 只吃游戏窗口的键；软键盘输入框等其他窗口照常收字 | Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.modifierFlags & NSEventModifierFlagCommand) return e;   // 带 ⌘ 的留给菜单（⌘Q、⌃⌘F） | Keys with ⌘ are left to the menu (⌘Q, ⌃⌘F)
