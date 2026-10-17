@@ -40,6 +40,7 @@
 #include <mach/thread_policy.h>
 #include <assert.h>
 #include <stdatomic.h>
+static uint64_t g_sync_wait_ns; static unsigned g_sync_wait_n;   // 定义见帧账环 | defined at the frame ledger ring
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 
@@ -394,7 +395,8 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     if (mtl_wait(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    return mtl_wait(o->fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    uint64_t w0 = now_ns(); int ok = mtl_wait(o->fence, timeout); g_sync_wait_ns += now_ns() - w0; g_sync_wait_n++;   // 帧账：阻塞等待计入本帧 | frame ledger: blocking wait charged to this frame
+    return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
@@ -437,7 +439,7 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; uint64_t w0 = now_ns(); mtl_finish(); g_sync_wait_ns += now_ns() - w0; g_sync_wait_n++; }
 
 // ---------- 命令缓冲：录进游戏的命令内存，提交时执行 CPU 可见副作用 ----------
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
@@ -981,6 +983,28 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 #define LFN 16
 typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
+// 帧账环（常开、无开销）：最近 FRN 帧每帧的 绘制数 / 通道数 / 三类等待（取图节拍、出图队列、同步对象）/ 遮挡查询结果（结果 0 与非零的报告数，按提交时所属帧记）。
+// 画面触发器（nvn_mtl.m，REGLUM 处）命中时 nvn_fr_mark(错帧) → 9 帧后（GPU 时间到齐）把错帧前 6 帧到后 2 帧打成 [帧账] 行；另每 300 帧打一行汇总（站着不动时绘制数该不变：变了 = CPU 侧没画，没变而画面错 = GPU 侧画错）。
+// Frame ledger ring (always on, no cost): for each of the last FRN frames, draws / passes / three kinds of waits (acquire pacing, present queue, sync objects) / occlusion-query results (reports with result 0 vs nonzero, attributed to the frame of the submit).
+// When the picture trigger (nvn_mtl.m, at REGLUM) fires, nvn_fr_mark(bad frame) → 9 frames later (GPU times complete) the frames from 6 before to 2 after the bad one are logged as [帧账] lines; a summary line is logged every 300 frames
+// (standing still the draw count should not change: changed = the CPU side did not draw, unchanged while the picture is wrong = the GPU side drew it wrong).
+#define FRN 512
+typedef struct { uint64_t f; double t_s, fr, nv, acq_ms, pq_ms, sync_ms; unsigned passes, draws, sync_n; _Atomic unsigned oq_z, oq_nz; } fr_rec;
+static fr_rec g_frr[FRN];
+static _Atomic uint64_t g_fr_dump_at, g_fr_dump_b;
+void nvn_fr_oq(uint64_t f, int zero) { fr_rec *r = &g_frr[f % FRN]; if (zero) atomic_fetch_add(&r->oq_z, 1); else atomic_fetch_add(&r->oq_nz, 1); }
+void nvn_fr_mark(uint64_t frame_b) { uint64_t z = 0; if (atomic_compare_exchange_strong(&g_fr_dump_at, &z, frame_b + 9)) atomic_store(&g_fr_dump_b, frame_b); }
+static void fr_dump(uint64_t b, uint64_t upto) {
+    for (uint64_t k = b > 6 ? b - 6 : 1; k <= b + 2 && k <= upto; k++) { const fr_rec *r = &g_frr[k % FRN]; if (r->f != k) continue; double g = mtl_gpu_ms(k);
+        LOG("[帧账] %s帧 %llu（%.2f s）整帧 %.1f ms，提交+出图 %.1f ms，GPU %.1f ms；通道 %u，绘制 %u；等待 取图 %.1f / 队列 %.1f / 同步 %.1f ms（%u 次）；遮挡查询 结果0 %u / 非零 %u", k == b ? "★" : "　", (unsigned long long)k, r->t_s, r->fr, r->nv, g, r->passes, r->draws, r->acq_ms, r->pq_ms, r->sync_ms, r->sync_n, atomic_load(&r->oq_z), atomic_load(&r->oq_nz)); }
+}
+static int ucmp(const void *a, const void *b) { unsigned x = *(const unsigned *)a, y = *(const unsigned *)b; return x < y ? -1 : x > y; }
+static void fr_summary(uint64_t f) {
+    unsigned d[300], n = 0, pmin = ~0u, pmax = 0, oz = 0, onz = 0; double sy = 0, symax = 0;
+    for (uint64_t k = f > 300 ? f - 299 : 1; k <= f; k++) { const fr_rec *r = &g_frr[k % FRN]; if (r->f != k) continue; d[n++] = r->draws; if (r->passes < pmin) pmin = r->passes; if (r->passes > pmax) pmax = r->passes; oz += atomic_load(&r->oq_z); onz += atomic_load(&r->oq_nz); sy += r->sync_ms; if (r->sync_ms > symax) symax = r->sync_ms; }
+    if (!n) return; qsort(d, n, sizeof *d, ucmp);
+    LOG("[nvn] 帧账 至帧 %llu：每帧绘制 最少 %u / 中位 %u / 最多 %u，通道 %u–%u，遮挡查询 结果0 %u / 非零 %u，同步等待 合计 %.1f ms / 单帧最大 %.1f ms（%u 帧）", (unsigned long long)f, d[0], d[n / 2], d[n - 1], pmin, pmax, oz, onz, sy, symax, n);
+}
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[长帧] %s", what); }   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
 static const char *const g_tname[6] = {"帧时间", "出帧工作", "NVN 提交+出图", "GPU", "翻译层录制期", "翻译层提交期"};
@@ -1190,6 +1214,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             trow(f, "@call_ms", (t0 - g_t0_ns) / 1e6);
         }
         trow(f, "@passes", (double)(ps - prev_pass)); trow(f, "@draws", (double)(dr - prev_draw));
+        { fr_rec *r = &g_frr[f % FRN]; r->f = f; r->t_s = (t0 - g_t0_ns) / 1e9; r->fr = fr; r->nv = nv; r->acq_ms = g_acq_wait_ns / 1e6; r->pq_ms = g_pq_wait_ns / 1e6; r->sync_ms = g_sync_wait_ns / 1e6; r->sync_n = g_sync_wait_n; r->passes = (unsigned)(ps - prev_pass); r->draws = (unsigned)(dr - prev_draw);
+          fr_rec *nx = &g_frr[(f + 1) % FRN]; nx->f = 0; atomic_store(&nx->oq_z, 0); atomic_store(&nx->oq_nz, 0); }   // 帧账：下一帧的槽先清（其提交的完成回调只会在下一帧开始后到） | frame ledger: clear the next frame's slot first (completions of its submits arrive only after that frame begins
+        if (f % 300 == 0) fr_summary(f);
+        { uint64_t at = atomic_load(&g_fr_dump_at); if (at && f >= at) { fr_dump(atomic_load(&g_fr_dump_b), f); atomic_store(&g_fr_dump_at, 0); } }
         static uint64_t pl, pst, pf, pudc; uint64_t l, st, fu; mtl_bw(&l, &st, &fu);
         trow(f, "@rt_load_mb", (l - pl) / 1048576.0); trow(f, "@rt_store_mb", (st - pst) / 1048576.0); trow(f, "@pass_full_rw", (double)(fu - pf));
         uint64_t udc = mtl_udc_saved_bytes(); trow(f, "@unwritten_dc_mb", (udc - pudc) / 1048576.0);
@@ -1220,7 +1248,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@drawable_ms", mtl_drawable_ns_take() / 1e6);
         trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", atomic_exchange(&g_sub_cpu_ns, 0) / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
     } else atomic_store(&g_nvn_ns, 0);
-    g_acq_wait_ns = g_pq_wait_ns = 0;
+    g_acq_wait_ns = g_pq_wait_ns = 0; g_sync_wait_ns = 0; g_sync_wait_n = 0;
     if (f >= 8) { double g = mtl_gpu_ms(f - 8); if (g >= 0) { tpush(3, g); trow(f - 8, "@gpu_ms", g); g_hr[g_hn++ % HRN] = g; }   // GPU 时间滞后 8 帧取（已完成） | GPU time is taken 8 frames late (already completed)
         { lf_rec *r = &g_lf[(f - 8) % LFN];   // 长帧日志（缺省开，DM_LONGFRAME=0 关）：整帧 > 20 ms 或 GPU > 16.7 ms、且明显高于近况，才打一行 | long-frame log (on by default, DM_LONGFRAME=0 turns it off): a line is printed only when the whole frame > 20 ms or GPU > 16.7 ms, and it is clearly above recent conditions
           static int on = -1; if (on < 0) { const char *e = getenv("DM_LONGFRAME"); on = !(e && !strcmp(e, "0")); }

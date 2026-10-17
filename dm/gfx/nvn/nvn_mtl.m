@@ -925,6 +925,7 @@ static void rp_flush(void);
 static const char *cctx_snap(void);   // 这次提交里有什么（出错时打进红行；定义在 mtl_exec 之前） | What is in this submission (printed into the failure line on error; defined before mtl_exec)
 // 诊断 DM_NVN_VISSTAT=1（缺省关）：按报告地址记遮挡查询结果序列，统计「非零 → 0 → 非零」（一帧被判全遮挡又恢复，即可见性 A-B-A 的查询侧来源）与「0 → 非零 → 0」，每 20000 次报告打一行
 // Diagnostic DM_NVN_VISSTAT=1 (off by default): per report address, track the occlusion-query result sequence and count "nonzero -> 0 -> nonzero" (judged fully occluded for one report, then back: the query-side source of a visibility A-B-A) and "0 -> nonzero -> 0"; one log line per 20000 reports
+__attribute__((weak)) void nvn_fr_oq(uint64_t f, int zero); __attribute__((weak)) void nvn_fr_mark(uint64_t frame_b);   // 帧账环（hle_nvn.c；图形单测里可能没链进来） | frame ledger ring (hle_nvn.c; may be absent in graphics unit tests)
 static void vis_stat_note(uint64_t addr, uint64_t sum, int nslots) {
     static int on = -1; if (on < 0) on = getenv("DM_NVN_VISSTAT") != NULL; if (!on) return;
     enum { VN = 1 << 14 }; static uint64_t ka[VN], v0[VN], v1[VN]; static uint8_t nv[VN]; static uint64_t tot, zero, flip_z, flip_nz, noslot, coll; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -1021,6 +1022,7 @@ uint64_t mtl_sub_commit(void) {
                 free(l); { static int all = -1; if (all < 0) { const char *e = getenv("DM_NVN_VIS_ALL"); all = e && !strcmp(e, "1"); } if (all && !sum) sum = 1; }   // 诊断 DM_NVN_VIS_ALL=1：遮挡查询一律「可见」（判是不是查询结果把东西剔掉了） | Diagnostic DM_NVN_VIS_ALL=1: every occlusion query answers 'visible' (to tell whether query results are culling things)
                 uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
                 vis_stat_note(ops[i].addr, sum, vis_nslots);
+                if (nvn_fr_oq) nvn_fr_oq(gpu_f, sum == 0);   // 帧账：遮挡查询结果按提交帧计数 | frame ledger: occlusion-query results counted per submit frame
             }
             else { uint64_t t = gpu_ticks(), rec[2] = {ops[i].type == 0 || ops[i].type == 0x10 ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }
         }
@@ -6432,9 +6434,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                 static uint8_t tb[3][144]; static int tbn; static int trig2;
                 uint8_t cur[144]; for (int by = 0; by < 9; by++) for (int bx = 0; bx < 16; bx++) { unsigned sm = 0; for (int yy = 0; yy < 4; yy++) for (int xx = 0; xx < 4; xx++) sm += g[(by * 4 + yy) * 64 + bx * 4 + xx]; cur[by * 16 + bx] = (uint8_t)(sm / 16); }
                 static const char *gd2 = NULL; static int gd2_init; if (!gd2_init) { gd2_init = 1; gd2 = getenv("DM_NVN_GLITCH"); }
-                static int gmin = -1, gmax; if (gmin < 0) { const char *e = getenv("DM_NVN_GLITCH_MIN"), *x = getenv("DM_NVN_GLITCH_MAX"); gmin = e ? atoi(e) : 3; gmax = x ? atoi(x) : 6; }   // 诊断：触发所需最少块数（缺省 3）、最多触发次数（缺省 6） | diagnostic: minimum block count to fire (default 3), maximum number of firings (default 6)
+                static int gmin = -1, gmax; if (gmin < 0) { const char *e = getenv("DM_NVN_GLITCH_MIN"), *x = getenv("DM_NVN_GLITCH_MAX"); gmin = e ? atoi(e) : 3; gmax = x ? atoi(x) : 100; }   // 诊断：触发所需最少块数（缺省 3）、最多触发次数（缺省 100） | diagnostic: minimum block count to fire (default 3), maximum number of firings (default 100)
                 if (tbn >= 2 && gd2 && trig2 < gmax) { int hits = 0; for (int k = 0; k < 144; k++) { int a = tb[0][k], b = tb[1][k], c = cur[k]; if (abs(b - a) > 20 && abs(c - b) > 20 && (b - a) * (c - b) < 0 && abs(c - a) < 8) hits++; }
-                    if (hits >= gmin) { trig2++; char path[512]; snprintf(path, sizeof path, "%s/aba%d_present%llu_ring.txt", gd2, trig2, rl_n); if (pdr_on()) pdr_flush(path);
+                    if (hits >= gmin) { trig2++; if (nvn_fr_mark) nvn_fr_mark(rl_n - 1); char path[512]; snprintf(path, sizeof path, "%s/aba%d_present%llu_ring.txt", gd2, trig2, rl_n); if (pdr_on()) pdr_flush(path);
                         // 存三帧小图（A / B / C，64x36 PGM）并截接下来 2 帧的全尺寸画面：没开通道转储环（玩家正常游玩）时也能看出错画在哪、是什么 | save the three thumbnails (A / B / C, 64x36 PGM) and screenshot the next 2 full-size frames:
                         // even without the pass-dump ring (normal play) this shows where the wrong frame is and what it looks like
                         { static const char *nm[3] = {"a", "b", "c"}; const uint8_t *src[3] = {tb[0], tb[1], cur}; for (int t = 0; t < 3; t++) { char pp[512]; snprintf(pp, sizeof pp, "%s/aba%d_present%llu_%s.pgm", gd2, trig2, rl_n, nm[t]);
