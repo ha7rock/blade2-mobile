@@ -26,7 +26,7 @@ for i in $(seq 0 90); do K="$K,A@$(echo "55+$i*0.7" | bc)"; done
 K="$K,LSU@70+2,LSR@85+2"
 env | grep '^DM_\|^MTL_' | sort > "$O/env.txt"
 [ -n "${ABA_LAG:-}" ] && export DM_NVN_LAGLOG="$O/lag.txt"
-${ABA_TOP:+DM_WINDOW_TOP=1} ${ABA_TOP:-DM_WINDOW_BACK=1} DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE="$SP" \
+env ${ABA_TOP:+DM_WINDOW_TOP=1} ${ABA_TOP:-DM_WINDOW_BACK=1} DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE="$SP" \
 DM_WATCH=$WATCH DM_KEYS="$K" DM_NVN_REGLUM="0,0,1,1:$O/reglum.txt" DM_NVN_DRAWSET=${ABA_DRAWSET:+$O/drawset.txt} \
   "$APP/Contents/MacOS/BladeII" > "$O/stdout.log" 2> "$O/stderr.log" &
 UPNS='import time;print(time.clock_gettime_ns(time.CLOCK_UPTIME_RAW))'
