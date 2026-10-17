@@ -98,7 +98,7 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         // No system "window state restoration": after a forced quit / crash the system shows a modal "the app quit unexpectedly, reopen windows?" at launch - the game has no window to restore,
         // yet the dialog covers the main window, which then receives no mouse or keyboard (the game keeps running behind it). Equivalent to the launch argument -ApplePersistenceIgnoreState YES; must be set before NSApplication is created
         [NSUserDefaults.standardUserDefaults setVolatileDomain:@{ @"ApplePersistenceIgnoreState": @YES } forName:NSArgumentDomain];
-        [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular]; [NSApp activateIgnoringOtherApps:YES];
+        [NSApplication sharedApplication]; if (!getenv("DM_WINDOW_BACK")) { [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular]; [NSApp activateIgnoringOtherApps:YES]; }   // DM_WINDOW_BACK：见 front_mac.m，自动化测试不抢前台 | DM_WINDOW_BACK: see front_mac.m, automated tests never take the foreground
         NSString *prod = res_item(@"product");
         if (!prod || ![fm fileExistsAtPath:[prod stringByAppendingPathComponent:@"main.patched.bin"]]) {
             alert(T("dmAppBrokenTitle"), T("dmAppBroken")); exit(1);

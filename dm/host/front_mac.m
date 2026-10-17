@@ -186,13 +186,18 @@ void front_run(void (*guest)(void)) {
     if (!getenv("DM_WINDOW")) { guest(); return; }
     @autoreleasepool {
         [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        // DM_WINDOW_BACK=1（自动化测试）：不抢前台——附属进程（无 Dock 图标、不切菜单栏）、窗口压在所有窗口之后、不做键窗口、缩成 480x270 放右下角；
+        // 玩家在同一台机器上工作时不被弹出来打断。窗口若被完全盖住，macOS 会停掉它的出图 → 用小窗放角落，让它大概率露出一角
+        // DM_WINDOW_BACK=1 (automated tests): never take the foreground -- accessory process (no Dock icon, menu bar untouched), window ordered behind all others, never key, shrunk to 480x270 in the bottom-right corner;
+        // the player working on the same machine is not interrupted by pop-ups. A fully covered window stops presenting on macOS, so a small corner window is used, which is likely to stay partly visible
+        int back = getenv("DM_WINDOW_BACK") != NULL;
+        [NSApp setActivationPolicy:back ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular];
         // 退出 App Nap：窗口不在前台、没有用户输入时 macOS 会把进程的定时器合并到几百毫秒一拍——实测 Blade 的游戏线程 SleepThread(10 ms) 要 200 ms 才醒，整帧 p50 200 ms。
         // 游戏是延迟敏感的用户发起活动（与 Switch 上永远前台一致），持有到进程退出
         // Opt out of App Nap: when the window is not frontmost and there is no user input, macOS coalesces the process's timers to a few hundred ms -- measured on Blade: the game thread's SleepThread(10 ms) took 200 ms to wake, whole-frame p50 200 ms.
         // The game is a latency-sensitive user-initiated activity (consistent with always being in the foreground on the Switch), held until the process exits
         static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical) reason:@"game loop"];
-        NSRect r = NSMakeRect(0, 0, 1280, 720);
+        NSRect r = NSMakeRect(0, 0, back ? 480 : 1280, back ? 270 : 720);
         { const char *e = getenv("DM_WINDOW"); unsigned ww = 0, wh = 0; if (e && sscanf(e, "%ux%u", &ww, &wh) == 2 && ww >= 320 && wh >= 200) r = NSMakeRect(0, 0, ww, wh); }   // DM_WINDOW=宽x高：按指定大小开窗（复现大窗口 / 最大化时的问题） | DM_WINDOW=WxH: open the window at that size (to reproduce issues seen with a large / maximized window)
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
@@ -201,7 +206,7 @@ void front_run(void (*guest)(void)) {
         screen_note();   // 出图节拍按窗口所在屏的刷新率取档（30 Hz 电视 → 30） | present pacing follows the refresh rate of the screen the window is on (30 Hz TV → 30)
         [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidChangeScreenNotification object:win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n_) { (void)n_; screen_note(); }];
         [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n_) { (void)n_; screen_note(); }];
-        if (getenv("DM_WINDOW_TOP")) win.level = NSFloatingWindowLevel;   // DM_WINDOW_TOP=1：窗口置顶（自动化测试时不被别的窗口盖住——被盖住时显示节拍降到 1 Hz） | DM_WINDOW_TOP=1: keep the window on top (automated tests must not be occluded: an occluded window drops the display link to 1 Hz)
+        if (getenv("DM_WINDOW_TOP") && !back) win.level = NSFloatingWindowLevel;   // DM_WINDOW_TOP=1：窗口置顶（自动化测试时不被别的窗口盖住——被盖住时显示节拍降到 1 Hz） | DM_WINDOW_TOP=1: keep the window on top (automated tests must not be occluded: an occluded window drops the display link to 1 Hz)
         NSView *v = win.contentView; g_view = v;
         v.wantsLayer = YES; v.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary; win.contentMinSize = NSMakeSize(640, 360);
@@ -212,6 +217,7 @@ void front_run(void (*guest)(void)) {
         g_layer.contentsScale = win.backingScaleFactor;
         [v.layer addSublayer:g_layer]; layout_game();
         [win center];
+        if (back) { NSRect sf = NSScreen.mainScreen.visibleFrame; [win setFrameOrigin:NSMakePoint(NSMaxX(sf) - win.frame.size.width - 8, NSMinY(sf) + 8)]; win.contentMinSize = NSMakeSize(320, 180); }
         g_live = getenv("DM_APP") || getenv("DM_TOUCH_LIVE"); if (g_live) dm_touch_host_live_enable();
         { // 菜单栏：应用（退出 ⌘Q）/ 显示（全屏 ⌃⌘F）/ 帮助（键位对照） | Menu bar: application (Quit ⌘Q) / View (Full Screen ⌃⌘F) / Help (key mapping)
           NSMenu *bar = [NSMenu new];
@@ -221,8 +227,7 @@ void front_run(void (*guest)(void)) {
           { NSMenu *hm = add(ui("dmAppMenuHelp")); [[hm addItemWithTitle:@(ui("dmAppKeysTitle")) action:@selector(keys:) keyEquivalent:@""] setTarget:ctl]; [[hm addItemWithTitle:@(ui("dmAppShareLog")) action:@selector(share:) keyEquivalent:@""] setTarget:ctl]; }
           NSApp.mainMenu = bar; }
         { void dm_gamepad_start(void (*on_mode)(int pad)); dm_gamepad_start(NULL); }   // 手柄（与 iOS 壳共用 ios/Sources/dm_gamepad.m）：连上即用，与键盘并存 | Gamepad (ios/Sources/dm_gamepad.m, shared with the iOS shell): works as soon as it is connected, alongside the keyboard
-        [win makeKeyAndOrderFront:nil];
-        [NSApp activateIgnoringOtherApps:YES];
+        if (back) [win orderBack:nil]; else { [win makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; }
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // 只吃游戏窗口的键；软键盘输入框等其他窗口照常收字 | Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.modifierFlags & NSEventModifierFlagCommand) return e;   // 带 ⌘ 的留给菜单（⌘Q、⌃⌘F） | Keys with ⌘ are left to the menu (⌘Q, ⌃⌘F)

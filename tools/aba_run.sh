@@ -3,6 +3,7 @@
 # Usage: tools/aba_run.sh <tag> [rec_start_s=55] [rec_dur_s=60] [watch_s=120]
 #   Extra DM_* env for the app: pass them in the environment of this script (they are inherited), e.g.
 #   DM_NVN_SERIAL_FRAME=1 tools/aba_run.sh serial1
+# The game window stays behind everything, small, in the bottom-right corner (DM_WINDOW_BACK=1) so a person working on the Mac is not interrupted; ABA_TOP=1 restores the old on-top window for screen recording.
 # Outputs: ~/blade2-work/run/aba/<tag>/{rec.mov, small.raw, reglum.txt, host.log, stderr.log, screen.txt, reglum_aba.txt, env.txt}
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,7 +26,7 @@ for i in $(seq 0 90); do K="$K,A@$(echo "55+$i*0.7" | bc)"; done
 K="$K,LSU@70+2,LSR@85+2"
 env | grep '^DM_\|^MTL_' | sort > "$O/env.txt"
 [ -n "${ABA_LAG:-}" ] && export DM_NVN_LAGLOG="$O/lag.txt"
-DM_WINDOW_TOP=1 DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE="$SP" \
+${ABA_TOP:+DM_WINDOW_TOP=1} ${ABA_TOP:-DM_WINDOW_BACK=1} DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE="$SP" \
 DM_WATCH=$WATCH DM_KEYS="$K" DM_NVN_REGLUM="0,0,1,1:$O/reglum.txt" DM_NVN_DRAWSET=${ABA_DRAWSET:+$O/drawset.txt} \
   "$APP/Contents/MacOS/BladeII" > "$O/stdout.log" 2> "$O/stderr.log" &
 UPNS='import time;print(time.clock_gettime_ns(time.CLOCK_UPTIME_RAW))'
