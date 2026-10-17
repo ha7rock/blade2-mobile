@@ -1134,7 +1134,7 @@ static void serial_put(uint64_t k, id o) { pthread_mutex_lock(&g_smu); id old = 
 static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) defer_obj_release(old); hm_del_id(&g_by_serial, &k); g_ser_gen++; pthread_mutex_unlock(&g_smu); }
 // 预排布贴图的宿主记录：当前 MTLTexture、上传戳、上次检查时的全局写代号
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
-@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash; int rt; uint32_t reups; uint64_t ser; uint32_t w, h, fmt, flags, lv; } @end   // rt：曾被挂为渲染目标 → 内容以 GPU 为准，不再按脏页从池重传 | rt: was attached as a render target → the GPU content is authoritative, no more dirty-page re-uploads from the pool   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
+@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash; int rt; uint32_t reups; uint64_t ser; uint32_t w, h, depth, target, fmt, flags, lv; } @end   // rt：曾被挂为渲染目标 → 内容以 GPU 为准，不再按脏页从池重传 | rt: was attached as a render target → the GPU content is authoritative, no more dirty-page re-uploads from the pool   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
 @implementation NvPkg
 - (void)dealloc { res_remove(tex); }
 @end
@@ -1468,6 +1468,7 @@ static void up_blit_add(id<MTLBuffer> src, size_t off, size_t row, size_t image,
 }
 
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp);
+static int g_pkg_reup_now;   // 当前这次 pkg_upload 是否为重传（提交线程单线程，调用前置位） | whether the current pkg_upload is a re-upload (submit thread only, set before the call)
 static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
     id<MTLTexture> r = pkg_upload_(t, stamp);
@@ -1508,7 +1509,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     int gdec = unp && t->d.target != 2 && bcd_fmt(t->d.format) && bcd_pso();   // 无 BC 的 BC1–5：GPU 解排布 + GPU 解压 | BC1–5 without BC: GPU deswizzle + GPU decompression
     size_t ctotal = 0;   // 压缩块的暂存大小（GPU 解压时暂存区放的是压缩块） | Staging size of the compressed blocks (with GPU decompression the staging area holds compressed blocks)
     if (gdec) for (unsigned l = 0; l < d.mipmapLevelCount; l++) { uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u); ctotal += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * layers; }
-    int use_gpu = (!unp || gdec) && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);
+    static int reup_cpu = -1; if (reup_cpu < 0) { const char *e = getenv("DM_NVN_REUP_CPU"); reup_cpu = e ? atoi(e) : 0; if (reup_cpu) MLOG("DM_NVN_REUP_CPU=%d（诊断）：%s走 CPU 快照上传（GPU 不再在执行时读内存池）", reup_cpu, reup_cpu == 2 ? "全部池源贴图" : "重传"); }   // 诊断：1 = 重传走 CPU 快照（上传时刻拷贝池内容），2 = 全部池源贴图都走 | diagnostic: 1 = re-uploads take the CPU snapshot path (pool content copied at upload time), 2 = every pool-source texture does
+    int use_gpu = (!unp || gdec) && g_nvn_deswz_gpu && !(reup_cpu == 2 || (reup_cpu == 1 && g_pkg_reup_now)) && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);
     if (g_nvn_deswz_gpu && !use_gpu && !unp) RED_ONCE(40, "预排布贴图存储不在内存池里，回退 CPU");
     if (use_gpu) {
         // GPU 执行时读内存池，比 CPU 上传时刻快照更接近 Switch 真机；脏页戳仍在编码前取，之后写入仍会触发重传。
@@ -1592,7 +1594,7 @@ void mtl_reup_report(void) {
     int idx[64]; for (int i = 0; i < g_reup_n; i++) idx[i] = i;
     for (int i = 0; i < g_reup_n; i++) for (int j = i + 1; j < g_reup_n; j++) if (g_reup_tab[idx[j]]->reups - last[idx[j]] > g_reup_tab[idx[i]]->reups - last[idx[i]]) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
     for (int k = 0; k < g_reup_n && k < 6 && o < (int)sizeof line - 80; k++) { NvPkg *pk = g_reup_tab[idx[k]]; uint32_t d = pk->reups - last[idx[k]]; if (!d) break;
-        o += snprintf(line + o, sizeof line - o, " ser=%llu %ux%u lv%u f%#x fl%#x:+%u", (unsigned long long)pk->ser, pk->w, pk->h, pk->lv, pk->fmt, pk->flags, d); }
+        o += snprintf(line + o, sizeof line - o, " ser=%llu %ux%ux%u t%d lv%u f%#x fl%#x:+%u", (unsigned long long)pk->ser, pk->w, pk->h, pk->depth, pk->target, pk->lv, pk->fmt, pk->flags, d); }
     for (int i = 0; i < g_reup_n; i++) last[i] = g_reup_tab[i]->reups;
     if (o) MLOG("重传排行（本段）%s", line);
 }
@@ -1615,11 +1617,11 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
                     MLOG("【红】脏页漏检：贴图 ser=%llu 池内容已变但未检出", t->serial);
                 return pk->tex;
             }
-            uint64_t st; id<MTLTexture> nt = pkg_upload(t, &st);   // 池内容变了（流式素材写进同一存储）：换新贴图，在途绘制仍读旧的 | Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
+            uint64_t st; g_pkg_reup_now = 1; id<MTLTexture> nt = pkg_upload(t, &st); g_pkg_reup_now = 0;   // 池内容变了（流式素材写进同一存储）：换新贴图，在途绘制仍读旧的 | Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; defer_obj_release(old); res_add(nt); g_ser_gen++; pk->stamp = st; pk->seen = nvn_dirty_now(); g_pkg_reuploads++; pk->reups++; reup_note(pk); if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size); }
             return pk->tex;
         }
-        pk = [NvPkg new]; pk->ser = t->serial; pk->w = t->d.width; pk->h = t->d.height; pk->fmt = t->d.format; pk->flags = t->d.flags; pk->lv = t->d.levels;
+        pk = [NvPkg new]; pk->ser = t->serial; pk->w = t->d.width; pk->h = t->d.height; pk->depth = t->d.depth; pk->target = t->d.target; pk->fmt = t->d.format; pk->flags = t->d.flags; pk->lv = t->d.levels;
         pk->tex = pkg_upload(t, &pk->stamp);
         if (!pk->tex) return nil;
         pk->seen = nvn_dirty_now(); g_pkg_uploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size);
@@ -6510,7 +6512,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                 uint8_t cur[144]; for (int by = 0; by < 9; by++) for (int bx = 0; bx < 16; bx++) { unsigned sm = 0; for (int yy = 0; yy < 4; yy++) for (int xx = 0; xx < 4; xx++) sm += g[(by * 4 + yy) * 64 + bx * 4 + xx]; cur[by * 16 + bx] = (uint8_t)(sm / 16); }
                 static const char *gd2 = NULL; static int gd2_init; if (!gd2_init) { gd2_init = 1; gd2 = getenv("DM_NVN_GLITCH"); }
                 static int gmin = -1, gmax; if (gmin < 0) { const char *e = getenv("DM_NVN_GLITCH_MIN"), *x = getenv("DM_NVN_GLITCH_MAX"); gmin = e ? atoi(e) : 3; gmax = x ? atoi(x) : 100000; }   // 诊断：触发所需最少块数（缺省 3）、最多触发次数（缺省不限；全尺寸截图只存前 10 次，小图与帧账每次都记） | diagnostic: minimum block count to fire (default 3), maximum number of firings (default unlimited; full-size screenshots only for the first 10, thumbnails and the frame ledger every time)
-                if (tbn >= 2 && gd2 && trig2 < gmax) { int hits = 0; for (int k = 0; k < 144; k++) { int a = tb[0][k], b = tb[1][k], c = cur[k]; if (abs(b - a) > 20 && abs(c - b) > 20 && (b - a) * (c - b) < 0 && abs(c - a) < 8) hits++; }
+                if (tbn >= 2 && gd2 && trig2 < gmax) { int hits = 0, bright = 0; for (int k = 0; k < 144; k++) { int a = tb[0][k], b = tb[1][k], c = cur[k]; if (abs(b - a) > 20 && abs(c - b) > 20 && (b - a) * (c - b) < 0 && abs(c - a) < 8) { if (b < a) hits++; else bright++; } }   // 只有「变暗又恢复」算错画；「变亮又恢复」是命中火花 / 刀光这类一帧特效（2026-10-17 玩家 Boss 局：最大的两次触发都是亮斑），只记数不触发 | only "darker then back" counts as a wrong frame; "brighter then back" is a one-frame effect (hit sparks / slashes: the two largest firings in the player's boss run were bright blobs), counted but never fires
                     if (hits >= gmin) { trig2++; if (nvn_fr_mark) nvn_fr_mark(rl_n - 1); char path[512]; snprintf(path, sizeof path, "%s/aba%d_present%llu_ring.txt", gd2, trig2, rl_n); if (pdr_on()) pdr_flush(path);
                         // 存三帧小图（A / B / C，64x36 PGM）并截接下来 2 帧的全尺寸画面：没开通道转储环（玩家正常游玩）时也能看出错画在哪、是什么 | save the three thumbnails (A / B / C, 64x36 PGM) and screenshot the next 2 full-size frames:
                         // even without the pass-dump ring (normal play) this shows where the wrong frame is and what it looks like
@@ -6518,7 +6520,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                             FILE *pf = fopen(pp, "wb"); if (pf) { fprintf(pf, "P5\n16 9\n255\n"); fwrite(src[t], 1, 144, pf); fclose(pf); } }
                           char gp[512]; snprintf(gp, sizeof gp, "%s/aba%d_present%llu_g.pgm", gd2, trig2, rl_n); FILE *gf = fopen(gp, "wb"); if (gf) { fprintf(gf, "P5\n64 36\n255\n"); fwrite(g, 1, 64 * 36 < ng ? 64 * 36 : ng, gf); fclose(gf); }
                           if (trig2 <= 10) for (int t = 1; t <= 2; t++) { char sp[512]; snprintf(sp, sizeof sp, "%s/aba%d_present%llu_next%d.png", gd2, trig2, rl_n, t); dm_gfx_shot_at(t, sp); } }
-                        MLOG("【红】画面触发器：出图 %llu 的前一帧有 %d 块 A-B-A 错画（当前帧 %llu），通道转储环已写 %s", rl_n, hits, (unsigned long long)atomic_load(&g_cur_frame), path); } }
+                        MLOG("【红】画面触发器：出图 %llu 的前一帧有 %d 块变暗又恢复（另 %d 块变亮，不计），当前帧 %llu，通道转储环已写 %s", rl_n, hits, bright, (unsigned long long)atomic_load(&g_cur_frame), path); } }
                 memcpy(tb[0], tb[1], 144); memcpy(tb[1], cur, 144); if (tbn < 2) tbn++;
             }   // 黑帧触发器 DM_NVN_GLITCH=目录：游戏帧亮度骤降（上帧 >15、本帧 < 上帧 35%）时存本帧像素、截后 3 帧、并把通道转储对准后 3 帧 | black-frame trigger DM_NVN_GLITCH=dir: when the game frame's brightness collapses (previous > 15, this < 35% of previous) save this frame's pixels, screenshot the next 3 frames and aim the pass dump at them
             static const char *gd = NULL; static int gd_init; if (!gd_init) { gd_init = 1; gd = getenv("DM_NVN_GLITCH"); }
