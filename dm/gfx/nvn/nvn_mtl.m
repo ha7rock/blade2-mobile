@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #import <objc/runtime.h>
 static void al_install(void);   // 分配账 | allocation ledger
+static void up_block_recycle(id<MTLBuffer> b);   // 上传暂存块复用池 | upload staging block reuse pool
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
@@ -1334,6 +1335,7 @@ static void up_flush(void) {
     MTL4CommitOptions *o = [MTL4CommitOptions new];
 #endif
     atomic_fetch_add(&g_up_pending, 1);
+    id<MTLBuffer> up_blk = (g_up_block && g_up_block_size == UP_BLOCK_SIZE) ? g_up_block : nil;   // 标准大小的当前块：GPU 做完后进复用池 | standard-size current block: goes to the reuse pool once the GPU is done
     [FB_ON(o, cb) FB_SEL:^(FB_ARG f) {
         if (f.error) MLOG("【红】上传命令缓冲执行出错：%s", f.error.description.UTF8String);
         if (f.error || fake_lost) {
@@ -1345,6 +1347,7 @@ static void up_flush(void) {
         if (d > 0) atomic_fetch_add(&g_upload_gpu_ns, (uint64_t)(d * 1e9));
         atomic_store(&g_up_alloc_busy[slot], 0);
         atomic_fetch_sub(&g_up_pending, 1);
+        if (up_blk) up_block_recycle(up_blk);
     }];
     res_commit();
 #if DM_NVN_M3
@@ -1355,7 +1358,7 @@ static void up_flush(void) {
     [g_q4 commit:buffers count:1 options:o];
 #endif
     cb_committed();
-    g_up_cb = nil; if (g_up_block) { defer_obj_release(g_up_block); g_up_block = nil; } g_up_block_off = g_up_block_size = 0;
+    g_up_cb = nil; if (g_up_block) { if (g_up_block != up_blk) defer_obj_release(g_up_block); g_up_block = nil; } g_up_block_off = g_up_block_size = 0;
     for (id obj in g_up_keep) defer_obj_release(obj);
     [g_up_keep removeAllObjects];
     up_diag();
@@ -1388,7 +1391,20 @@ static void up_begin(void) {
 // 换块时旧块若没退役，它留在驻留集里永远放不掉，「显卡已分配」会随换块次数一块一块往上涨
 // Diagnostic readout (low frequency; printed only when the block switch count changed and ≥ 1 second since the last line, at most 200 lines per game): how many times an upload batch ran out of staging block and switched blocks midway; GPU allocated, residency set object count, deferred-release queue length.
 // If the old block is not retired on a switch it stays in the residency set and can never be freed, and "GPU allocated" climbs one block at a time with the switch count
-static uint64_t g_up_blocks_new, g_up_swaps, g_up_swap_bytes; static NSHashTable *g_up_old;   // g_up_old：换下的旧块（弱引用），诊断行数它们还活着几块 | g_up_old: old blocks switched out (weak references); the diagnostic line counts how many are still alive
+static uint64_t g_up_blocks_new, g_up_swaps, g_up_swap_bytes; static NSHashTable *g_up_old;
+// 暂存块复用池：冲刷提交的上传命令缓冲在 GPU 上做完后，标准大小（32 MB）的当前块进这里，下次 up_alloc 先从这里拿，不再每批新建一块。
+// 原先每批冲刷都 defer_obj_release 当前块、下批再 newBuffer 32 MB：Blade 有一张贴图每帧被游戏重写（每帧重传），于是每帧新建 + 退役 32 MB（分配账实测 1.5 次 / 帧，每秒 2.9 GB 的分配周转）；
+// 出图一卡（窗口失焦被盖住、GPU 队列等 drawable）延迟释放落不了地，显存就按每秒 300 MB 涨，7 分钟 24 GB 被内存看门狗杀。最多留 4 块，多的照旧延迟退役
+// Staging block reuse pool: once the flushed upload command buffer has finished on the GPU, a standard-size (32 MB) current block goes here, and the next up_alloc takes from here instead of creating a new block per batch.
+// Previously every flush defer_obj_release'd the current block and the next batch did newBuffer 32 MB: Blade has one texture the game rewrites every frame (re-uploaded every frame), so 32 MB was created + retired every frame
+// (allocation ledger: 1.5 times per frame, 2.9 GB/s of allocation churn); when presenting stalls (window unfocused and covered, GPU queue waiting for a drawable) the deferred releases cannot land and GPU memory grows 300 MB/s,
+// 24 GB in 7 minutes, killed by the memory watchdog. At most 4 blocks are kept; extra ones are retired as before
+static NSMutableArray *g_up_free; static os_unfair_lock g_up_free_lk = OS_UNFAIR_LOCK_INIT; static uint64_t g_up_blocks_reused;
+static void up_block_recycle(id<MTLBuffer> b) {
+    if (!b) return;
+    os_unfair_lock_lock(&g_up_free_lk); if (!g_up_free) g_up_free = [NSMutableArray array]; int keep = g_up_free.count < 4; if (keep) [g_up_free addObject:b]; os_unfair_lock_unlock(&g_up_free_lk);
+    if (!keep) defer_obj_release(b);
+}   // g_up_old：换下的旧块（弱引用），诊断行数它们还活着几块 | g_up_old: old blocks switched out (weak references); the diagnostic line counts how many are still alive
 static void up_diag(void) {
     // 换块次数变了打一行；之后过 5 秒再补一行（那一批提交早已跑完、延迟退役也排空了，「显卡已分配」是落定后的数）
     // Print a line when the block switch count changes; then one more line 5 seconds later (that batch's commit is long done and deferred retirement drained, so "GPU allocated" is the settled number)
@@ -1398,8 +1414,8 @@ static void up_diag(void) {
     unsigned long alive = 0, inres = 0; uint64_t abytes = 0; NSArray *olds = g_up_old.allObjects;
     pthread_mutex_lock(&g_res_mu); unsigned long nres = (unsigned long)g_res_objects.allObjects.count; for (id<MTLBuffer> o in olds) { alive++; abytes += o.length; inres += [g_res_objects containsObject:o]; } pthread_mutex_unlock(&g_res_mu);
     pthread_mutex_lock(&g_deferred_mu); unsigned long ndef = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
-    MLOG("上传暂存块%s：累计新建 %llu 块、其中一批内换块 %llu 次（换下的旧块共 %llu MB）；换下的旧块此刻还活着 %lu 块 %llu MB、仍在驻留集 %lu 块；显卡已分配 %llu MB、驻留集 %lu 个对象、延迟释放队列 %lu", fol && !chg ? "（落定后）" : "",
-         (unsigned long long)g_up_blocks_new, (unsigned long long)g_up_swaps, (unsigned long long)(g_up_swap_bytes >> 20), alive, (unsigned long long)(abytes >> 20), inres, (unsigned long long)(g_dev.currentAllocatedSize >> 20), nres, ndef);
+    MLOG("上传暂存块%s：累计新建 %llu 块（复用 %llu 次）、其中一批内换块 %llu 次（换下的旧块共 %llu MB）；换下的旧块此刻还活着 %lu 块 %llu MB、仍在驻留集 %lu 块；显卡已分配 %llu MB、驻留集 %lu 个对象、延迟释放队列 %lu", fol && !chg ? "（落定后）" : "",
+         (unsigned long long)g_up_blocks_new, (unsigned long long)g_up_blocks_reused, (unsigned long long)g_up_swaps, (unsigned long long)(g_up_swap_bytes >> 20), alive, (unsigned long long)(abytes >> 20), inres, (unsigned long long)(g_dev.currentAllocatedSize >> 20), nres, ndef);
 }
 static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
     size_t need = (n + 255u) & ~((size_t)255u);
@@ -1410,12 +1426,18 @@ static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
         // Block switch: the old block is still referenced by copy / decompress commands already recorded in this batch and cannot be freed on the spot; hand it to g_up_keep, to be retired later with the other staging after the flush commits (removed from the residency set on retire).
         // Previously g_up_block was simply replaced with the new block here: nobody retired the old block, yet it stayed in the residency set, so each extra block switch in an upload batch leaked one block (usually 32 MB) of GPU memory.
         // The old block and the "current block" retired at flush are two objects, so nothing is retired twice
-        g_up_blocks_new++; if (g_up_block) { g_up_swaps++; g_up_swap_bytes += g_up_block_size; if (!g_up_old) g_up_old = [NSHashTable weakObjectsHashTable]; [g_up_old addObject:g_up_block]; static int leak = -1; if (leak < 0) leak = getenv("DM_TEST_UP_LEAK") != NULL;   // 测试开关 DM_TEST_UP_LEAK=1：照修前的做法不退役旧块（对照用，量漏多少） | test switch DM_TEST_UP_LEAK=1: do not retire the old block, as before the fix (for comparison, to measure the leak)
+        if (g_up_block) { g_up_swaps++; g_up_swap_bytes += g_up_block_size; if (!g_up_old) g_up_old = [NSHashTable weakObjectsHashTable]; [g_up_old addObject:g_up_block]; static int leak = -1; if (leak < 0) leak = getenv("DM_TEST_UP_LEAK") != NULL;   // 测试开关 DM_TEST_UP_LEAK=1：照修前的做法不退役旧块（对照用，量漏多少） | test switch DM_TEST_UP_LEAK=1: do not retire the old block, as before the fix (for comparison, to measure the leak)
             if (!leak) { if (!g_up_keep) g_up_keep = [NSMutableArray array]; [g_up_keep addObject:g_up_block]; } }
-        g_up_block_size = n > UP_BLOCK_SIZE ? need : UP_BLOCK_SIZE;
-        g_up_block = [g_dev newBufferWithLength:g_up_block_size options:MTLResourceStorageModePrivate];
-        if (!g_up_block) MDIE("建预排布上传暂存块失败 %#zx", g_up_block_size);
-        res_add(g_up_block);
+        id<MTLBuffer> reuse = nil;
+        if (n <= UP_BLOCK_SIZE) { os_unfair_lock_lock(&g_up_free_lk); if (g_up_free.count) { reuse = g_up_free.lastObject; [g_up_free removeLastObject]; } os_unfair_lock_unlock(&g_up_free_lk); }
+        if (reuse) { g_up_block = reuse; g_up_block_size = UP_BLOCK_SIZE; g_up_blocks_reused++; }   // 复用：仍在驻留集里，GPU 已用完（见 up_block_recycle） | reuse: still resident, the GPU is done with it (see up_block_recycle)
+        else {
+            g_up_blocks_new++;
+            g_up_block_size = n > UP_BLOCK_SIZE ? need : UP_BLOCK_SIZE;
+            g_up_block = [g_dev newBufferWithLength:g_up_block_size options:MTLResourceStorageModePrivate];
+            if (!g_up_block) MDIE("建预排布上传暂存块失败 %#zx", g_up_block_size);
+            res_add(g_up_block);
+        }
         g_up_block_off = 0;
     }
     *off = g_up_block_off;
