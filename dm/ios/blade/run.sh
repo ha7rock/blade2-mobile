@@ -56,7 +56,7 @@ build)
     xcodebuild -project BladeIOS.xcodeproj -scheme BladeII -configuration "$CFG" -destination 'generic/platform=iOS' -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build > "$R/build_blade.log" 2>&1 \
       || { t "🔴 构建失败（$R/build_blade.log）"; grep -E "error:" "$R/build_blade.log" | head -5; exit 1; }
   fi
-  t "构建完成：$APP（$(du -sh "$APP" 2>/dev/null | cut -f1)）"; exit 0;;
+  t "构建完成：${APP}（$(du -sh "$APP" 2>/dev/null | cut -f1)）"; exit 0;;
 install)
   local_env_need DM_DEVICE || exit 1
   xcrun devicectl device install app --device "$DM_DEVICE" "$APP" > "$R/install_blade.log" 2>&1 || { t "🔴 装机失败"; tail -5 "$R/install_blade.log"; exit 1; }
