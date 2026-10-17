@@ -1046,7 +1046,7 @@ uint64_t mtl_sub_commit(void) {
     // Diagnostic DM_NVN_SERIAL=5 (off by default): before committing, wait until the previous submit has finished on the GPU -- submits never overlap on the GPU, while CPU recording / the game's guest-memory writes still overlap the GPU (separates GPU-GPU ordering from CPU writes vs in-flight GPU reads)
     { static int s5 = -1; static uint64_t last_f = ~0ull; if (s5 < 0) { const char *e = getenv("DM_NVN_SERIAL"); s5 = e ? atoi(e) : 0; }
       uint64_t cf = atomic_load(&g_cur_frame);   // 6 = 只在新一帧的第一个提交前等（帧内各提交仍可在 GPU 上重叠） | 6 = wait only before the first submit of a new frame (submits inside a frame may still overlap on the GPU); 7 = wait only before non-first submits of a frame
-      if (fence > 1 && (s5 == 5 || (s5 == 6 && cf != last_f) || (s5 == 7 && cf == last_f))) mtl_wait(fence - 1, UINT64_MAX); last_f = cf; }
+      if (fence > 1 && (s5 == 5 || s5 == 8 || (s5 == 6 && cf != last_f) || (s5 == 7 && cf == last_f))) mtl_wait(fence - 1, UINT64_MAX); last_f = cf; }   // 8 = 同 5，但出图处不做每帧 GPU 收尾（5/6/7 在 hle 出图处还会 mtl_finish，见 nvn_serial）| 8 = as 5 but without the per-frame GPU finish at present (5/6/7 also mtl_finish at present in hle, see nvn_serial)
     [g_q4 commit:buffers count:1 options:o];
     [g_q4 signalEvent:g_ev value:fence];
 #endif
@@ -6434,7 +6434,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                 static uint8_t tb[3][144]; static int tbn; static int trig2;
                 uint8_t cur[144]; for (int by = 0; by < 9; by++) for (int bx = 0; bx < 16; bx++) { unsigned sm = 0; for (int yy = 0; yy < 4; yy++) for (int xx = 0; xx < 4; xx++) sm += g[(by * 4 + yy) * 64 + bx * 4 + xx]; cur[by * 16 + bx] = (uint8_t)(sm / 16); }
                 static const char *gd2 = NULL; static int gd2_init; if (!gd2_init) { gd2_init = 1; gd2 = getenv("DM_NVN_GLITCH"); }
-                static int gmin = -1, gmax; if (gmin < 0) { const char *e = getenv("DM_NVN_GLITCH_MIN"), *x = getenv("DM_NVN_GLITCH_MAX"); gmin = e ? atoi(e) : 3; gmax = x ? atoi(x) : 100; }   // 诊断：触发所需最少块数（缺省 3）、最多触发次数（缺省 100） | diagnostic: minimum block count to fire (default 3), maximum number of firings (default 100)
+                static int gmin = -1, gmax; if (gmin < 0) { const char *e = getenv("DM_NVN_GLITCH_MIN"), *x = getenv("DM_NVN_GLITCH_MAX"); gmin = e ? atoi(e) : 3; gmax = x ? atoi(x) : 100000; }   // 诊断：触发所需最少块数（缺省 3）、最多触发次数（缺省不限；全尺寸截图只存前 10 次，小图与帧账每次都记） | diagnostic: minimum block count to fire (default 3), maximum number of firings (default unlimited; full-size screenshots only for the first 10, thumbnails and the frame ledger every time)
                 if (tbn >= 2 && gd2 && trig2 < gmax) { int hits = 0; for (int k = 0; k < 144; k++) { int a = tb[0][k], b = tb[1][k], c = cur[k]; if (abs(b - a) > 20 && abs(c - b) > 20 && (b - a) * (c - b) < 0 && abs(c - a) < 8) hits++; }
                     if (hits >= gmin) { trig2++; if (nvn_fr_mark) nvn_fr_mark(rl_n - 1); char path[512]; snprintf(path, sizeof path, "%s/aba%d_present%llu_ring.txt", gd2, trig2, rl_n); if (pdr_on()) pdr_flush(path);
                         // 存三帧小图（A / B / C，64x36 PGM）并截接下来 2 帧的全尺寸画面：没开通道转储环（玩家正常游玩）时也能看出错画在哪、是什么 | save the three thumbnails (A / B / C, 64x36 PGM) and screenshot the next 2 full-size frames:
@@ -6442,7 +6442,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                         { static const char *nm[3] = {"a", "b", "c"}; const uint8_t *src[3] = {tb[0], tb[1], cur}; for (int t = 0; t < 3; t++) { char pp[512]; snprintf(pp, sizeof pp, "%s/aba%d_present%llu_%s.pgm", gd2, trig2, rl_n, nm[t]);
                             FILE *pf = fopen(pp, "wb"); if (pf) { fprintf(pf, "P5\n16 9\n255\n"); fwrite(src[t], 1, 144, pf); fclose(pf); } }
                           char gp[512]; snprintf(gp, sizeof gp, "%s/aba%d_present%llu_g.pgm", gd2, trig2, rl_n); FILE *gf = fopen(gp, "wb"); if (gf) { fprintf(gf, "P5\n64 36\n255\n"); fwrite(g, 1, 64 * 36 < ng ? 64 * 36 : ng, gf); fclose(gf); }
-                          for (int t = 1; t <= 2; t++) { char sp[512]; snprintf(sp, sizeof sp, "%s/aba%d_present%llu_next%d.png", gd2, trig2, rl_n, t); dm_gfx_shot_at(t, sp); } }
+                          if (trig2 <= 10) for (int t = 1; t <= 2; t++) { char sp[512]; snprintf(sp, sizeof sp, "%s/aba%d_present%llu_next%d.png", gd2, trig2, rl_n, t); dm_gfx_shot_at(t, sp); } }
                         MLOG("【红】画面触发器：出图 %llu 的前一帧有 %d 块 A-B-A 错画（当前帧 %llu），通道转储环已写 %s", rl_n, hits, (unsigned long long)atomic_load(&g_cur_frame), path); } }
                 memcpy(tb[0], tb[1], 144); memcpy(tb[1], cur, 144); if (tbn < 2) tbn++;
             }   // 黑帧触发器 DM_NVN_GLITCH=目录：游戏帧亮度骤降（上帧 >15、本帧 < 上帧 35%）时存本帧像素、截后 3 帧、并把通道转储对准后 3 帧 | black-frame trigger DM_NVN_GLITCH=dir: when the game frame's brightness collapses (previous > 15, this < 35% of previous) save this frame's pixels, screenshot the next 3 frames and aim the pass dump at them

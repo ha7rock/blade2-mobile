@@ -524,6 +524,7 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
     uint8_t *p = o->cur; o->cur += size; put_hdr(p, 0, size); return p;
 }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
+    { cmd_t *o_ = CB(c); if (o_->nvn_flag10) { static uint64_t seen, said; seen++; if (said < 3 && (seen == 1 || seen == 100 || seen == 10000)) { said++; LOG("[nvn] 游戏写了 NVNcommandBuffer+0x10 = %#llx（第 %llu 次；旧布局下这会砍掉段尾指针的低字节）", (unsigned long long)o_->nvn_flag10, (unsigned long long)seen); } o_->nvn_flag10 = 0; } }   // 见 nvn_obj.h cmd_t 的 nvn_flag10 | see nvn_flag10 in nvn_obj.h cmd_t
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
@@ -790,7 +791,7 @@ void dm_gfx_suspend(int on) {
 }
 // 诊断 DM_NVN_SERIAL（缺省关，只为定位一帧错画）：1 = 每次出图入队后等 GPU 把本帧（含出图命令缓冲）做完再放游戏录下一帧；2 = 另外每次提交后也等 GPU 做完（帧内各提交互不重叠）
 // Diagnostic DM_NVN_SERIAL (off by default, only for localizing one-frame glitches): 1 = after each present is queued, wait until the GPU has finished this frame (including the present command buffer) before the game records the next one; 2 = also wait for GPU completion after every submit (no overlap between submits inside a frame)
-static int nvn_serial(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_SERIAL"); v = e ? atoi(e) : 0; if (v) LOG("[nvn] DM_NVN_SERIAL=%d：%s（诊断，帧率会降）", v, v == 3 ? "每帧出图后只等本帧游戏提交完成" : v == 4 ? "每帧出图后只等出图命令缓冲完成" : v >= 2 ? "每次提交与每帧出图后都等 GPU 完成" : "每帧出图后等 GPU 完成"); } return v; }
+static int nvn_serial(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_SERIAL"); v = e ? atoi(e) : 0; if (v) LOG("[nvn] DM_NVN_SERIAL=%d：%s%s", v, v == 3 ? "每帧出图后只等本帧游戏提交完成" : v == 4 ? "每帧出图后只等出图命令缓冲完成" : v >= 2 ? "每次提交与每帧出图后都等 GPU 完成" : "每帧出图后等本帧 GPU 完成", v == 1 ? "（Mac App 缺省：防跨帧重叠错画）" : "（诊断，帧率会降）"); } return v; }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
@@ -996,7 +997,8 @@ void nvn_fr_oq(uint64_t f, int zero) { fr_rec *r = &g_frr[f % FRN]; if (zero) at
 void nvn_fr_mark(uint64_t frame_b) { uint64_t z = 0; if (atomic_compare_exchange_strong(&g_fr_dump_at, &z, frame_b + 9)) atomic_store(&g_fr_dump_b, frame_b); }
 static void fr_dump(uint64_t b, uint64_t upto) {
     for (uint64_t k = b > 6 ? b - 6 : 1; k <= b + 2 && k <= upto; k++) { const fr_rec *r = &g_frr[k % FRN]; if (r->f != k) continue; double g = mtl_gpu_ms(k);
-        LOG("[帧账] %s帧 %llu（%.2f s）整帧 %.1f ms，提交+出图 %.1f ms，GPU %.1f ms；通道 %u，绘制 %u；等待 取图 %.1f / 队列 %.1f / 同步 %.1f ms（%u 次）；遮挡查询 结果0 %u / 非零 %u", k == b ? "★" : "　", (unsigned long long)k, r->t_s, r->fr, r->nv, g, r->passes, r->draws, r->acq_ms, r->pq_ms, r->sync_ms, r->sync_n, atomic_load(&r->oq_z), atomic_load(&r->oq_nz)); }
+        uint64_t g0 = 0, g1 = 0; int sp = mtl_gpu_span(k, &g0, &g1); double b0 = sp ? (g0 - g_t0_ns) / 1e6 - r->t_s * 1e3 : 0, b1 = sp ? (g1 - g_t0_ns) / 1e6 - r->t_s * 1e3 : 0;   // GPU 开工 / 收工时刻，相对本帧出图调用（负 = 出图前） | GPU begin / end relative to this frame's present call (negative = before present)
+        LOG("[帧账] %s帧 %llu（%.2f s）整帧 %.1f ms，提交+出图 %.1f ms，GPU %.1f ms（开工 %+.1f 收工 %+.1f）；通道 %u，绘制 %u；等待 取图 %.1f / 队列 %.1f / 同步 %.1f ms（%u 次）；遮挡查询 结果0 %u / 非零 %u", k == b ? "★" : "　", (unsigned long long)k, r->t_s, r->fr, r->nv, g, b0, b1, r->passes, r->draws, r->acq_ms, r->pq_ms, r->sync_ms, r->sync_n, atomic_load(&r->oq_z), atomic_load(&r->oq_nz)); }
 }
 static int ucmp(const void *a, const void *b) { unsigned x = *(const unsigned *)a, y = *(const unsigned *)b; return x < y ? -1 : x > y; }
 static void fr_summary(uint64_t f) {
@@ -1179,7 +1181,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     gfx_leave();
     if (nvn_serial() == 3) mtl_wait(mtl_last_fence(), UINT64_MAX);   // 3 = 只等本帧游戏提交做完（不等出图命令缓冲）：区分「帧间游戏提交重叠」与「出图命令缓冲参与的重叠」 | 3 = wait only for this frame's game submissions (not the present command buffer): separates cross-frame game-submit overlap from overlap involving the present command buffer
     else if (nvn_serial() == 4) mtl_present_flush();   // 4 = 只等出图命令缓冲做完 | 4 = wait only for the present command buffer
-    else if (nvn_serial() >= 1) mtl_finish();
+    else if (nvn_serial() >= 1 && nvn_serial() != 8) mtl_finish();   // 8 = 只在提交侧等上一个提交（nvn_mtl.m），出图处不收尾 | 8 = only the submit-side wait for the previous submit (nvn_mtl.m), no finish at present
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     if (nvn_real[0] || nvn_real[1]) {   // DM_NVN_PROF：录制期 = 除提交外全部已实现函数耗时；提交期 = QueueSubmitCommands | DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands

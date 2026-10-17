@@ -126,6 +126,11 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         // Present defaults to the present thread acquiring drawables itself (vsync left to CAMetalLayer), not the display-link callback: on Mac the callback stops for whole seconds whenever the system carries other load (VM / browser / builds),
         // and the host's fallbacks for that (dropping queued frames, re-presenting old ones) are exactly the flicker the player saw; on the self-driven path the same load barely flickers (measured 2026-10-16, same build, A/B within one session)
         if (!getenv("DM_PRESENT_LINK")) setenv("DM_PRESENT_LINK", "0", 1);
+        // 每帧出图时等本帧的 GPU 工作做完（DM_NVN_SERIAL=1）：实测（2026-10-17，GPU_SPIN 复现器各跑 110 s）不等时每局 3–9 个整帧黑 / 9–19 次大块错画，等了之后 0–1（剩下那 1 次在关卡读取过渡）；帧时间 p50 16.66 / p95 17.98 ms，最大从 48 ms 降到 19.7 ms。
+        // 机制：下一帧的 CPU 写与本帧 GPU 读跨帧重叠时出一帧错画（黑屏只剩特效、火焰闪、错贴图）；具体是哪块内存被覆盖仍未定位（见 README 五）。DM_NVN_SERIAL=0 可关掉对照
+        // Wait at each present for this frame's GPU work to finish (DM_NVN_SERIAL=1): measured (2026-10-17, GPU_SPIN reproducer, 110 s runs) 3-9 whole black frames / 9-19 large wrong-block events per run without it, 0-1 with it (the remaining one is at the level-load transition);
+        // frame time p50 16.66 / p95 17.98 ms, maximum down from 48 ms to 19.7 ms. Mechanism: a one-frame wrong picture (black with only effects, flickering fire, wrong textures) when the next frame's CPU writes overlap this frame's GPU reads across frames; which memory gets overwritten is still not located (see README section 5). DM_NVN_SERIAL=0 turns it off for comparison
+        if (!getenv("DM_NVN_SERIAL")) setenv("DM_NVN_SERIAL", "1", 1);
         // 不在映射表里的着色器缺省转储到应用支持目录 shdump/（只写控制段与代码区，几 KB 一条）：玩家正常游玩碰到的新着色器（弹反剑光等只在特定操作下才出现的特效）
         // 下一轮 tools/shaders_iterate.sh 直接从这里补进映射表，不必靠脚本复现那个操作 | Shaders missing from the map are dumped by default into shdump/ under Application Support (control section + code only, a few KB each):
         // new shaders met in normal play (effects such as the parry sword flash that only appear on specific inputs) are picked up by the next tools/shaders_iterate.sh run without scripting that input
