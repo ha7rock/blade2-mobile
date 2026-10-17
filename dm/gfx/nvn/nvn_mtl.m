@@ -170,9 +170,11 @@ static id<MTLBuffer> m3_buf(uint64_t gpu, NSUInteger *off) {
 // Test switch DM_RES_CENSUS=1 (not normally on): records every object that has entered the residency set (weak references); on the tick of the memory readout line it reports the count and size of those "still in the residency set" and those "removed from the residency set but not yet destroyed".
 // The latter = GPU memory we no longer use but someone still holds a reference to (for example an autorelease pool on a guest thread that is never drained)
 static NSHashTable *g_res_ever; static int g_res_census = -1;
+static uint64_t g_res_adds, g_res_removes, g_res_commits;   // 驻留集变更计数（分配账行打） | residency set change counters (printed on the allocation ledger line)
 static void res_add(id<MTLResource> r) {
     if (!r) return;
     pthread_mutex_lock(&g_res_mu);
+    g_res_adds++;
     [g_res addAllocation:(id<MTLAllocation>)r];
     if (!g_res_objects) g_res_objects = [NSHashTable weakObjectsHashTable];
     [g_res_objects addObject:r];
@@ -187,6 +189,7 @@ static void res_add(id<MTLResource> r) {
 static void res_remove(id<MTLResource> r) {
     if (!r) return;
     pthread_mutex_lock(&g_res_mu);
+    g_res_removes++;
     [g_res removeAllocation:(id<MTLAllocation>)r];
     [g_res_objects removeObject:r];
 #if DM_NVN_M3
@@ -212,7 +215,7 @@ static void res_check(id r, const char *what, int reg) {
 }
 static void res_commit(void) {
     pthread_mutex_lock(&g_res_mu);
-    if (g_res_dirty) { [g_res commit]; g_res_dirty = 0; }
+    if (g_res_dirty) { [g_res commit]; g_res_dirty = 0; g_res_commits++; }
     pthread_mutex_unlock(&g_res_mu);
 }
 
@@ -1588,13 +1591,26 @@ static inline int tex_pool_src(const tex_t *t) {
 }
 // 重传排行（诊断）：各池来源贴图的重传次数，随「预排布贴图」统计行打前 6 名（看是谁在每帧改池内容） | Re-upload ranking (diagnostic): re-upload count per pool-sourced texture, the top 6 are printed with the periodic statistics line (shows who rewrites pool content every frame)
 static NvPkg *g_reup_tab[64]; static int g_reup_n;
+// 重传榜前 6 名被哪些着色器采样（阶段:键前 16 位，每张最多记 4 个）：定位「每帧被 CPU 重写的贴图」是谁在用 | which shaders sample the top-6 re-uploaded textures (stage:key, up to 4 per texture): tells who uses the textures the CPU rewrites every frame
+static uint64_t g_reup_watch_ser[6]; static char g_reup_who[6][4][28]; static int g_reup_who_n[6];
+static void reup_who_note(uint64_t ser, const char *key, int stage) {
+    if (!ser || !key || !key[0]) return;
+    for (int i = 0; i < 6; i++) if (g_reup_watch_ser[i] == ser) {
+        char nm[28]; snprintf(nm, sizeof nm, "st%d:%.16s", stage, key);
+        for (int k = 0; k < g_reup_who_n[i]; k++) if (!strcmp(g_reup_who[i][k], nm)) return;
+        if (g_reup_who_n[i] < 4) strlcpy(g_reup_who[i][g_reup_who_n[i]++], nm, sizeof g_reup_who[i][0]);
+        return; }
+}
 static void reup_note(NvPkg *pk) { for (int i = 0; i < g_reup_n; i++) if (g_reup_tab[i] == pk) return; if (g_reup_n < 64) g_reup_tab[g_reup_n++] = pk; }
 void mtl_reup_report(void) {
-    static uint32_t last[64]; char line[600]; int o = 0;
+    static uint32_t last[64]; char line[1400]; int o = 0;
     int idx[64]; for (int i = 0; i < g_reup_n; i++) idx[i] = i;
     for (int i = 0; i < g_reup_n; i++) for (int j = i + 1; j < g_reup_n; j++) if (g_reup_tab[idx[j]]->reups - last[idx[j]] > g_reup_tab[idx[i]]->reups - last[idx[i]]) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
     for (int k = 0; k < g_reup_n && k < 6 && o < (int)sizeof line - 80; k++) { NvPkg *pk = g_reup_tab[idx[k]]; uint32_t d = pk->reups - last[idx[k]]; if (!d) break;
-        o += snprintf(line + o, sizeof line - o, " ser=%llu %ux%ux%u t%d lv%u f%#x fl%#x:+%u", (unsigned long long)pk->ser, pk->w, pk->h, pk->depth, pk->target, pk->lv, pk->fmt, pk->flags, d); }
+        o += snprintf(line + o, sizeof line - o, " ser=%llu %ux%ux%u t%d lv%u f%#x fl%#x:+%u", (unsigned long long)pk->ser, pk->w, pk->h, pk->depth, pk->target, pk->lv, pk->fmt, pk->flags, d);
+        int wi = -1; for (int i = 0; i < 6; i++) if (g_reup_watch_ser[i] == pk->ser) wi = i;
+        if (wi < 0) { for (int i = 0; i < 6 && wi < 0; i++) if (!g_reup_watch_ser[i]) wi = i; if (wi < 0) wi = k; g_reup_watch_ser[wi] = pk->ser; g_reup_who_n[wi] = 0; }
+        if (g_reup_who_n[wi]) { o += snprintf(line + o, sizeof line - o, "（用者"); for (int q = 0; q < g_reup_who_n[wi] && o < (int)sizeof line - 40; q++) o += snprintf(line + o, sizeof line - o, " %s", g_reup_who[wi][q]); o += snprintf(line + o, sizeof line - o, "）"); } }
     for (int i = 0; i < g_reup_n; i++) last[i] = g_reup_tab[i]->reups;
     if (o) MLOG("重传排行（本段）%s", line);
 }
@@ -1707,7 +1723,9 @@ static void al_report(unsigned long long frame) {
     uint64_t asz = 0; for (int i = 0; i < g_alloc_n; i++) if (g_alloc4[i]) asz += g_alloc4[i].allocatedSize;
     uint64_t usz = 0, psz = 0; for (int i = 0; i < 3; i++) { if (g_up_alloc4[i]) usz += g_up_alloc4[i].allocatedSize; if (g_present_alloc4[i]) psz += g_present_alloc4[i].allocatedSize; }
     for (int i = 0; i < 2; i++) if (g_rep_alloc4[i]) psz += g_rep_alloc4[i].allocatedSize;
-    MLOG("分配账 至帧 %llu：本段新建 %.1f MB；命令分配器 主 %llu 个 %.1f MB / 上传 %.1f MB / 出图 %.1f MB；新建最多：%s", frame, tot / 1048576.0, (unsigned long long)g_alloc_n, asz / 1048576.0, usz / 1048576.0, psz / 1048576.0, o ? line : " 无");
+    static uint64_t la, lr, lc; uint64_t ra = g_res_adds, rr = g_res_removes, rc = g_res_commits;
+    MLOG("分配账 至帧 %llu：本段新建 %.1f MB；驻留集 本段 加 %llu / 删 %llu / 提交 %llu 次；命令分配器 主 %llu 个 %.1f MB / 上传 %.1f MB / 出图 %.1f MB；新建最多：%s", frame, tot / 1048576.0, (unsigned long long)(ra - la), (unsigned long long)(rr - lr), (unsigned long long)(rc - lc), (unsigned long long)g_alloc_n, asz / 1048576.0, usz / 1048576.0, psz / 1048576.0, o ? line : " 无");
+    la = ra; lr = rr; lc = rc;
 }
 static void res_census(unsigned long long frame, unsigned long long rss_mb) {
     @autoreleasepool {
@@ -3458,6 +3476,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType);
             if (t) texfacts_note(sh, reg, t.textureType);
+            if (t && tid < g_ntreg) reup_who_note(g_treg[tid].t.serial, sh->key, nvn_stage);
             if (t && nvn_stage == 1 && tid < g_ntreg) texraw_sel_note(t, g_treg[tid].t.serial);
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
             slots[aid] = trid;
