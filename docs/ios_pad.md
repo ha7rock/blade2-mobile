@@ -1,4 +1,4 @@
-# iOS 触摸虚拟手柄图层（设计，2026-10-18，第 2 稿：缩小 + 系统手柄图标）
+# iOS 触摸虚拟手柄图层（设计，2026-10-18，第 3 稿：按实际用法的扇形布局）
 
 代码：`dm/ios/blade/Sources/pad_layout.h`（几何 + 绘制，纯 C / CoreGraphics；键帽是系统 SF Symbols 的手柄图标 `a.circle` / `zl.button.roundedtop.horizontal` / `dpad` / `l.joystick`…，正是 Switch 的键形，由宿主按名提供位图、这里染白摆放，按下换 `.fill` 实心变体）、`dm/ios/blade/Sources/front_blade.m`（触点归类、淡出、震感）、`tools/pad_mockup.m`（Mac 上出效果图，用的是同一份几何与绘制代码）。
 
@@ -6,28 +6,32 @@
 
 | | |
 |---|---|
-| ![15 Pro 按着](screenshots/ios_pad_15pro.jpg) iPhone 15 Pro 横屏 852×393 点，安全区 左右 59 / 下 21（黄虚线）；左摇杆推右上、A 与 ZL 按下 | ![15 Pro 空闲](screenshots/ios_pad_15pro_idle.jpg) 同机型，松手 2.5 s 后的空闲态（整层透明度 0.45） |
-| ![SE](screenshots/ios_pad_se.jpg) iPhone SE 级 667×375 点、无安全区、16:9 铺满；B 与十字键下按下 | |
+| ![15 Pro 按着](screenshots/ios_pad_15pro.jpg) iPhone 15 Pro 横屏 852×393 点，安全区 左右 59 / 下 21（黄虚线）；左摇杆推右上、Y 与 R 按下 | ![15 Pro 空闲](screenshots/ios_pad_15pro_idle.jpg) 同机型，松手 2.5 s 后的空闲态（整层透明度 0.45） |
+| ![SE](screenshots/ios_pad_se.jpg) iPhone SE 级 667×375 点、无安全区、16:9 铺满；B 按下 | |
 
 ## 依据
 
 - 游戏的输入映射（pak 里的 `BladeII/Config/DefaultInput.ini`）：全部手柄键都映射成动作——面键 4、L/R、ZL/ZR、十字键 4、＋/−、L3/R3；左摇杆是移动轴（轴死区 0.25），右摇杆只在背包里转角色（`InvenRotateMove`）。
-- 战斗 HUD 右下 4 个技能格的键提示是 L / ZL / R / ZR，面键菱形是主攻击 / 闪避区。
+- 战斗 HUD 右下 7 个格的键提示：上排 L / X / R，下排 ZL / Y / A / B / ZR。作者真机确认的用法：**Y 普攻（最常用）、B 格挡（第二常用，精确防御后反击）、A 技能、L 终结技、R 闪避**，ZL / ZR 基本不用，十字键对应摇杆方向。
+- 手游的通行做法：一个普攻大键贴角，其余键按使用频率呈扇形围在它旁边，键与键之间留真实间隙。第 2 稿的菱形键距 1.45r 而键半径 r，相邻键边缘只差 1 点、命中圈互相重叠，这是"大小和间隙不对"的根源。
 - 出图是 16:9 居中留黑边（`nvn_mtl.m` 出图视口），iPhone 19.5:9 两侧各有约 0.09 H 的黑柱。
 
 ## 布局
 
-尺寸基准 `r = H × 0.058`，夹在 17–32 点（iPhone 横屏 393 点高 → 22.8 点，面键直径 46 点 ≥ 44 点可点最小值，技能键帽宽 34 点）。全部相对安全区。第 1 稿是 0.075 H 的粗白圈 + 字母，被否（太大、太丑）。
+尺寸基准 `r = H × 0.058`，夹在 17–32 点（iPhone 横屏 393 点高 → 22.8 点）。全部相对安全区。第 1 稿 0.075 H 粗白圈 + 字母被否（太大太丑）；第 2 稿缩小 + 图标但仍是 Switch 菱形、键贴键，被否（没按实际用法、大小间隙不对）。
 
-| 控件 | 位置 | 半径 / 命中 |
+| 控件 | 位置 | 半径 / 命中（15 Pro 直径） |
 |---|---|---|
-| A / B / X / Y 菱形（Switch 排法：X 上 Y 左 A 右 B 下） | 中心离右下安全角 (2.4r, 2.4r)，键距 1.45r；深色圆底 + `x.circle` 等圆标 | r / 1.1r |
-| ZL L R ZR 技能弧 | 绕菱形中心半径 3.05r，190° → 265°（从左到上），都在右拇指转动半径内；键帽形深色圆角底 + `zl.button.roundedtop.horizontal` 等键帽 | 0.72r / 0.92r |
+| **Y 普攻** | 贴右下安全角，边距 0.5r；深色圆底 + `y.circle` | 1.45r / 1.55r（66 点） |
+| 内扇 **B 格挡 / R 闪避 / A 技能** | 绕 Y 中心 D1 = 2.65r（与 Y 边缘留 0.3r ≈ 7 点），172°（正左，拇指平移最顺手）/ 222° / 272° | 0.9r / 1.05r（41 点，命中 48 点） |
+| 外扇 ZL / **L 终结技** / X / ZR | 绕 Y 中心 D2 = 4.7r（与内扇留 0.3r），177° / 207° / 237° / 267°，与内扇错开成蜂窝；L R 键帽形圆角底 | ZL ZR 0.7r，L 0.85r，X 0.8r（32 / 39 / 36 点） |
 | − ＋ | 右上角，`minus.circle` / `plus.circle`，无底 | 0.5r / 0.75r |
-| L3 R3 | 左上角（极少用，最小最淡），`l.joystick.press.down` / `r.joystick.press.down` | 0.5r / 0.75r |
-| 十字键 | 左侧中部、摇杆区之上（矮屏自动让开 L3 R3）：一个 `dpad` 图标（边长 2.2r）+ 深色圆底，按下画 `dpad.<向>.filled`；命中仍按四个方向分 | 0.5r / 0.625r |
-| 左摇杆 | 左 45% 屏空处浮动，落点为中心，满偏 1.8r（底盘黑 0.18 + 1 点细圈，滑块 0.42 满偏半径）；空闲时左下 (2.2r, 2.2r) 只画一个淡的 `l.joystick` 图标 | 8% 死区（游戏自己还有 0.25） |
+| L3 R3 | 左上角（极少用，最小最淡） | 0.5r / 0.75r |
+| 十字键 | 左侧中部、摇杆区之上（矮屏自动让开 L3 R3）：一个 `dpad` 图标 + 深色圆底，按下画 `dpad.<向>.filled`；命中按四向分 | 0.5r / 0.625r |
+| 左摇杆 | 左 45% 屏空处浮动，落点为中心，满偏 1.8r；空闲时左下 (2.2r, 2.2r) 只画一个淡的 `l.joystick` 图标 | 8% 死区（游戏自己还有 0.25） |
 | 右摇杆 | 右 55% 屏空处（背包转角色），不画空闲圈 | 同上 |
+
+效果图工具每次都打印每个键与最近邻的**边缘间隙**和**命中圈间隙**（负数 = 重叠）：第 3 稿右手簇边缘间隙最小 6.8 点（Y 与内扇）、其余 11–13 点，命中圈全部不重叠；十字键四向是故意叠成一个图标的，命中取最近者。
 
 ## 行为
 
@@ -38,11 +42,11 @@
 
 ## 改布局的流程
 
-改 `pad_layout.h`（图标名在 `k_glyph`，可换成任意 SF Symbols）→ `clang -fobjc-arc -framework AppKit -framework CoreText -I dm/host -I dm/ios/blade/Sources tools/pad_mockup.m -o /tmp/pad_mockup` → `/tmp/pad_mockup docs/screenshots/03_skeletons.jpg out.png 852 393 0 59 21 59 3 A,ZL 0.7,0.5 1` 看图（工具还会打印每个键的中心 / 半径 / 命中半径）→ 真机 `dm/ios/blade/run.sh build && install && launch`。
+改 `pad_layout.h`（图标名在 `k_glyph`，可换成任意 SF Symbols）→ `clang -fobjc-arc -framework AppKit -framework CoreText -I dm/host -I dm/ios/blade/Sources tools/pad_mockup.m -o /tmp/pad_mockup` → `/tmp/pad_mockup docs/screenshots/03_skeletons.jpg out.png 852 393 0 59 21 59 3 Y,R 0.7,0.5 1` 看图（工具还会打印每个键的中心 / 半径 / 命中半径 / 与最近邻的间隙）→ 真机 `dm/ios/blade/run.sh build && install && launch`。
 
 ## 真机上要验的
 
 1. 启动日志 `虚拟手柄：窗口 … 安全区 …` 一行的数值与机型相符（横屏左右 59、下 21）。
-2. 拇指盲按菱形与技能弧不误触、不漏触；摇杆落点区与十字键不打架；图标在真机上的清晰度（3x 位图，渲染字号 64）。
+2. 右手拇指停在 Y 上，盲按 B / R / A / L 不误触、不漏触，Y→B 的平移格挡手法顺手；摇杆落点区与十字键不打架；图标在真机上的清晰度（3x 位图，渲染字号 64）。
 3. 空闲淡出不遮 HUD；背包里右半屏滑动能转角色。
 4. 整层 `drawRect` 的重绘开销（每次触点变化重画一次 Core Graphics）对帧时间的影响——如可见，改成 CALayer 分层只动变化的键。

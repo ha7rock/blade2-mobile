@@ -55,7 +55,10 @@ int main(int argc, char **argv) {
         NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:out]; NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
         if (![png writeToFile:@(argv[2]) atomically:YES]) { fprintf(stderr, "写不了 %s\n", argv[2]); return 1; }
         printf("%s：%zux%zu 像素，基准半径 %.1f 点，画面 %.0f,%.0f %.0fx%.0f，摇杆满偏 %.0f 点，分界 x=%.0f\n", argv[2], pw, ph, L.r, L.pic.origin.x, L.pic.origin.y, L.pic.size.width, L.pic.size.height, L.stick_r, L.split_x);
-        for (int i = 0; i < PB_N; i++) printf("  %-3s 中心 %6.1f,%6.1f 半径 %4.1f 命中 %4.1f\n", k_label[i], L.btn[i].c.x, L.btn[i].c.y, L.btn[i].r, L.btn[i].hit);
+        for (int i = 0; i < PB_N; i++) {   // 每个键：中心、半径、命中半径、与最近邻的边缘间隙 / 命中圈间隙（负 = 重叠） | per key: centre, radius, hit radius, edge gap / hit-circle gap to the nearest neighbour (negative = overlap)
+            int nb = -1; double eg = 1e9, hg = 1e9;
+            for (int j = 0; j < PB_N; j++) if (j != i) { double d = hypot(L.btn[j].c.x - L.btn[i].c.x, L.btn[j].c.y - L.btn[i].c.y), e = d - L.btn[i].r - L.btn[j].r; if (e < eg) { eg = e; hg = d - L.btn[i].hit - L.btn[j].hit; nb = j; } }
+            printf("  %-3s 中心 %6.1f,%6.1f 半径 %4.1f 命中 %4.1f  最近 %-3s 边缘间隙 %5.1f 命中圈间隙 %5.1f\n", k_label[i], L.btn[i].c.x, L.btn[i].c.y, L.btn[i].r, L.btn[i].hit, nb >= 0 ? k_label[nb] : "-", eg, hg); }
         CGImageRelease(out); CGContextRelease(g); CGColorSpaceRelease(cs);
     }
     return 0;

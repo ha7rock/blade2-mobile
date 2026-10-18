@@ -5,13 +5,14 @@
 // 没有图标时退回画字。坐标系：原点左上、y 向下（UIKit drawRect 的上下文即如此；效果图工具自己翻转位图上下文）。
 //
 // 布局依据（BladeII/Config/DefaultInput.ini）：游戏把全部手柄键都映射成动作（面键 4、肩键 L/R、扳机 ZL/ZR、十字键 4、＋ −、L3 R3），
-// 左摇杆走移动轴（死区 0.25），右摇杆只在背包里旋转角色（InvenRotateMove）。战斗 HUD 右下角 4 个技能格的键提示是 L / ZL / R / ZR，所以：
-//   · 右下：A/B/X/Y 菱形（Switch 排法：X 上 Y 左 A 右 B 下；主攻击 / 闪避区，最大）；外圈 4 个技能键按 ZL L R ZR 从左到上排成弧，都在右手拇指转动半径内；
+// 左摇杆走移动轴（死区 0.25），右摇杆只在背包里旋转角色（InvenRotateMove）。战斗 HUD 右下 7 个格的键提示：上排 L / X / R，下排 ZL / Y / A / B / ZR，
+// 实际用法（作者真机确认）：Y 普攻（最常用）、B 格挡（第二常用，精确防御后反击）、A 技能、L 终结技、R 闪避，ZL ZR 基本不用。所以按手游的做法：
+//   · 右下：Y 一个普攻大键贴角；其余键按频率呈扇形围着它——内扇 B R A、外扇 L X 中段、ZL ZR 两端最小；键与键之间留实打实的间隙（≥ 0.3r ≈ 7 点），命中圈互不重叠；
 //   · 左半屏：浮动左摇杆（落点为中心），空闲时左下只画一个淡的摇杆图标提示；十字键一个图标放左侧中部、摇杆区之上；
 //   · 顶边：左上 L3 R3（极少用，最小最淡），右上 − ＋；
 //   · 右半屏空处 = 右摇杆（只有背包用，不画空闲提示）。
-// 画面是 16:9 居中留黑边（nvn_mtl.m 的出图视口），iPhone 19.5:9 两侧各有约 H×0.09 的黑柱，摇杆提示与菱形的外沿落在黑柱里，少盖 HUD。
-// 尺寸以窗口高为基准：r = H×0.058（夹在 17–32 点，DM_PAD_SCALE 再乘），iPhone 横屏 393 点高 → 面键直径 46 点（≥ 44 点可点最小值），技能键 33 点。
+// 画面是 16:9 居中留黑边（nvn_mtl.m 的出图视口），iPhone 19.5:9 两侧各有约 H×0.09 的黑柱，摇杆提示与右手簇的外沿落在黑柱里，少盖 HUD。
+// 尺寸以窗口高为基准：r = H×0.058（夹在 17–32 点，DM_PAD_SCALE 再乘），iPhone 横屏 393 点高 → Y 直径 66 点、B R A 41 点（命中 50 点）、L 39 点、X 36 点、ZL ZR 32 点。
 //
 // Touch gamepad layer for Blade II: geometry (where, how big, hit testing) and drawing (CoreGraphics), plain C with no UIKit dependency,
 // so the iOS shell (overlay in front_blade.m) and the Mac mock-up tool (tools/pad_mockup.m) share one copy -- what the mock-up shows is what the device draws.
@@ -21,12 +22,13 @@
 //
 // Layout rationale (BladeII/Config/DefaultInput.ini): the game maps every controller button to an action (4 face, L/R, ZL/ZR, 4 d-pad, + -, L3 R3),
 // the left stick drives the move axes (dead zone 0.25) and the right stick is only used to rotate the character in the inventory (InvenRotateMove).
-// The combat HUD's four skill slots bottom right are labelled L / ZL / R / ZR, hence:
-//   - bottom right: A/B/X/Y diamond (Switch order: X top, Y left, A right, B bottom; attack / dodge, largest); an outer arc of the 4 skill keys ZL L R ZR from left to top;
+// The combat HUD's seven slots bottom right are labelled L / X / R (top row) and ZL / Y / A / B / ZR (bottom row): Y is the whip strike (primary attack), A the dash (dodge),
+// Actual use (confirmed by the author on hardware): Y basic attack (most used), B block (second, perfect guard then counter), A skill, L finisher, R dodge, ZL ZR hardly ever. Hence, the mobile-game way:
+//   - bottom right: one big basic-attack key Y in the corner; the rest fanned around it by frequency -- inner fan B R A, outer fan L X mid-arc, ZL ZR smallest at the ends; real gaps between keys (>= 0.3r ~ 7 pt), hit circles never overlap;
 //   - left half: floating left stick (landing point = centre), idle = one faint joystick glyph bottom left; one d-pad glyph mid-left above the stick zone;
 //   - top edge: L3 R3 top left (rarely used, smallest and faintest), - + top right;
 //   - free space in the right half = right stick (inventory only, no idle hint).
-// Sizes are relative to the window height: r = H*0.058 (clamped 17-32 pt, times DM_PAD_SCALE); 393 pt landscape iPhone -> 46 pt face buttons (>= 44 pt minimum), 33 pt skill keys.
+// Sizes are relative to the window height: r = H*0.058 (clamped 17-32 pt, times DM_PAD_SCALE); 393 pt landscape iPhone -> Y 66 pt, B R A 41 pt (50 pt hit), L 39 pt, X 36 pt, ZL ZR 32 pt.
 #pragma once
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreText/CoreText.h>
@@ -69,14 +71,24 @@ static inline void pad_layout_make(pad_layout *L, CGSize sz, CGFloat in_top, CGF
     CGFloat H = sz.height, W = sz.width, r = fmin(32, fmax(17, H * 0.058)) * (scale > 0 ? scale : 1);
     CGFloat bot = H - in_bottom, top = in_top, left = in_left, right = W - in_right;
     L->size = sz; L->pic = pad_picture_rect(sz); L->r = r; L->stick_r = 1.8 * r; L->split_x = W * 0.45;
-    // 菱形：中心离右下安全角 2.4r；键距 1.45r；命中 1.1r | diamond: centre 2.4r from the bottom-right safe corner; pitch 1.45r; hit 1.1r
-    CGPoint d = CGPointMake(right - 2.4 * r, bot - 2.4 * r);
-    L->btn[PB_A] = pad_c(d.x + 1.45 * r, d.y, r, 1.1 * r); L->btn[PB_B] = pad_c(d.x, d.y + 1.45 * r, r, 1.1 * r);
-    L->btn[PB_Y] = pad_c(d.x - 1.45 * r, d.y, r, 1.1 * r); L->btn[PB_X] = pad_c(d.x, d.y - 1.45 * r, r, 1.1 * r);
-    // 技能弧：绕菱形中心半径 3.05r，190°→265°（y 向下：190° 偏左略下，265° 正上略右），顺序 ZL L R ZR；键帽半宽 0.72r，命中 0.92r
-    // skill arc: radius 3.05r around the diamond centre, 190 -> 265 degrees (y down), order ZL L R ZR; cap half-width 0.72r, hit 0.92r
-    static const int arc_btn[4] = {PB_ZL, PB_L, PB_R, PB_ZR}; static const double arc_deg[4] = {190, 215, 240, 265};
-    for (int i = 0; i < 4; i++) { double a = arc_deg[i] * M_PI / 180; L->btn[arc_btn[i]] = pad_c(d.x + 3.05 * r * cos(a), d.y + 3.05 * r * sin(a), 0.72 * r, 0.92 * r); }
+    // 右手簇（手游打法：一个主攻击大键，其余按使用频率呈扇形围在它旁边）：
+    //   Y 普攻：半径 1.45r，贴右下安全角（边距 0.5r）；
+    //   内扇 B R A：半径 0.9r，离 Y 中心 D1（与 Y 边缘留 0.3r），172°（正左，拇指平移最顺手）= B 格挡（第二常用）、222°（左上）= R 闪避、272°（正上）= A 技能；
+    //   外扇 ZL L X ZR：离 Y 中心 D2（与内扇边缘留 0.3r），177° = ZL（0.7r，少用）、207° = L 终结技（0.85r）、237° = X（0.8r）、267° = ZR（0.7r，少用）；与内扇错开成蜂窝。
+    //   命中圈 = 画的半径 + 0.2r，相邻命中圈不重叠；pad_hit 取最近者。
+    // right-hand cluster (mobile-game logic: one big primary attack key, the rest fanned around it by frequency of use):
+    //   Y basic attack: radius 1.45r, tucked into the bottom-right safe corner (0.5r margin);
+    //   inner fan B R A: radius 0.9r, D1 from Y's centre (0.3r clear of Y's edge): 172 deg (straight left, the easiest thumb slide) = B block (second most used), 222 deg (up-left) = R dodge, 272 deg (straight up) = A skill;
+    //   outer fan ZL L X ZR: D2 from Y's centre (0.3r clear of the inner fan): 177 deg = ZL (0.7r, rare), 207 deg = L finisher (0.85r), 237 deg = X (0.8r), 267 deg = ZR (0.7r, rare); staggered against the inner fan, honeycomb style.
+    //   hit radius = drawn radius + 0.2r; neighbouring hit circles do not overlap; pad_hit takes the nearest.
+    CGFloat R0 = 1.45 * r, R1 = 0.9 * r, R2 = 0.85 * r, R2x = 0.8 * r, R2s = 0.7 * r, gap = 0.3 * r;
+    CGPoint y0 = CGPointMake(right - (R0 + 0.5 * r), bot - (R0 + 0.5 * r));
+    L->btn[PB_Y] = pad_c(y0.x, y0.y, R0, R0 + 0.1 * r);
+    CGFloat D1 = R0 + gap + R1, D2 = D1 + R1 + gap + R2;
+    static const int in_btn[3] = {PB_B, PB_R, PB_A}; static const double in_deg[3] = {172, 222, 272};
+    for (int i = 0; i < 3; i++) { double a = in_deg[i] * M_PI / 180; L->btn[in_btn[i]] = pad_c(y0.x + D1 * cos(a), y0.y + D1 * sin(a), R1, R1 + 0.15 * r); }
+    static const int out_btn[4] = {PB_ZL, PB_L, PB_X, PB_ZR}; static const double out_deg[4] = {177, 207, 237, 267}; const CGFloat out_rad[4] = {R2s, R2, R2x, R2s};
+    for (int i = 0; i < 4; i++) { double a = out_deg[i] * M_PI / 180; CGFloat rr = out_rad[i]; L->btn[out_btn[i]] = pad_c(y0.x + D2 * cos(a), y0.y + D2 * sin(a), rr, rr + 0.2 * r); }
     // 顶边：右上 − ＋，左上 L3 R3 | top edge: - + top right, L3 R3 top left
     L->btn[PB_PLUS] = pad_c(right - 0.8 * r, top + 0.8 * r, 0.5 * r, 0.75 * r); L->btn[PB_MINUS] = pad_c(right - 2.1 * r, top + 0.8 * r, 0.5 * r, 0.75 * r);
     L->btn[PB_LS] = pad_c(left + 0.8 * r, top + 0.8 * r, 0.5 * r, 0.75 * r); L->btn[PB_RS] = pad_c(left + 2.1 * r, top + 0.8 * r, 0.5 * r, 0.75 * r);
