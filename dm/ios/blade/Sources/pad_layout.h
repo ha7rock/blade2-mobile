@@ -4,15 +4,14 @@
 // 由宿主通过 pad_glyph 回调提供位图（iOS：UIImage systemImageNamed；Mac：NSImage imageWithSystemSymbolName），这里只负责摆放与染色；
 // 没有图标时退回画字。坐标系：原点左上、y 向下（UIKit drawRect 的上下文即如此；效果图工具自己翻转位图上下文）。
 //
-// 布局依据（BladeII/Config/DefaultInput.ini）：游戏把全部手柄键都映射成动作（面键 4、肩键 L/R、扳机 ZL/ZR、十字键 4、＋ −、L3 R3），
-// 左摇杆走移动轴（死区 0.25），右摇杆只在背包里旋转角色（InvenRotateMove）。战斗 HUD 右下 7 个格的键提示：上排 L / X / R，下排 ZL / Y / A / B / ZR，
-// 实际用法（作者真机确认）：Y 普攻（最常用）、B 格挡（第二常用，精确防御后反击）、A 技能、L 终结技、R 闪避，ZL ZR 基本不用。所以按手游的做法：
-//   · 右下：Y 一个普攻大键贴角；其余键按频率呈扇形围着它——内扇 B R A、外扇 L X 中段、ZL ZR 两端最小；键与键之间留实打实的间隙（≥ 0.3r ≈ 7 点），命中圈互不重叠；
-//   · 左半屏：浮动左摇杆（落点为中心），空闲时左下只画一个淡的摇杆图标提示；十字键一个图标放左侧中部、摇杆区之上；
-//   · 顶边：左上 L3 R3（极少用，最小最淡），右上 − ＋；
-//   · 右半屏空处 = 右摇杆（只有背包用，不画空闲提示）。
-// 画面是 16:9 居中留黑边（nvn_mtl.m 的出图视口），iPhone 19.5:9 两侧各有约 H×0.09 的黑柱，摇杆提示与右手簇的外沿落在黑柱里，少盖 HUD。
-// 尺寸以窗口高为基准：r = H×0.058（夹在 17–32 点，DM_PAD_SCALE 再乘），iPhone 横屏 393 点高 → Y 直径 66 点、B R A 41 点（命中 50 点）、L 39 点、X 36 点、ZL ZR 32 点。
+// 布局依据：这是原生手柄游戏，战斗 HUD 右下本来就把 8 个键摆成一块 7 格菱形（上排 L X R、中排 Y A、下排 ZL B ZR，格里是技能图和键名），
+// 实际用法（作者真机确认）Y 普攻、B 格挡、A 技能、L 终结技、R 闪避。所以 iOS 上不另造手游布局，右手 8 键就半透明地叠在这些格子上、位置随 16:9 画面缩放，
+// 玩家按的就是屏幕上看到的那个格子；左半屏浮动左摇杆（移动轴，死区 0.25）+ 一个十字键图标（方向键 = 摇杆方向）；顶边 L3 R3 / − ＋ 小图标；右半屏空处 = 右摇杆（只有背包用）。
+// Layout rationale: this is a native controller game whose combat HUD already arranges the 8 keys as a 7-slot diamond block bottom right (top row L X R, middle Y A, bottom ZL B ZR, each slot showing the skill icon and key name);
+// actual use (confirmed by the author on hardware): Y attack, B block, A skill, L finisher, R dodge. So on iOS no mobile-style layout is invented: the 8 right-hand keys sit translucently on those very slots, scaling with the 16:9 picture,
+// and the player presses the slot they see; left half = floating left stick (move axes, dead zone 0.25) + one d-pad glyph (d-pad = stick directions); top edge L3 R3 / - + small glyphs; free right half = right stick (inventory only).
+// 画面是 16:9 居中留黑边（nvn_mtl.m 的出图视口），iPhone 19.5:9 两侧各有约 H×0.09 的黑柱，摇杆提示落在黑柱里，少盖画面。
+// 左侧 / 顶边控件以窗口高为基准：r = H×0.058（夹在 17–32 点，DM_PAD_SCALE 再乘）；右手 8 键以画面宽为基准，见 pad_layout_make。
 //
 // Touch gamepad layer for Blade II: geometry (where, how big, hit testing) and drawing (CoreGraphics), plain C with no UIKit dependency,
 // so the iOS shell (overlay in front_blade.m) and the Mac mock-up tool (tools/pad_mockup.m) share one copy -- what the mock-up shows is what the device draws.
@@ -28,7 +27,7 @@
 //   - left half: floating left stick (landing point = centre), idle = one faint joystick glyph bottom left; one d-pad glyph mid-left above the stick zone;
 //   - top edge: L3 R3 top left (rarely used, smallest and faintest), - + top right;
 //   - free space in the right half = right stick (inventory only, no idle hint).
-// Sizes are relative to the window height: r = H*0.058 (clamped 17-32 pt, times DM_PAD_SCALE); 393 pt landscape iPhone -> Y 66 pt, B R A 41 pt (50 pt hit), L 39 pt, X 36 pt, ZL ZR 32 pt.
+// Left-side / top-edge controls scale with the window height: r = H*0.058 (clamped 17-32 pt, times DM_PAD_SCALE); the 8 right-hand keys scale with the picture width, see pad_layout_make.
 #pragma once
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreText/CoreText.h>
@@ -71,24 +70,18 @@ static inline void pad_layout_make(pad_layout *L, CGSize sz, CGFloat in_top, CGF
     CGFloat H = sz.height, W = sz.width, r = fmin(32, fmax(17, H * 0.058)) * (scale > 0 ? scale : 1);
     CGFloat bot = H - in_bottom, top = in_top, left = in_left, right = W - in_right;
     L->size = sz; L->pic = pad_picture_rect(sz); L->r = r; L->stick_r = 1.8 * r; L->split_x = W * 0.45;
-    // 右手簇（手游打法：一个主攻击大键，其余按使用频率呈扇形围在它旁边）：
-    //   Y 普攻：半径 1.45r，贴右下安全角（边距 0.5r）；
-    //   内扇 B R A：半径 0.9r，离 Y 中心 D1（与 Y 边缘留 0.3r），172°（正左，拇指平移最顺手）= B 格挡（第二常用）、222°（左上）= R 闪避、272°（正上）= A 技能；
-    //   外扇 ZL L X ZR：离 Y 中心 D2（与内扇边缘留 0.3r），177° = ZL（0.7r，少用）、207° = L 终结技（0.85r）、237° = X（0.8r）、267° = ZR（0.7r，少用）；与内扇错开成蜂窝。
-    //   命中圈 = 画的半径 + 0.2r，相邻命中圈不重叠；pad_hit 取最近者。
-    // right-hand cluster (mobile-game logic: one big primary attack key, the rest fanned around it by frequency of use):
-    //   Y basic attack: radius 1.45r, tucked into the bottom-right safe corner (0.5r margin);
-    //   inner fan B R A: radius 0.9r, D1 from Y's centre (0.3r clear of Y's edge): 172 deg (straight left, the easiest thumb slide) = B block (second most used), 222 deg (up-left) = R dodge, 272 deg (straight up) = A skill;
-    //   outer fan ZL L X ZR: D2 from Y's centre (0.3r clear of the inner fan): 177 deg = ZL (0.7r, rare), 207 deg = L finisher (0.85r), 237 deg = X (0.8r), 267 deg = ZR (0.7r, rare); staggered against the inner fan, honeycomb style.
-    //   hit radius = drawn radius + 0.2r; neighbouring hit circles do not overlap; pad_hit takes the nearest.
-    CGFloat R0 = 1.45 * r, R1 = 0.9 * r, R2 = 0.85 * r, R2x = 0.8 * r, R2s = 0.7 * r, gap = 0.3 * r;
-    CGPoint y0 = CGPointMake(right - (R0 + 0.5 * r), bot - (R0 + 0.5 * r));
-    L->btn[PB_Y] = pad_c(y0.x, y0.y, R0, R0 + 0.1 * r);
-    CGFloat D1 = R0 + gap + R1, D2 = D1 + R1 + gap + R2;
-    static const int in_btn[3] = {PB_B, PB_R, PB_A}; static const double in_deg[3] = {172, 222, 272};
-    for (int i = 0; i < 3; i++) { double a = in_deg[i] * M_PI / 180; L->btn[in_btn[i]] = pad_c(y0.x + D1 * cos(a), y0.y + D1 * sin(a), R1, R1 + 0.15 * r); }
-    static const int out_btn[4] = {PB_ZL, PB_L, PB_X, PB_ZR}; static const double out_deg[4] = {177, 207, 237, 267}; const CGFloat out_rad[4] = {R2s, R2, R2x, R2s};
-    for (int i = 0; i < 4; i++) { double a = out_deg[i] * M_PI / 180; CGFloat rr = out_rad[i]; L->btn[out_btn[i]] = pad_c(y0.x + D2 * cos(a), y0.y + D2 * sin(a), rr, rr + 0.2 * r); }
+    // 右手 8 键：不另起布局，直接叠在游戏自己 HUD 的 7 格菱形块上（右下，UMG 锚定在 720p 画面，位置是 16:9 画面矩形的比例，
+    // 从 960x540 截图量得：上排 L X R（v 0.787）、中排 Y A（0.847）、下排 ZL B ZR（0.917）；X 列 u 0.860，L R 距 X ±0.093，Y A 距 X ±0.037）。
+    // 画的是半透明菱形框（格子对角半宽 0.027 画面宽，15 Pro 上 19 点），不画图标——游戏 HUD 里本来就有键名和技能图；命中半径 0.05 画面宽（35 点），
+    // 相邻命中圈互相重叠，pad_hit 取最近者，整块等于按最近格子划分；DM_PAD_SCALE 不动这 8 键（位置由 HUD 定）。菜单里 HUD 不显示时仍有淡框指位。
+    // right-hand 8 keys: no layout of their own -- they sit exactly on the game's own 7-slot HUD diamond block (bottom right; UMG anchored to the 720p frame, so positions are fractions of the 16:9 picture rect,
+    // measured on 960x540 screenshots: top row L X R (v 0.787), middle Y A (0.847), bottom ZL B ZR (0.917); X column u 0.860, L R at ±0.093 from X, Y A at ±0.037).
+    // Drawn as translucent diamond frames (slot half-diagonal 0.027 of the picture width, 19 pt on a 15 Pro), no glyphs -- the HUD already shows key names and skill icons; hit radius 0.05 of the picture width (35 pt),
+    // neighbouring hit circles overlap and pad_hit takes the nearest, so the block is partitioned by nearest slot; DM_PAD_SCALE leaves these 8 alone (the HUD fixes them). In menus, where the HUD is hidden, the faint frames still mark the spots.
+    { CGFloat pw = L->pic.size.width, ph = L->pic.size.height, px = L->pic.origin.x, py = L->pic.origin.y, sr = 0.027 * pw, sh = 0.05 * pw;
+      static const int hud_btn[8] = {PB_L, PB_X, PB_R, PB_Y, PB_A, PB_ZL, PB_B, PB_ZR};
+      static const double hud_u[8] = {0.7682, 0.8604, 0.9531, 0.8229, 0.8984, 0.7682, 0.8604, 0.9531}, hud_v[8] = {0.7870, 0.7870, 0.7870, 0.8472, 0.8472, 0.9167, 0.9167, 0.9167};
+      for (int i = 0; i < 8; i++) L->btn[hud_btn[i]] = pad_c(px + hud_u[i] * pw, py + hud_v[i] * ph, sr, sh); }
     // 顶边：右上 − ＋，左上 L3 R3 | top edge: - + top right, L3 R3 top left
     L->btn[PB_PLUS] = pad_c(right - 0.8 * r, top + 0.8 * r, 0.5 * r, 0.75 * r); L->btn[PB_MINUS] = pad_c(right - 2.1 * r, top + 0.8 * r, 0.5 * r, 0.75 * r);
     L->btn[PB_LS] = pad_c(left + 0.8 * r, top + 0.8 * r, 0.5 * r, 0.75 * r); L->btn[PB_RS] = pad_c(left + 2.1 * r, top + 0.8 * r, 0.5 * r, 0.75 * r);
@@ -141,13 +134,16 @@ static inline int pad_glyph_draw(CGContextRef g, const char *name, CGPoint c, CG
 }
 static inline void pad_disc(CGContextRef g, CGPoint c, CGFloat r, CGFloat alpha) { CGContextSetRGBFillColor(g, 0, 0, 0, alpha); CGContextFillEllipseInRect(g, CGRectMake(c.x - r, c.y - r, 2 * r, 2 * r)); }
 static inline void pad_draw_button(CGContextRef g, const pad_layout *L, int i, int on) {
-    pad_circle c = L->btn[i]; CGFloat box = 2 * c.r;
-    if (i <= PB_Y) { pad_disc(g, c.c, c.r * 0.96, on ? 0.15 : 0.34); box = 2.04 * c.r; }          // 面键：深底 + 圆标（按下换实心） | face: dark disc + circled letter (filled when held)
-    else if (i <= PB_ZR) {   // 技能键：键帽形的深色圆角底（图标 84:63）+ 键帽 | skill: key-cap shaped dark rounded backing (glyph is 84:63) + key cap
-        CGFloat w = 1.5 * c.r, h = w * 63 / 84; CGPathRef rr = CGPathCreateWithRoundedRect(CGRectMake(c.c.x - w / 2, c.c.y - h / 2, w, h), h * 0.3, h * 0.3, NULL);
-        CGContextSetRGBFillColor(g, 0, 0, 0, on ? 0.12 : 0.30); CGContextAddPath(g, rr); CGContextFillPath(g); CGPathRelease(rr); box = 2.0 * c.r; }
-    if (!pad_glyph_draw(g, k_glyph[i][on ? 1 : 0], c.c, box, i <= PB_ZR ? (on ? 1.0 : 0.88) : (on ? 1.0 : 0.7))) {
-        CGRect rr = CGRectMake(c.c.x - c.r, c.c.y - c.r, 2 * c.r, 2 * c.r);                             // 没有图标：圈 + 字 | no glyph: ring + text
+    pad_circle c = L->btn[i];
+    if (i <= PB_ZR) {   // HUD 格子上的 8 键：半透明菱形框，按下填白 | the 8 keys on the HUD slots: translucent diamond frame, filled white when held
+        CGFloat d = c.r; CGContextBeginPath(g);
+        CGContextMoveToPoint(g, c.c.x, c.c.y - d); CGContextAddLineToPoint(g, c.c.x + d, c.c.y); CGContextAddLineToPoint(g, c.c.x, c.c.y + d); CGContextAddLineToPoint(g, c.c.x - d, c.c.y); CGContextClosePath(g);
+        CGContextSetRGBFillColor(g, 1, 1, 1, on ? 0.45 : 0.0); CGContextSetRGBStrokeColor(g, 1, 1, 1, on ? 0.95 : 0.35); CGContextSetLineWidth(g, on ? 2.0 : 1.2);
+        CGContextDrawPath(g, on ? kCGPathFillStroke : kCGPathStroke);
+        return;
+    }
+    if (!pad_glyph_draw(g, k_glyph[i][on ? 1 : 0], c.c, 2 * c.r, on ? 1.0 : 0.7)) {   // 其余键：系统手柄图标；没有图标：圈 + 字 | other keys: system controller glyph; no glyph: ring + text
+        CGRect rr = CGRectMake(c.c.x - c.r, c.c.y - c.r, 2 * c.r, 2 * c.r);
         CGContextSetRGBStrokeColor(g, 1, 1, 1, on ? 0.9 : 0.5); CGContextSetLineWidth(g, 1.2); CGContextStrokeEllipseInRect(g, rr);
         pad_text(g, k_label[i], c.c, c.r * 0.85, on ? 1.0 : 0.8);
     }
