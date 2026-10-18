@@ -3,8 +3,18 @@
 这是对 [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)（把 Switch 版《暗黑破坏神 II：狱火重生》原生跑在 iPhone 上的开源兼容层）的**方法论拆解**，以及把同一套方法**举一反三**用到本地另一款 Switch 游戏（Blade II，UE4 4.17）上的工程。
 `dm/` 是 d2r-mobile 的 `dm/` 目录原样拷贝（MIT，见 `LICENSE.d2r-mobile`）加上 Blade 的改动；改动都能用 `git log -p` 看到。
 
-状态（2026-10-15）：**Mac 宿主能进关卡正常游玩并出声；iOS 壳（`dm/ios/blade`）能为 iphoneos 编出完整 App，待真机验证**；细节见文末「现状与下一步」。
+状态（2026-10-18，标签 `v0.1.0`）：**Mac 宿主可正常游玩（玩家已通过第 1–3 关，60 fps，有声音、有过场动画），全部 10 220 个着色器已离线抽出并翻译，不再依赖「走到哪补到哪」；iOS 壳（`dm/ios/blade`）能用全量着色器为 iphoneos 编出完整 App，待真机验证**；细节见文末「现状与下一步」。
 游戏内容（程序、资源、改写产物）一律不进仓库。
+
+## 画面（Mac 宿主，玩家实机对局时宿主自动留下的 1280×720 帧，缩到 960×540）
+
+| | |
+|---|---|
+| ![标题](docs/screenshots/01_title.jpg) 标题画面（点光源、雨、闪电） | ![城镇广场](docs/screenshots/02_town_square.jpg) 过场：城镇广场，火光与蓝刃卫兵 |
+| ![骷髅兵](docs/screenshots/03_skeletons.jpg) Act 1：石板路、骷髅兵、连击与伤害数字 | ![蓝刃](docs/screenshots/04_blue_blades.jpg) 近景：蓝色光刃与紫色魔气（半透明光照体 + 几何着色器融合变体） |
+| ![49 连击](docs/screenshots/05_combo49.jpg) 范围技能的红色光环与对话框 UI | ![骷髅头](docs/screenshots/06_skulls.jpg) 发光骷髅头、点光源、烛光 |
+
+截图只用于说明兼容层的运行结果，版权归游戏权利人所有（见文末）。
 
 ---
 
@@ -138,6 +148,12 @@ DM_OUT=$O dm/ios/blade/run.sh build && dm/ios/blade/run.sh install && dm/ios/bla
 ---
 
 ## 五、现状与下一步
+
+**版本标签**
+
+| 标签 | 日期 | 内容 |
+|---|---|---|
+| `v0.1.0` | 2026-10-18 | 第一个阶段性版本：Mac 宿主可通关游玩（已验证第 1–3 关，60 fps，音频、mp4 过场、实体手柄）；闪烁 / 一帧错画 / 显存暴涨三条线全部收口；`tools/pak_shaders.py` 离线抽出全部 10 220 个着色器并推出贴图 / 属性事实，Mac 与 iOS 着色器库都是全量；iOS 壳能编完整 App，尚未上真机。下一步：iOS 真机运行、性能、触摸虚拟手柄浮层。 |
 
 **2026-10-15 的结果（Mac 宿主，`tools/run_mac.sh`，60 fps）**：标题 → 读档确认（世界地图底图）→ 章节地图 → 关卡选择（角色立绘、关卡预览图）→ 读取画面 → Act 1「Darkness in Luemos」：带贴图的石板地、木桶、锁链、尖塔，雾、烛光、点光源，主角（白发角斗士）与敌人（骷髅兵）的完整模型、鹅、受击特效、连击数字、受伤红闪，画面与真机一致；不操作时主角被打死出「Defeat」画面。截图在 `~/blade2-work/run/shot_*.png`。
 
