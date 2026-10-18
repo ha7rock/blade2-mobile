@@ -191,7 +191,8 @@ DM_OUT=$O dm/ios/blade/run.sh build && dm/ios/blade/run.sh install && dm/ios/bla
    - **iphoneos 着色器库**：`dmsh_build.py` 的 `IOSOUT` 路径现在也出融合变体 `<顶点键>+<几何键>_b`（含 `-fpreserve-invariance`）并进内容缓存；301 个库 + 6 个融合变体 + 40 个采样变体。
    - **实体手柄**（`dm/host/gamepad_generic.m`，Mac 与 iOS 共用，GameController.framework，热插拔）：面键按位置排——下→B、右→A、左→Y、上→X（游戏画的是 Switch 键帽提示；`DM_PAD_FACE=letter` 改按字母），L/R、ZL/ZR、L3/R3、菜单→＋、选项→−、十字键；摇杆径向死区 12%（`DM_PAD_DEADZONE`）。Mac 上与键盘并存（`front_mac.m` 原有的 `dm_gamepad_start` 调用，不再是 `blade_stubs.c` 的空实现）。没有实体手柄实测，只验证了启动枚举（日志「手柄：GameController 启动，系统当前列出 N 个」）。
    - **iOS 音频会话**（`dm/host/audio_session.m`，`hle_blade.c` 建 RemoteIO 前调）：Playback 类别、不与别的 App 混音；打断开始 / 结束与进后台 / 回前台合成一个开关停 / 起渲染器的声卡单元（`dm_audren_suspend`，停着时节拍线程照实时静音消耗）；线路变化只记日志。音频渲染器缺省改成与 `hle_audio.c` 同口径：iOS 真出声、Mac 静音（`DM_AUDIO` 仍可覆盖）。没在真机上验证。
-   - 还没做：真机上跑（发热 / 内存上限读数）、触摸屏（游戏只认手柄，没接 `dm_touch_set`）。
+   - **触摸虚拟手柄图层**（2026-10-18 设计稿，见 [docs/ios_pad.md](docs/ios_pad.md) 与效果图）：几何与绘制在 `Sources/pad_layout.h`（纯 C），Mac 上 `tools/pad_mockup.m` 用同一份代码把图层画在游戏截图上出效果图，不用真机就能调布局。布局依据 pak 里的 `DefaultInput.ini`（全部手柄键都有动作映射，右摇杆只在背包里用）与 HUD 的 L / ZL / R / ZR 技能提示：右下 A/B/X/Y 菱形 + 外圈技能弧，左半屏浮动摇杆 + 十字键，顶边 L3 R3 / − ＋；松手 2.5 s 淡出，按键有震感，实体手柄接上自动隐藏。
+   - 还没做：真机上跑（发热 / 内存上限读数、图层重绘开销）、触摸屏（游戏只认手柄，没接 `dm_touch_set`）。
 5. **验证工具**：`structck.py` / `equiv.py` 认识 `JA` 行、负偏移补丁区与新改写块。
 
 **此前（同日白天）的结果**：引擎循环先跑起来（900 帧 / 60 秒，画面空）时修掉的通用问题：
