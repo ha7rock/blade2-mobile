@@ -11,6 +11,20 @@
 #include <stdlib.h>
 #include "pad_layout.h"
 
+// 键帽图标：NSImage 的系统符号渲成 3x 位图并缓存（pad_layout.h 只用其 alpha） | key-cap glyphs: NSImage system symbols rendered into 3x bitmaps and cached (pad_layout.h uses only their alpha)
+static CGImageRef mac_glyph(const char *name) {
+    static NSMutableDictionary *cache; if (!cache) cache = [NSMutableDictionary new];
+    NSString *k = @(name); id v = cache[k]; if (v) return v == NSNull.null ? NULL : (__bridge CGImageRef)v;
+    NSImage *im = [[NSImage imageWithSystemSymbolName:k accessibilityDescription:nil] imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:64 weight:NSFontWeightMedium]];
+    CGImageRef cg = NULL;
+    if (im) { NSSize sz = im.size; CGFloat q = 3;
+        NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)(sz.width * q) pixelsHigh:(NSInteger)(sz.height * q) bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+        [NSGraphicsContext saveGraphicsState]; NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+        [im drawInRect:NSMakeRect(0, 0, sz.width * q, sz.height * q) fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
+        [NSGraphicsContext restoreGraphicsState]; cg = CGImageRetain(rep.CGImage);
+    } else fprintf(stderr, "没有图标 %s\n", name);
+    cache[k] = cg ? (__bridge id)cg : NSNull.null; return cg;
+}
 static int label_index(const char *s) { for (int i = 0; i < PB_N; i++) if (!strcmp(s, k_label[i])) return i; return -1; }
 
 int main(int argc, char **argv) {
@@ -26,7 +40,7 @@ int main(int argc, char **argv) {
         CGContextSetRGBFillColor(g, 0, 0, 0, 1); CGContextFillRect(g, CGRectMake(0, 0, pw, ph));
         // 翻成 y 向下的点坐标系（与 UIKit drawRect 一致） | flip into a y-down point coordinate system (same as UIKit's drawRect)
         CGContextTranslateCTM(g, 0, ph); CGContextScaleCTM(g, scale, -scale);
-        pad_layout L; pad_layout_make(&L, CGSizeMake(W, H), it, il, ib, ir, 1.0);
+        pad_glyph = mac_glyph; pad_layout L; pad_layout_make(&L, CGSizeMake(W, H), it, il, ib, ir, 1.0);
         // 画面：16:9 居中（图片在翻转的上下文里要再翻一次） | picture: 16:9 centred (the image must be flipped back inside the flipped context)
         CGContextSaveGState(g); CGContextTranslateCTM(g, 0, L.pic.origin.y * 2 + L.pic.size.height); CGContextScaleCTM(g, 1, -1);
         CGContextSetInterpolationQuality(g, kCGInterpolationHigh); CGContextDrawImage(g, L.pic, src); CGContextRestoreGState(g);

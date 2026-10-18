@@ -29,6 +29,21 @@ static CAMetalLayer *g_layer;
 // Environment: DM_PAD_OVERLAY=0 hides it; DM_PAD_SCALE=0.8-1.4 scales everything; DM_PAD_ALPHA = idle opacity (default 0.45, fades 2.5 s after the last touch, restored on the next touch); DM_PAD_HAPTIC=0 disables button haptics
 #include "pad_layout.h"
 static double env_num(const char *k, double dflt) { const char *e = getenv(k); return e && *e ? atof(e) : dflt; }
+// 键帽图标：系统 SF Symbols（Switch 键形），按名渲成 3x 白色位图并缓存；缺的名字记 NSNull，pad_layout.h 会退回画字
+// Key-cap glyphs: system SF Symbols (Switch key shapes) rendered once per name into a 3x white bitmap and cached; missing names are recorded as NSNull and pad_layout.h falls back to text
+static CGImageRef ios_glyph(const char *name) {
+    static NSMutableDictionary *cache; if (!cache) cache = [NSMutableDictionary new];
+    NSString *k = @(name); id v = cache[k]; if (v) return v == NSNull.null ? NULL : (__bridge CGImageRef)v;
+    UIImage *im = [UIImage systemImageNamed:k withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:64 weight:UIImageSymbolWeightMedium]];
+    CGImageRef cg = NULL;
+    if (im) {
+        UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat]; f.scale = 3; f.opaque = NO;
+        UIImage *bm = [[[UIGraphicsImageRenderer alloc] initWithSize:im.size format:f] imageWithActions:^(UIGraphicsImageRendererContext *c) { (void)c;
+            [[im imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal] drawInRect:(CGRect){CGPointZero, im.size}]; }];
+        cg = CGImageRetain(bm.CGImage);
+    } else LOG("虚拟手柄：没有图标 %s（退回画字）", name);
+    cache[k] = cg ? (__bridge id)cg : NSNull.null; return cg;
+}
 
 // ---- 覆盖层：只画 | overlay: draws only ----
 @interface DmPadOverlay : UIView
@@ -53,7 +68,7 @@ typedef struct { UITouch *__unsafe_unretained t; int role, btn; CGPoint c; } slo
     const char *e = getenv("DM_PAD_OVERLAY"); _hide = e && !atoi(e);
     _scale = fmin(1.4, fmax(0.8, env_num("DM_PAD_SCALE", 1.0))); _idleAlpha = fmin(1.0, fmax(0.1, env_num("DM_PAD_ALPHA", 0.45)));
     if (env_num("DM_PAD_HAPTIC", 1) > 0) { _tap = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight]; [_tap prepare]; }
-    pad_layout_make(&_L, f.size, 0, 0, 0, 0, _scale);
+    pad_glyph = ios_glyph; pad_layout_make(&_L, f.size, 0, 0, 0, 0, _scale);
     _ov = [[DmPadOverlay alloc] initWithFrame:self.bounds]; _ov.layout = &_L; _ov.hidden = _hide; _ov.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; [self addSubview:_ov];
     _lastTouch = CFAbsoluteTimeGetCurrent();
     _fade = [NSTimer scheduledTimerWithTimeInterval:0.25 target:self selector:@selector(fadeTick) userInfo:nil repeats:YES];
