@@ -5021,7 +5021,17 @@ static _Atomic long g_req_draw_frame = -1; static FILE *g_req_draw_f;
 static void req_dispatch_log(__unsafe_unretained NvShader *cs, const p_dispatch *dp) {   // 计算派发也记一行 | compute dispatches get a line too
     long want = atomic_load(&g_req_draw_frame), cur = (long)atomic_load(&g_cur_frame); if (cur != want || !g_req_draw_f) return;
     fprintf(g_req_draw_f, "F%ld p%llu DISPATCH cs=%.16s grid=%d,%d,%d", cur, (unsigned long long)g_stat_pass, cs->key, dp->x, dp->y, dp->z);
-    req_log_binds(g_req_draw_f, cs, 5, "ct"); fputc('\n', g_req_draw_f);
+    req_log_binds(g_req_draw_f, cs, 5, "ct");
+    if (!strncmp(cs->key, "f89eadf19c00a9b3", 16)) {   // 反射环境计算核：先让 GPU 做完前面的派发，再读它要用的类型化缓冲（光照网格）内容 | reflection environment kernel: let the GPU finish the earlier dispatches, then read the typed buffers (light grid) it consumes
+        rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; } mtl_finish_gpu();
+        for (int i = 0; i < cs->rf.nb; i++) { if (cs->rf.b[i].kind != NVN_RB_TBUF || cs->rf.b[i].reg >= 128) continue; int reg = cs->rf.b[i].reg;
+            int tid = (int)(S.tex[5][reg] & 0xfffff); if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) continue; const tex_t *t = &g_treg[tid].t;
+            void *mb; uint64_t mo; const uint8_t *base; uint64_t sz = t->L.size;
+            if (!t->mem || !sz || !mtl_addr((uint64_t)t->mem, sz, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) { fprintf(g_req_draw_f, " tb%d=?", reg); continue; }
+            uint64_t n = sz < 1 << 20 ? sz : 1 << 20, nz = 0; for (uint64_t q = 0; q + 4 <= n; q += 4) if (*(const uint32_t *)(base + mo + q)) nz++;
+            fprintf(g_req_draw_f, " tb%d=%llu:nz%llu/%llu:", reg, (unsigned long long)sz, (unsigned long long)nz, (unsigned long long)(n / 4)); for (int q = 0; q < 64 && (uint64_t)q < n; q++) fprintf(g_req_draw_f, "%02x", base[mo + q]); }
+    }
+    fputc('\n', g_req_draw_f);
 }
 static void req_draw_log(__unsafe_unretained NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     long want = atomic_load(&g_req_draw_frame), cur = (long)atomic_load(&g_cur_frame);
@@ -6517,6 +6527,13 @@ static void req_poll(void) {
         if (tf) { for (int tid = 1; tid < g_ntreg; tid++) { if (!g_treg[tid].ok) continue; const tex_t *t = &g_treg[tid].t; n++;
                 fprintf(tf, "tid=%d ser=%llu %ux%ux%u fmt=%d target=%d levels=%u flags=%#x samples=%d\n", tid, (unsigned long long)atomic_load_explicit(&g_tser[tid], memory_order_relaxed), t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, t->d.flags, t->d.samples); }
             fclose(tf); MLOG("[req] 贴图普查 %d 张 → %s", n, path); } }
+    const char *pq = strstr(line, "poolraw");   // poolraw <序号>…：贴图在内存池里的原始（排布后）字节 + 布局参数 | poolraw <serial>...: the texture's raw (tiled) bytes in the memory pool + layout parameters
+    if (pq) for (pq += 7; *pq;) { while (*pq == ' ' || *pq == ',') pq++; if (!*pq || *pq == '\n') break; char *endp; uint64_t ser = strtoull(pq, &endp, 10); if (endp == pq) break; pq = endp;
+        int tid = 0; for (int i = 1; i < g_ntreg; i++) if (g_treg[i].ok && atomic_load_explicit(&g_tser[i], memory_order_relaxed) == ser) { tid = i; break; }
+        if (!tid || !g_treg[tid].t.mem) { MLOG("[req] poolraw ser=%llu 不在登记表或没有池存储", (unsigned long long)ser); continue; }
+        const tex_t *t = &g_treg[tid].t; snprintf(path, sizeof path, "%s/req_pool%llu.raw", g_req_dir, (unsigned long long)ser); FILE *pf = fopen(path, "wb");
+        if (pf) { fprintf(pf, "%u %u %u fmt=%d target=%d flags=%#x levels=%u stride=%u pkg=%d size=%llu layer=%llu tileH=%u tileD=%u bpb=%u\n", t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.flags, t->d.levels, t->d.stride, t->d.pkg_block_h, (unsigned long long)t->L.size, (unsigned long long)t->L.layer_size, t->L.tileH, t->L.tileD, t->L.bpb);
+            fwrite(t->mem, 1, t->L.size, pf); fclose(pf); MLOG("[req] poolraw ser=%llu %llu 字节 → %s", (unsigned long long)ser, (unsigned long long)t->L.size, path); } }
     const char *q = strstr(line, "texraw");
     if (q) { char *pat = malloc(1024); snprintf(pat, 1024, "%s/req_tex%%d", g_req_dir); g_td_path = pat;
         for (q += 6; *q;) { while (*q == ' ' || *q == ',') q++; if (!*q || *q == '\n') break; char *endp; uint64_t ser = strtoull(q, &endp, 10); if (endp == q) break; q = endp;
