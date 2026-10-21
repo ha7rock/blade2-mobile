@@ -6198,15 +6198,20 @@ static void texraw_save(id<MTLTexture> t, uint64_t ser) {
         // BC 压缩格式：按 4x4 块存（BC1/BC4 每块 8 字节，其余 16）；首行头里的「每行字节」即块行字节 | BC formats: stored by 4x4 blocks (BC1/BC4 8 bytes per block, the rest 16); the header's bytes-per-row is then the block-row size
         unsigned pfv = (unsigned)t.pixelFormat; int bc = pfv >= 130 && pfv <= 153; size_t blk = (pfv == 130 || pfv == 131 || pfv == 140 || pfv == 141) ? 8 : 16;
         size_t row = bc ? (w + 3) / 4 * blk : w * bpp, img = bc ? row * ((h + 3) / 4) : row * h;
-        NSUInteger ns = t.textureType == MTLTextureTypeCube ? 6 : t.textureType == MTLTextureTypeCubeArray ? t.arrayLength * 6 : t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;   // 立方体 / 数组：逐片存（深度按片数叠加） | cube / array: saved slice by slice (depth = slices stacked)
-        id<MTLBuffer> buf = [g_dev newBufferWithLength:img * dz * ns options:MTLResourceStorageModeShared];
-        id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-        for (NSUInteger sl = 0; sl < ns; sl++)
-            [b copyFromTexture:t sourceSlice:sl sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, dz) toBuffer:buf destinationOffset:sl * img * dz destinationBytesPerRow:row destinationBytesPerImage:img];
-        [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        char path[1024]; snprintf(path, sizeof path, g_td_path, (int)ser); strlcat(path, ".raw", sizeof path);
-        FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu %zu\n", (unsigned long)w, (unsigned long)h, (unsigned long)(dz * ns), (unsigned long)t.pixelFormat, row); fwrite(buf.contents, 1, img * dz * ns, f); fclose(f); }
-        MLOG("[texraw] ser=%llu %lux%lux%lu 格式 %lu → %s", ser, (unsigned long)w, (unsigned long)h, (unsigned long)dz, (unsigned long)t.pixelFormat, path);
+        NSUInteger ns = t.textureType == MTLTextureTypeCube ? 6 : t.textureType == MTLTextureTypeCubeArray ? t.arrayLength * 6 : t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;   // 立方体 / 数组：逐片存（深度按片数叠加） | cube / array
+        // 每个 mip 级一个文件（_l<级>；级 0 不带后缀，兼容旧用法）：查反射立方体数组的小 mip 有没有内容 | one file per mip level (_l<level>; level 0 keeps the old name): to check whether the small mips of the reflection cube array hold anything
+        for (NSUInteger lv = 0; lv < t.mipmapLevelCount; lv++) {
+            NSUInteger lw = MAX(w >> lv, 1u), lh = MAX(h >> lv, 1u), ldz = MAX(dz >> lv, 1u);
+            size_t lrow = bc ? (lw + 3) / 4 * blk : lw * bpp, limg = bc ? lrow * ((lh + 3) / 4) : lrow * lh;
+            id<MTLBuffer> buf = [g_dev newBufferWithLength:limg * ldz * ns options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+            for (NSUInteger sl = 0; sl < ns; sl++)
+                [b copyFromTexture:t sourceSlice:sl sourceLevel:lv sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(lw, lh, ldz) toBuffer:buf destinationOffset:sl * limg * ldz destinationBytesPerRow:lrow destinationBytesPerImage:limg];
+            [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            char path[1024]; snprintf(path, sizeof path, g_td_path, (int)ser); if (lv) { char sfx[16]; snprintf(sfx, sizeof sfx, "_l%lu", (unsigned long)lv); strlcat(path, sfx, sizeof path); } strlcat(path, ".raw", sizeof path);
+            FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu %zu\n", (unsigned long)lw, (unsigned long)lh, (unsigned long)(ldz * ns), (unsigned long)t.pixelFormat, lrow); fwrite(buf.contents, 1, limg * ldz * ns, f); fclose(f); }
+            MLOG("[texraw] ser=%llu 级 %lu %lux%lux%lu 格式 %lu → %s", ser, (unsigned long)lv, (unsigned long)lw, (unsigned long)lh, (unsigned long)ldz, (unsigned long)t.pixelFormat, path);
+        }
 }
 // DM_NVN_TEXRAW=sel:WxH:fmt（可多项）：绑定时记下该帧片元阶段用到的、尺寸与 Metal 格式都匹配的贴图，帧末随 TEXDUMP 一起按原始字节存
 // DM_NVN_TEXRAW=sel:WxH:fmt (several allowed): at bind time note the textures used by the fragment stage in that frame whose size and Metal format match, saved as raw bytes at frame end together with TEXDUMP
