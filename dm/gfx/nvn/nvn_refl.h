@@ -22,6 +22,7 @@ typedef struct {
     uint8_t kind, rw;        // rw：存储缓冲 access 为 read_write / write / device | rw: storage buffer access is read_write / write / device
     uint8_t dtt, dpf;        // 贴图槽未绑时的哑贴图：MTLTextureType 数值、像素类 | Dummy texture when the texture slot is unbound: MTLTextureType value, pixel class
     uint16_t reg, aid;       // D3D 寄存器号、参数缓冲内序号 | D3D register number, index within the argument buffer
+    uint8_t ptr;             // 图像槽：MSL 里是 device 指针（缓冲贴图上做原子操作的 *_atomic 成员），槽里放显卡地址而不是资源号 | image slot: a device pointer in MSL (the *_atomic member for atomics on a buffer texture); the slot takes a GPU address, not a resource ID
     uint8_t st;              // 非 0 = 从这个 NVN 阶段的绑定取（融合几何着色器的顶点变体：几何阶段 uniform，st = 2） | non-0 = take from this NVN stage's bindings (vertex variant with a fused geometry shader: geometry stage uniform, st = 2)
 } nvn_rbind;
 typedef struct {

@@ -2216,12 +2216,19 @@ static MTLPixelFormat rt_color_fmt(id<MTLTexture> base, const view_t *v, int has
 // color: when the view of a colour attachment changes the format (e.g. an RGBA8 base texture written through an RGBA8_SRGB view), attach a Metal view of that format - on the Switch writes and clears are encoded by the view's format,
 // and attaching only the base texture drops the sRGB encoding entirely, making the picture too dark (public repository #36, measured by seedds on another game); the pipeline colour formats take the attached texture's format (g_pass.cfmt), so they follow.
 // The view lives only until this submission completes (Metal 4 does not retain resources; the view shares storage with the base texture and is not made resident separately). Depth / stencil attachments do not change format
+// 池来源贴图被 GPU 写过（挂为渲染目标、缓冲→贴图 / 贴图→贴图拷贝的目标、清除）：从此 GPU 内容为准，不再按脏页从池重传
+// （否则邻页的 CPU 写会把池里的陈旧字节再传一遍、盖掉 GPU 写好的内容。实录：UE4 的环境 BRDF 查找表 128x32 RG16 由解锁时的缓冲→贴图拷贝填入，被重传盖成垃圾，偏置通道全 1 → 反射全屏过曝）
+// A pool-sourced texture written by the GPU (attached as a render target, destination of a buffer->texture / texture->texture copy, cleared): from then on the GPU content is authoritative and dirty-page re-uploads from the pool stop
+// (otherwise a CPU write to a neighbouring page re-uploads the stale pool bytes over the GPU-written content. Seen: UE4's 128x32 RG16 environment-BRDF lookup is filled by the unlock-time buffer->texture copy, was re-uploaded into garbage, bias channel all 1 -> reflections blown out across the screen)
+static void pool_tex_gpu_owned(const tex_t *t, const char *why) {
+    if (!t || !tex_pool_src(t)) return;
+    id o = serial_get(t->serial);
+    if ([o isKindOfClass:[NvPkg class]] && !((NvPkg *)o)->rt) { ((NvPkg *)o)->rt = 1; static int n; if (n++ < 8) MLOG("池来源贴图被 GPU 写入（%s）ser=%llu %ux%u 级%u 格式 %#x 标志 %#x：此后不再按脏页重传", why, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.levels, t->d.format, t->d.flags); }
+}
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v, int color) {
     id<MTLTexture> base = tex_mtl(t); a.texture = base;
-    if (base && tex_pool_src(t)) {   // 池来源贴图（UE4 缺省块线性布局、标志不像渲染目标）被挂为附件：从此 GPU 内容为准 | A pool-sourced texture (UE4 default block-linear layout, flags not like a render target) attached: from now on the GPU content is authoritative
-        id o = serial_get(t->serial);
-        if ([o isKindOfClass:[NvPkg class]] && !((NvPkg *)o)->rt) { ((NvPkg *)o)->rt = 1; static int n; if (n++ < 8) MLOG("池来源贴图被挂为渲染目标 ser=%llu %ux%u 级%u 格式 %#x 标志 %#x：此后不再按脏页重传", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.levels, t->d.format, t->d.flags); }
-    }
+    if (base) pool_tex_gpu_owned(t, "渲染目标");   // 池来源贴图被挂为附件：从此 GPU 内容为准 | a pool-sourced texture attached: from now on the GPU content is authoritative
+
     if (has_v && v->set_levels) a.level = v->base_level;
     if (has_v && v->set_layers) { if (t->d.target == 2) a.depthPlane = v->min_layer; else a.slice = v->min_layer; }
     if (!color || !base) return;
@@ -3486,9 +3493,16 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
-            if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
-            slots[aid] = trid;
-            USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
+            if (b->ptr) {   // 原子图像：spirv-cross 把缓冲贴图上的原子操作翻成 device atomic_uint* 成员，槽里要放该缓冲贴图所在池缓冲的显卡地址（原先放资源号：原子写全部落空，UE4 的光照网格注入 / 压实核写不进网格，反射探头一个也找不到，金属面发黑）
+                            // atomic image: spirv-cross turns atomics on a buffer texture into a device atomic_uint* member, and the slot must hold the GPU address of the pool buffer behind that buffer texture (it used to hold the resource ID: every atomic write was lost, UE4's light-grid injection / compaction kernels never filled the grid, no reflection capture was ever found and metals rendered black)
+                __unsafe_unretained id<MTLBuffer> pb = t && t.textureType == MTLTextureTypeTextureBuffer ? t.buffer : nil;
+                if (pb) { slots[aid] = pb.gpuAddress + t.bufferOffset; USE(pb, MTLResourceUsageRead | MTLResourceUsageWrite); }
+                else { static int n_; if (n_++ < 3) MLOG("【红】原子图像槽 %d 绑的不是缓冲贴图（贴图号 %d），原子写丢弃", reg, tid); slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead | MTLResourceUsageWrite); }
+            } else {
+                if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
+                slots[aid] = trid;
+                USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
+            }
         } else if (b->kind == NVN_RB_TBUF) {   // 类型化缓冲：贴图槽 r 里的缓冲贴图（目标 BUFFER） | Typed buffer: the buffer texture (target BUFFER) in texture slot r
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
@@ -5464,6 +5478,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("C ser=%llu", c->tex->serial);
     if (!t) return;
+    pool_tex_gpu_owned(c->tex, "缓冲→贴图拷贝");
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
@@ -5548,6 +5563,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     }
     id<MTLTexture> s = tex_mtl(c->src), d = tex_mtl(c->dst);
     PD("T src=%llu dst=%llu %dx%dx%d→%dx%dx%d flags=%#x", c->src->serial, c->dst->serial, c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, c->flags);
+    if (d) pool_tex_gpu_owned(c->dst, "贴图→贴图拷贝");
     if (!s || !d) return;
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
