@@ -6207,7 +6207,6 @@ static void texraw_save(id<MTLTexture> t, uint64_t ser) {
         size_t bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : t.pixelFormat == MTLPixelFormatRGBA32Float ? 16 : 4; (void)bw; (void)bh;
         // BC 压缩格式：按 4x4 块存（BC1/BC4 每块 8 字节，其余 16）；首行头里的「每行字节」即块行字节 | BC formats: stored by 4x4 blocks (BC1/BC4 8 bytes per block, the rest 16); the header's bytes-per-row is then the block-row size
         unsigned pfv = (unsigned)t.pixelFormat; int bc = pfv >= 130 && pfv <= 153; size_t blk = (pfv == 130 || pfv == 131 || pfv == 140 || pfv == 141) ? 8 : 16;
-        size_t row = bc ? (w + 3) / 4 * blk : w * bpp, img = bc ? row * ((h + 3) / 4) : row * h;
         NSUInteger ns = t.textureType == MTLTextureTypeCube ? 6 : t.textureType == MTLTextureTypeCubeArray ? t.arrayLength * 6 : t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;   // 立方体 / 数组：逐片存（深度按片数叠加） | cube / array
         // 每个 mip 级一个文件（_l<级>；级 0 不带后缀，兼容旧用法）：查反射立方体数组的小 mip 有没有内容 | one file per mip level (_l<level>; level 0 keeps the old name): to check whether the small mips of the reflection cube array hold anything
         for (NSUInteger lv = 0; lv < t.mipmapLevelCount; lv++) {
