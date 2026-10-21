@@ -4,6 +4,7 @@
 #   Extra DM_* env for the app: pass them in the environment of this script (they are inherited), e.g.
 #   DM_NVN_SERIAL_FRAME=1 tools/aba_run.sh serial1
 # The game window stays behind everything, small, in the bottom-right corner (DM_WINDOW_BACK=1) so a person working on the Mac is not interrupted; ABA_TOP=1 restores the old on-top window for screen recording.
+# Silent by default (DM_AUDIO=0: no CoreAudio output unit at all); DM_AUDIO=1 in the environment turns sound back on.
 # Outputs: ~/blade2-work/run/aba/<tag>/{rec.mov, small.raw, reglum.txt, host.log, stderr.log, screen.txt, reglum_aba.txt, env.txt}
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -18,7 +19,7 @@ while ! mkdir "$LK" 2>/dev/null; do p=$(cat "$LK/pid" 2>/dev/null); if [ -n "$p"
 echo $$ > "$LK/pid"; echo "$TAG" > "$LK/tag"; trap 'rm -rf "$LK"' EXIT
 while pgrep -x BladeII > /dev/null; do sleep 3; done   # an instance started without the lock (older script): let it finish
 rm -rf "$O"; mkdir -p "$O"
-caffeinate -dimsu -t $((WATCH + 30)) &   # display sleep stops the display link (1 Hz) and ends screencapture early
+caffeinate -ims -t $((WATCH + 30)) &   # 只防系统睡眠；不带 -d/-u：那两个会点亮显示器，经 HDMI-CEC 把电视切过来 | keep the system awake only; no -d/-u: those wake the display and switch the TV over HDMI-CEC
 CAF=$!
 rm -rf "$SP"; cp -r $W/run/save "$SP"
 K="A@6,A@10,A@14,A@18,A@24,A@30,A@36"
@@ -26,7 +27,7 @@ for i in $(seq 0 90); do K="$K,A@$(echo "55+$i*0.7" | bc)"; done
 K="$K,LSU@70+2,LSR@85+2"
 env | grep '^DM_\|^MTL_' | sort > "$O/env.txt"
 [ -n "${ABA_LAG:-}" ] && export DM_NVN_LAGLOG="$O/lag.txt"
-env ${ABA_TOP:+DM_WINDOW_TOP=1} ${ABA_TOP:-DM_WINDOW_BACK=1} DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE="$SP" \
+env DM_AUDIO=${DM_AUDIO:-0} ${ABA_TOP:+DM_WINDOW_TOP=1} ${ABA_TOP:-DM_WINDOW_BACK=1} DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE="$SP" \
 DM_WATCH=$WATCH DM_KEYS="$K" DM_NVN_REGLUM="0,0,1,1:$O/reglum.txt" DM_NVN_DRAWSET=${ABA_DRAWSET:+$O/drawset.txt} \
   "$APP/Contents/MacOS/BladeII" > "$O/stdout.log" 2> "$O/stderr.log" &
 UPNS='import time;print(time.clock_gettime_ns(time.CLOCK_UPTIME_RAW))'
@@ -37,7 +38,7 @@ date +%s > "$O/t_launch_wall.txt"
 if [ "$RD" -gt 0 ]; then
   sleep "$RS"
   python3 -c "$UPNS" > "$O/t_rec.txt"
-  screencapture -x -V "$RD" "$O/rec.mov"
+  screencapture -x -V "$RD" "$O/rec.mov" & SC=$!; ( sleep $((RD + 20)); kill -INT $SC 2>/dev/null ) & wait $SC   # 显示器睡着时（无 -d）screencapture 不会自己结束，到点掐掉 | with the display asleep (no -d) screencapture never ends by itself: stop it when due
 fi
 wait $PID
 kill $CAF 2>/dev/null
