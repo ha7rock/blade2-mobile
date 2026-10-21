@@ -4988,6 +4988,39 @@ static void ghost_flush(void) {   // 渲染通道结束前：把认到的图标�
     memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; g_pso_dirty = g_dss_dirty = 1; g_gh.busy = 0;
     for (int i = 0; i < g_gh.n; i++) free(g_gh.c[i].S_); g_gh.n = 0;
 }
+// ---------- 运行时按需抓取（命令文件 <应用支持目录>/dump.req，产物进 <应用支持目录>/dump/；DM_NVN_REQ=目录 可改）：不必预知帧号 ----------
+// 出图线程每 10 帧查一次命令文件，读到第一行就删掉并执行：
+//   shot          下一次出图截图                 → dump/req_<出图帧>.png
+//   draws         下一回放帧每次绘制记一行         → dump/req_<回放帧>_draws.txt：帧 通道 顶点键 片元键 索引数 实例 目标尺寸 混合 深度测/写，
+//                 再接顶点 / 片元阶段每个贴图寄存器 vt<reg>/t<reg>=贴图号/序号:宽x高x深:f格式:t目标:l级数
+//   rts           下一回放帧用过的每张颜色目标      → dump/req_<回放帧>_rt<序号*100+级>.png（借 DM_NVN_TEXDUMP 的机制）
+//   texraw <序号>… 按序号存贴图原始字节            → dump/req_tex<序号>.raw（首行文本头：宽 高 深 格式 每行字节）
+//   all           shot + draws + rts
+// 用途：玩家停在要看的画面（如一关 BOSS）时，另开终端 echo all > dump.req，即得该帧的截图、逐 draw 清单与各通道输出，不用重启、不用预知帧号。
+// ---------- Runtime capture on request (command file <app support>/dump.req, output in <app support>/dump/; DM_NVN_REQ=dir overrides): no frame numbers needed in advance ----------
+// The present thread polls the command file every 10 frames; the first line is read, the file deleted, and the command executed:
+//   shot            screenshot at the next present                 -> dump/req_<present frame>.png
+//   draws           one line per draw of the next replay frame     -> dump/req_<replay frame>_draws.txt: frame pass vs-key fs-key index-count instances target-size blend depth-test/write,
+//                   followed by every texture register of the vertex / fragment stage as vt<reg>/t<reg>=texture-id/serial:WxHxD:f<format>:t<target>:l<levels>
+//   rts             every color target used by the next replay frame -> dump/req_<replay frame>_rt<index*100+level>.png (through the DM_NVN_TEXDUMP machinery)
+//   texraw <ser>... raw bytes of textures by serial                 -> dump/req_tex<ser>.raw (first-line text header: width height depth format bytes-per-row)
+//   all             shot + draws + rts
+// Use: while the player stands on the picture of interest (e.g. a stage boss), `echo all > dump.req` from another terminal yields that frame's screenshot, per-draw list and per-pass outputs, with no restart and no frame numbers.
+static _Atomic long g_req_draw_frame = -1; static FILE *g_req_draw_f; static char g_req_dir[700];
+static void req_draw_log(__unsafe_unretained NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+    long want = atomic_load(&g_req_draw_frame), cur = (long)atomic_load(&g_cur_frame);
+    if (cur > want) { if (g_req_draw_f) { fclose(g_req_draw_f); g_req_draw_f = NULL; MLOG("[req] 绘制清单写完：帧 %ld", want); } atomic_store(&g_req_draw_frame, -1); return; }
+    if (cur != want || !g_req_draw_f) return;
+    FILE *f = g_req_draw_f; const tex_t *rt = R.has_rt ? (R.rt.n && R.rt.color[0] ? R.rt.color[0] : R.rt.depth) : NULL;
+    fprintf(f, "F%ld p%llu vs=%.16s fs=%.16s n=%d inst=%d tgt=%ux%u blend=%#x dt=%d dw=%d", cur, (unsigned long long)g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
+            dw ? (int)dw->count : di ? (int)di->count : 0, dw ? 1 : di ? (int)di->instances : 0, rt ? rt->d.width : 0, rt ? rt->d.height : 0, (unsigned)S.color.blend_en, (int)S.ds.dt, (int)S.ds.dw);
+    for (int st = 0; st < 2; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb; i++) { int kind = sh->rf.b[i].kind, reg = sh->rf.b[i].reg; if ((kind != NVN_RB_TEX && kind != NVN_RB_SAMPT && kind != NVN_RB_TBUF) || reg >= 128) continue;
+            uint64_t h = S.tex[st][reg]; int tid = (int)(h & 0xfffff); uint64_t ser = h_ser(h);
+            if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) { const tex_t *t = &g_treg[tid].t; fprintf(f, " %s%d=%d/%llu:%ux%ux%u:f%d:t%d:l%u", st ? "t" : "vt", reg, tid, (unsigned long long)ser, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels); }
+            else fprintf(f, " %s%d=%d/%llu:?", st ? "t" : "vt", reg, tid, (unsigned long long)ser); } }
+    fputc('\n', f);
+}
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (g_oq_open) g_oqi.nd_seen++;
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); return; }
@@ -5222,6 +5255,7 @@ frz_plain:;
       if (dsi && di && pr->sh[0]) { const p_bind_buf *u = &S.ubo[0][1]; void *mb; uint64_t mo; const uint8_t *base; uint64_t h = 1469598103934665603ull; int ok = 0;
         if (u->addr && u->size >= 64 && !pend_hits(u->addr, 64) && mtl_addr(u->addr, 64, &mb, &mo) && (base = [(__bridge id<MTLBuffer>)mb contents])) { for (int q = 0; q < 64; q++) h = (h ^ base[mo + q]) * 1099511628211ull; ok = 1; }
         fprintf(dsf, "%llu %.16s %llx %d %d %016llx\n", (unsigned long long)atomic_load(&g_cur_frame), pr->sh[0]->key, (unsigned long long)di->ibuf, (int)di->count, (int)di->instances, ok ? (unsigned long long)h : 0ull); } }
+    if (atomic_load(&g_req_draw_frame) >= 0) req_draw_log(pr, dw, di);   // 运行时按需抓取：绘制清单 | runtime capture on request: draw list
     if (passdump()) {   // 通道首次绘制的特征（判读入是否可省：全屏、无混合、写满通道、不依赖深度）；DM_NVN_PASSDUMP_ALL 时每次绘制都记 | Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
         static uint64_t last_pass = ~0ull; static int all = -1; if (all < 0) all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
         if (all) PD("d %llu bv=%d bi=%d first=%d vs=%s fs=%s vc=%d inst=%d blend=%#x b0=%#llx dt=%d dw=%d df=%d cull=%d st=%d sf=%d,%d sop=%d,%d,%d/%d,%d,%d smask=%#x,%#x/%#x,%#x sref=%#x,%#x ib=%#llx it=%d cmask=%#x", g_stat_pass, di ? di->base_vertex : 0, di ? di->base_instance : 0, dw ? dw->first : 0, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
@@ -6433,6 +6467,30 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, c
     return 1;
 }
 static double g_link_it_tin;   // 节拍回调正在上屏的那一帧的入队时刻（只在节拍线程读写） | Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
+// 按需抓取的命令轮询（见 req_draw_log 上方说明） | Command polling for capture on request (see the note above req_draw_log)
+static void req_poll(void) {
+    static int init; static char req[760]; static uint64_t last;
+    if (!init) { init = 1; const char *gd = getenv("DM_NVN_GLITCH"), *e = getenv("DM_NVN_REQ");
+        if (e) strlcpy(g_req_dir, e, sizeof g_req_dir);
+        else if (gd) { strlcpy(g_req_dir, gd, sizeof g_req_dir); char *sl = strrchr(g_req_dir, '/'); if (sl) *sl = 0; strlcat(g_req_dir, "/dump", sizeof g_req_dir); }
+        if (g_req_dir[0]) { snprintf(req, sizeof req, "%s.req", g_req_dir); MLOG("[req] 按需抓取：命令文件 %s，产物目录 %s", req, g_req_dir); } }
+    if (!req[0] || g_present_n - last < 10) return;
+    last = g_present_n;
+    FILE *f = fopen(req, "r"); if (!f) return;
+    char line[512] = {0}; if (!fgets(line, sizeof line, f)) line[0] = 0; fclose(f); unlink(req);
+    mkdir(g_req_dir, 0755);
+    long cur = (long)atomic_load(&g_cur_frame) + 1; char path[1024]; int all = strstr(line, "all") != NULL;
+    if (all || strstr(line, "shot")) { snprintf(path, sizeof path, "%s/req_%llu.png", g_req_dir, (unsigned long long)g_present_n + 1); dm_gfx_shot_at(1, path); MLOG("[req] 截图 → %s", path); }
+    if (all || strstr(line, "draws")) { snprintf(path, sizeof path, "%s/req_%ld_draws.txt", g_req_dir, cur); FILE *df = fopen(path, "w");
+        if (df) { if (g_req_draw_f) fclose(g_req_draw_f); g_req_draw_f = df; atomic_store(&g_req_draw_frame, cur); MLOG("[req] 绘制清单：帧 %ld → %s", cur, path); } else MLOG("【红】[req] 打不开 %s", path); }
+    if (all || strstr(line, "rts")) { if (!g_td_list) g_td_list = [NSMutableArray array]; [g_td_list removeAllObjects];
+        char *pat = malloc(1024); snprintf(pat, 1024, "%s/req_%ld_rt%%d.png", g_req_dir, cur); g_td_path = pat; g_td_frame = cur; g_td_done = 0; MLOG("[req] 颜色目标转储：帧 %ld → %s", cur, pat); }
+    const char *q = strstr(line, "texraw");
+    if (q) { char *pat = malloc(1024); snprintf(pat, 1024, "%s/req_tex%%d", g_req_dir); g_td_path = pat;
+        for (q += 6; *q;) { while (*q == ' ' || *q == ',') q++; if (!*q || *q == '\n') break; char *endp; uint64_t ser = strtoull(q, &endp, 10); if (endp == q) break; q = endp;
+            id o = serial_get(ser); id<MTLTexture> tx = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : o;
+            if (tx) texraw_save(tx, ser); else MLOG("[req] texraw ser=%llu 不在序号表", (unsigned long long)ser); } }
+}
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
@@ -6470,6 +6528,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
             g_rl_rb = ring[slot]; g_rl_x0 = x0; g_rl_y0 = y0; g_rl_w = w; g_rl_h = h; g_rl_f = rlf; g_rl_mu = &rlmu; }
         else { static int nb; if (nb++ < 8) MLOG("【红】DM_NVN_REGLUM：回读槽 %d 仍在用，出图 %llu 不回读", slot, (unsigned long long)g_present_n); }
     }
+    req_poll();   // 运行时按需抓取 | runtime capture on request
     // DM_NVN_SHOT=帧号[,帧号…]:路径（路径里的 %d 换成帧号）
     // DM_NVN_SHOT=frame number[,frame number...]:path (%d in the path is replaced with the frame number)
     static long shots[16]; static int nshot = -1; static const char *shot_path;
