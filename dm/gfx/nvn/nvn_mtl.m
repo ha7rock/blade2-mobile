@@ -5006,7 +5006,23 @@ static void ghost_flush(void) {   // 渲染通道结束前：把认到的图标�
 //   texraw <ser>... raw bytes of textures by serial                 -> dump/req_tex<ser>.raw (first-line text header: width height depth format bytes-per-row)
 //   all             shot + draws + rts
 // Use: while the player stands on the picture of interest (e.g. a stage boss), `echo all > dump.req` from another terminal yields that frame's screenshot, per-draw list and per-pass outputs, with no restart and no frame numbers.
-static _Atomic long g_req_draw_frame = -1; static FILE *g_req_draw_f; static char g_req_dir[700];
+static char g_req_dir[700]; static char g_req_cb_fs[20];   // g_req_cb_fs：命令 draws fs=<片元键前缀> 时，这些绘制另附片元阶段各常量缓冲的前 512 字节（十六进制） | g_req_cb_fs: with "draws fs=<fragment key prefix>" those draws also carry the first 512 bytes (hex) of every fragment-stage constant buffer
+// 某阶段着色器的贴图 / 图像绑定逐个写出：<前缀><寄存器>=贴图号/序号:宽x高x深:f格式:t目标:l级数 | write every texture / image binding of one shader stage: <prefix><reg>=id/serial:WxHxD:f<format>:t<target>:l<levels>
+static void req_log_binds(FILE *f, __unsafe_unretained NvShader *sh, int st, const char *prefix) {
+    for (int i = 0; i < sh->rf.nb; i++) { int kind = sh->rf.b[i].kind, reg = sh->rf.b[i].reg; uint64_t h; const char *px = prefix;
+        if ((kind == NVN_RB_TEX || kind == NVN_RB_SAMPT || kind == NVN_RB_TBUF) && reg < 128) h = S.tex[st][reg];
+        else if (kind == NVN_RB_IMG && reg < 32) { h = S.img[st][reg]; px = "img"; }
+        else continue;
+        int tid = (int)(h & 0xfffff); uint64_t ser = h_ser(h);
+        if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) { const tex_t *t = &g_treg[tid].t; fprintf(f, " %s%d=%d/%llu:%ux%ux%u:f%d:t%d:l%u", px, reg, tid, (unsigned long long)ser, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels); }
+        else fprintf(f, " %s%d=%d/%llu:?", px, reg, tid, (unsigned long long)ser); }
+}
+static _Atomic long g_req_draw_frame = -1; static FILE *g_req_draw_f;
+static void req_dispatch_log(__unsafe_unretained NvShader *cs, const p_dispatch *dp) {   // 计算派发也记一行 | compute dispatches get a line too
+    long want = atomic_load(&g_req_draw_frame), cur = (long)atomic_load(&g_cur_frame); if (cur != want || !g_req_draw_f) return;
+    fprintf(g_req_draw_f, "F%ld p%llu DISPATCH cs=%.16s grid=%d,%d,%d", cur, (unsigned long long)g_stat_pass, cs->key, dp->x, dp->y, dp->z);
+    req_log_binds(g_req_draw_f, cs, 5, "ct"); fputc('\n', g_req_draw_f);
+}
 static void req_draw_log(__unsafe_unretained NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     long want = atomic_load(&g_req_draw_frame), cur = (long)atomic_load(&g_cur_frame);
     if (cur > want) { if (g_req_draw_f) { fclose(g_req_draw_f); g_req_draw_f = NULL; MLOG("[req] 绘制清单写完：帧 %ld", want); } atomic_store(&g_req_draw_frame, -1); return; }
@@ -5014,11 +5030,15 @@ static void req_draw_log(__unsafe_unretained NvProg *pr, const p_draw *dw, const
     FILE *f = g_req_draw_f; const tex_t *rt = R.has_rt ? (R.rt.n && R.rt.color[0] ? R.rt.color[0] : R.rt.depth) : NULL;
     fprintf(f, "F%ld p%llu vs=%.16s fs=%.16s n=%d inst=%d tgt=%ux%u blend=%#x dt=%d dw=%d", cur, (unsigned long long)g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
             dw ? (int)dw->count : di ? (int)di->count : 0, dw ? 1 : di ? (int)di->instances : 0, rt ? rt->d.width : 0, rt ? rt->d.height : 0, (unsigned)S.color.blend_en, (int)S.ds.dt, (int)S.ds.dw);
-    for (int st = 0; st < 2; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
-        for (int i = 0; i < sh->rf.nb; i++) { int kind = sh->rf.b[i].kind, reg = sh->rf.b[i].reg; if ((kind != NVN_RB_TEX && kind != NVN_RB_SAMPT && kind != NVN_RB_TBUF) || reg >= 128) continue;
-            uint64_t h = S.tex[st][reg]; int tid = (int)(h & 0xfffff); uint64_t ser = h_ser(h);
-            if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) { const tex_t *t = &g_treg[tid].t; fprintf(f, " %s%d=%d/%llu:%ux%ux%u:f%d:t%d:l%u", st ? "t" : "vt", reg, tid, (unsigned long long)ser, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels); }
-            else fprintf(f, " %s%d=%d/%llu:?", st ? "t" : "vt", reg, tid, (unsigned long long)ser); } }
+    for (int st = 0; st < 2; st++) if (pr->sh[st]) req_log_binds(f, pr->sh[st], st, st ? "t" : "vt");
+    if (g_req_cb_fs[0] && pr->sh[1] && !strncmp(pr->sh[1]->key, g_req_cb_fs, strlen(g_req_cb_fs))) {   // 常量缓冲内容（判材质参数是不是游戏写进来的值） | constant buffer contents (is the material parameter what the game wrote?)
+        __unsafe_unretained NvShader *sh = pr->sh[1];
+        for (int i = 0; i < sh->rf.nb; i++) { if (sh->rf.b[i].kind != NVN_RB_CBUF || sh->rf.b[i].reg >= 16) continue; int reg = sh->rf.b[i].reg;
+            const p_bind_buf *u = &S.ubo[1][reg]; void *mb; uint64_t mo; const uint8_t *base;
+            if (!u->addr || !u->size) { fprintf(f, " c%d=-", reg); continue; }
+            if (pend_hits(u->addr, u->size) || !mtl_addr(u->addr, u->size, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) { fprintf(f, " c%d=P/%llu", reg, (unsigned long long)u->size); continue; }
+            uint64_t n = u->size < 512 ? u->size : 512; fprintf(f, " c%d=%llu:", reg, (unsigned long long)u->size); for (uint64_t q = 0; q < n; q++) fprintf(f, "%02x", base[mo + q]); }
+    }
     fputc('\n', f);
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
@@ -5418,6 +5438,7 @@ static void dispatch(const p_dispatch *dp) {
     if (!S.prog) { RED_ONCE(27, "派发前没有绑定程序"); return; }
     NvShader *cs = prog_get(S.prog)->sh[5];
     if (!cs) { RED_ONCE(28, "派发的程序没有计算着色器（或未映射）"); return; }
+    if (atomic_load(&g_req_draw_frame) >= 0) req_dispatch_log(cs, dp);   // 运行时按需抓取 | runtime capture on request
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
@@ -6482,9 +6503,15 @@ static void req_poll(void) {
     long cur = (long)atomic_load(&g_cur_frame) + 1; char path[1024]; int all = strstr(line, "all") != NULL;
     if (all || strstr(line, "shot")) { snprintf(path, sizeof path, "%s/req_%llu.png", g_req_dir, (unsigned long long)g_present_n + 1); dm_gfx_shot_at(1, path); MLOG("[req] 截图 → %s", path); }
     if (all || strstr(line, "draws")) { snprintf(path, sizeof path, "%s/req_%ld_draws.txt", g_req_dir, cur); FILE *df = fopen(path, "w");
+        const char *fk = strstr(line, "fs="); g_req_cb_fs[0] = 0; if (fk) { size_t n = strcspn(fk + 3, " ,\n"); if (n > 16) n = 16; memcpy(g_req_cb_fs, fk + 3, n); g_req_cb_fs[n] = 0; }
         if (df) { if (g_req_draw_f) fclose(g_req_draw_f); g_req_draw_f = df; atomic_store(&g_req_draw_frame, cur); MLOG("[req] 绘制清单：帧 %ld → %s", cur, path); } else MLOG("【红】[req] 打不开 %s", path); }
     if (all || strstr(line, "rts")) { if (!g_td_list) g_td_list = [NSMutableArray array]; [g_td_list removeAllObjects];
         char *pat = malloc(1024); snprintf(pat, 1024, "%s/req_%ld_rt%%d.png", g_req_dir, cur); g_td_path = pat; g_td_frame = cur; g_td_done = 0; MLOG("[req] 颜色目标转储：帧 %ld → %s", cur, pat); }
+    if (strstr(line, "texlist")) {   // 贴图普查：登记表里每张贴图一行 | texture census: one line per registered texture
+        snprintf(path, sizeof path, "%s/req_%ld_texlist.txt", g_req_dir, cur); FILE *tf = fopen(path, "w"); int n = 0;
+        if (tf) { for (int tid = 1; tid < g_ntreg; tid++) { if (!g_treg[tid].ok) continue; const tex_t *t = &g_treg[tid].t; n++;
+                fprintf(tf, "tid=%d ser=%llu %ux%ux%u fmt=%d target=%d levels=%u flags=%#x samples=%d\n", tid, (unsigned long long)atomic_load_explicit(&g_tser[tid], memory_order_relaxed), t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, t->d.flags, t->d.samples); }
+            fclose(tf); MLOG("[req] 贴图普查 %d 张 → %s", n, path); } }
     const char *q = strstr(line, "texraw");
     if (q) { char *pat = malloc(1024); snprintf(pat, 1024, "%s/req_tex%%d", g_req_dir); g_td_path = pat;
         for (q += 6; *q;) { while (*q == ' ' || *q == ',') q++; if (!*q || *q == '\n') break; char *endp; uint64_t ser = strtoull(q, &endp, 10); if (endp == q) break; q = endp;

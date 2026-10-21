@@ -9,7 +9,7 @@ CMD=${1:-all}; shift || true; WAIT=8; ARGS=""
 for a in "$@"; do case "$a" in [0-9]*) if [ "$CMD" = texraw ]; then ARGS="$ARGS $a"; else WAIT=$a; fi;; esac; done
 pgrep -x BladeII > /dev/null || { echo "🔴 游戏没在运行 | the game is not running"; exit 1; }
 mkdir -p "$OUT"; before=$(ls -1 "$OUT" 2>/dev/null | sort)
-echo "$CMD$ARGS" > "$REQ"; echo "→ $CMD$ARGS（等 ${WAIT}s）"
+echo "${CMD}${ARGS}" > "$REQ"; echo "→ ${CMD}${ARGS}（等 ${WAIT}s）"
 for i in $(seq 1 $((WAIT * 2))); do sleep 0.5; [ -f "$REQ" ] || break; done
 [ -f "$REQ" ] && { echo "🔴 ${WAIT}s 内宿主没读走命令（这个包没有 req_poll？看 host.log 有没有「[req] 按需抓取」行）"; exit 1; }
 sleep 2
