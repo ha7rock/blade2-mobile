@@ -1174,7 +1174,8 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
         case 5: d.textureType = MTLTextureType2DMultisample; d.sampleCount = t->d.samples; d.mipmapLevelCount = 1; break;
         case 6: d.textureType = MTLTextureType2DMultisampleArray; d.sampleCount = t->d.samples; d.arrayLength = t->d.depth; d.mipmapLevelCount = 1; break;
         case 8: d.textureType = MTLTextureTypeCube; break;
-        case 9: d.textureType = MTLTextureTypeCubeArray; d.arrayLength = t->d.depth; break;
+        case 9: d.textureType = MTLTextureTypeCubeArray; d.arrayLength = MAX(t->d.depth / 6, 1u);   // NVN 的 depth 是面数（6 × 立方体数），Metal 的 arrayLength 是立方体数；之前直接等于 depth，多建 6 倍 | NVN depth counts faces (6 × cubes), Metal arrayLength counts cubes; it used to equal depth, 6× too many
+            if (t->d.depth % 6) RED_ONCE(1, "立方体数组深度 %u 不是 6 的倍数", t->d.depth); break;
         case 10: RED_ONCE(1, "缓冲贴图（TARGET_BUFFER）未实现"); return nil;
         default: d.textureType = MTLTextureType2D; break;
     }

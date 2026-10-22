@@ -138,12 +138,16 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         // 同理缺省记录贴图事实（着色器每个贴图寄存器在运行时真正绑定的贴图类型：2D / 立方 / 3D / 数组）：没有配对 PC 反射的着色器翻译时只能按 2D 猜，
         // 猜错的寄存器采样出全零（Boss 斗篷一类材质发黑）；记录下来后下一轮迭代按事实出 | Likewise record texture facts by default (the texture type really bound to each texture register at runtime: 2D / cube / 3D / array):
         // shaders without paired PC reflection can only be translated with a 2D guess, and a wrongly guessed register samples zeros (materials such as the boss cloak turn black); recorded, the next iterate uses the facts
-        // 画面触发器缺省开：每帧把游戏画面回读成 64x36 小图（回读编在出图命令缓冲里，几乎不占 CPU），某块「突变又恢复」(A-B-A) 就把三帧小图和接下来两帧全尺寸截图存到应用支持目录 glitch/（每局最多 6 次）。
-        // 逐帧亮度行不落盘（/dev/null）。玩家报「闪」时不必复现，直接看这些图定性 | Picture trigger on by default: each frame the game picture is read back as a 64x36 thumbnail (the readback is encoded in the present command buffer, near-zero CPU);
-        // a block that jumps and reverts (A-B-A) saves the three thumbnails and full-size screenshots of the next two frames to glitch/ under Application Support (at most 6 per session). Per-frame luminance lines are not kept (/dev/null).
-        // When the player reports "flicker" there is no need to reproduce it: these pictures classify it
+        // 逐帧亮度行不落盘（/dev/null）；画面触发器见下 | Per-frame luminance lines are not kept (/dev/null); picture trigger: see below
         if (!getenv("DM_NVN_REGLUM")) setenv("DM_NVN_REGLUM", "0,0,1,1:/dev/null", 1);
-        if (!getenv("DM_NVN_GLITCH")) { NSString *gd = [sup stringByAppendingPathComponent:@"glitch"]; [fm createDirectoryAtPath:gd withIntermediateDirectories:YES attributes:nil error:NULL]; setenv("DM_NVN_GLITCH", gd.fileSystemRepresentation, 1); }
+        // 2026-10-22 起画面触发器缺省关：它每次命中要同步截 2–3 张全尺寸 PNG（回读 + 编码各 40–60 ms，在出图线程上），玩家一局 6 分钟命中 49 次（刀光、闪电一类正常特效也会触发），
+        // 就是「零星卡顿」的来源（帧账：提交+出图 52–61 ms、GPU 5 ms、无新管线无上传，全部落在触发帧及其后一帧）。闪烁问题 2026-10-17 已由玩家确认关闭，不再需要常开。
+        // 要开：DM_NVN_GLITCH=1（存到应用支持目录 glitch/）或 =<目录> | Picture trigger off by default since 2026-10-22: each hit synchronously saves 2-3 full-size PNGs (readback + encode 40-60 ms each, on the present thread);
+        // a 6-minute play session hit 49 times (normal one-frame effects such as sword flashes and lightning also fire it) - this was the source of the "occasional stutter" (frame ledger: submit+present 52-61 ms, GPU 5 ms,
+        // no new pipelines, no uploads, all on trigger frames and the frame after). The flicker issue was closed by the player on 2026-10-17, so it no longer needs to be always on. To enable: DM_NVN_GLITCH=1 (saved to glitch/ under Application Support) or =<dir>
+        { const char *gl = getenv("DM_NVN_GLITCH"); if (gl && !strcmp(gl, "1")) { NSString *gd = [sup stringByAppendingPathComponent:@"glitch"]; [fm createDirectoryAtPath:gd withIntermediateDirectories:YES attributes:nil error:NULL]; setenv("DM_NVN_GLITCH", gd.fileSystemRepresentation, 1); } }
+        // 按需抓取（dump.req，tools/dump_req.sh）不依赖画面触发器：命令文件 <应用支持>/dump.req，产物 <应用支持>/dump/ | Capture on request (dump.req, tools/dump_req.sh) no longer depends on the picture trigger: command file <Application Support>/dump.req, output <Application Support>/dump/
+        if (!getenv("DM_NVN_REQ")) setenv("DM_NVN_REQ", [sup stringByAppendingPathComponent:@"dump"].fileSystemRepresentation, 1);
         if (!getenv("DM_NVN_TEXFACTS")) { NSString *tfp = [sup stringByAppendingPathComponent:@"texfacts.tsv"]; setenv("DM_NVN_TEXFACTS", tfp.fileSystemRepresentation, 1); }
         if (!getenv("DM_PSO_MANIFEST")) setenv("DM_PSO_MANIFEST", "off", 1);
         if (!getenv("DM_NVN_TBDR")) setenv("DM_NVN_TBDR", "0", 1);
