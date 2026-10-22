@@ -21,10 +21,12 @@ while pgrep -x BladeII > /dev/null; do sleep 3; done   # an instance started wit
 rm -rf "$O"; mkdir -p "$O"
 caffeinate -ims -t $((WATCH + 30)) &   # 只防系统睡眠；不带 -d/-u：那两个会点亮显示器，经 HDMI-CEC 把电视切过来 | keep the system awake only; no -d/-u: those wake the display and switch the TV over HDMI-CEC
 CAF=$!
-rm -rf "$SP"; cp -r $W/run/save "$SP"
+rm -rf "$SP"; cp -r "${ABA_SAVESRC:-$W/run/save}" "$SP"   # ABA_SAVESRC=<存档目录>：换一份起始存档（如通关存档，开局进大厅而不是新游戏） | ABA_SAVESRC=<save dir>: start from another save (e.g. a cleared-stage save that opens in the lobby instead of a new game)
 K="A@6,A@10,A@14,A@18,A@24,A@30,A@36"
 for i in $(seq 0 90); do K="$K,A@$(echo "55+$i*0.7" | bc)"; done
 K="$K,LSU@70+2,LSR@85+2"
+[ -z "${ABA_KEYS_EXTRA:-}" ] || K="$K,$ABA_KEYS_EXTRA"
+[ -z "${ABA_KEYS:-}" ] || K="$ABA_KEYS"   # 整段按键脚本替换（探索菜单用） | replace the whole key script (for exploring menus)   # 追加按键（如 PLUS@120 打开暂停菜单看装备界面） | extra keys appended (e.g. PLUS@120 to open the pause menu and look at the equipment screen)
 env | grep '^DM_\|^MTL_' | sort > "$O/env.txt"
 [ -n "${ABA_LAG:-}" ] && export DM_NVN_LAGLOG="$O/lag.txt"
 env DM_AUDIO=${DM_AUDIO:-0} ${ABA_TOP:+DM_WINDOW_TOP=1} ${ABA_TOP:-DM_WINDOW_BACK=1} DM_APP_ROMFS=$W/data/switch/01009cc00e224000/v131072/Update/RomFS DM_APP_SUPPORT=$W/run/appsup DM_SAVE="$SP" \

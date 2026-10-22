@@ -1500,8 +1500,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
             char path[1024]; snprintf(path, sizeof path, "%s/%llu_%ux%u_l%u_f%#x_fl%#x_b%d_%d_%d_th%u.bin", pd, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.levels, t->d.format, t->d.flags, bpb, bw, bh, th);
             FILE *f = fopen(path, "wb"); if (f) { fwrite(t->mem, 1, t->L.size, f); fclose(f); pdn++; } }
     }
-    unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;
-    if (t->d.target == 9) layers *= 6;
+    unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;   // 立方体数组：NVN 的 depth 已是面数（Blade 的反射数组 128x128x12 = 2 个立方体），不再 ×6——配合建图按 depth/6 个立方体；原先 ×6 多传 6 倍、建图也多 6 倍，两处抵消没炸，改了一处就越界（GPU 错误恢复 ×4/局） | cube arrays: NVN depth already counts faces (Blade's reflection array 128x128x12 = 2 cubes), no ×6 any more -- paired with the descriptor's depth/6 cubes; the old ×6 upload and 6× descriptor cancelled out, fixing one alone overran (4 GPU recoveries per run)
     uint32_t upf; int ubpp = 0, unp = bc_unpack(t->d.format, &upf, &ubpp);   // 无 BC：解排布后在 CPU 上解压，暂存区按解压后的大小 | No BC: decompress on the CPU after deswizzling, with the staging area sized for the decompressed data
     size_t total = 0;
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
@@ -2831,6 +2830,13 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
         uint32_t pf = (uint32_t)base.pixelFormat; uint8_t swz[4];
         if (r.v.set_format && !(nvn_fmt_to_mtl(r.v.format, &pf, swz) && pf)) pf = (uint32_t)base.pixelFormat;
         { uint32_t upf; int ubpp; if (r.v.set_format && bc_unpack(r.v.format, &upf, &ubpp)) pf = upf; }   // 无 BC：BC 视图跟底图一样换成解压后的格式 | No BC: a BC view is switched to the decompressed format just like the base texture
+        // 模板视图：合一深度模板底图的 STENCIL8 视图在 Metal 里是 X32_Stencil8（Stencil8 建不出）；模板值只在 .x，UE4 的 HLSL 按 D3D 口径读 .g（CopyStencilToLightingChannels 等），
+        // NVN 版靠贴图视图的分量调换；宿主不记 NVN 调换，就把视图四个分量都调成模板（.x / .y 都对）——需要底图带换格式用途，下面的 pfv 升级路顺带满足
+        // Stencil views: a STENCIL8 view of the combined depth-stencil base is X32_Stencil8 on Metal (Stencil8 cannot be created); the stencil lands in .x only, while UE4's HLSL reads .g as on D3D
+        // (CopyStencilToLightingChannels etc.), the NVN build relying on the texture view's component swizzle; the host does not track NVN swizzles, so all four components of the view are swizzled
+        // to stencil (.x and .y both right) -- this needs the pixel-format-view usage on the base, which the pfv upgrade path below provides anyway
+        int stencil_view = 0;
+        if (r.v.set_format && (MTLPixelFormat)pf == MTLPixelFormatStencil8 && base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) { pf = MTLPixelFormatX32_Stencil8; stencil_view = 1; }
         if (r.v.set_format && tex_need_pfv(base.pixelFormat, (MTLPixelFormat)pf) && !(base.usage & MTLTextureUsagePixelFormatView)) {
             base = tex_upgrade_pfv(&rp->t, base, (MTLPixelFormat)pf);
             sg = g_ser_gen;
@@ -2840,8 +2846,11 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
         NSUInteger ns = base.textureType == MTLTextureType3D ? 1 : (r.v.set_layers && r.v.nlayers ? r.v.nlayers : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1) - s0);
         MTLTextureType tt = r.v.set_target ? ttype(r.v.target, base.textureType) : base.textureType;
         if (tt == MTLTextureType2D && ns > 1) ns = 1;
-        v = [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
+        v = stencil_view ? [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)
+                                                        swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed)]
+                         : [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
         if (!v) { RED_ONCE(11, "贴图视图建不出 id %d", tid); v = base; }
+        if (stencil_view) { static int n; if (n++ < 2) MLOG("模板视图：底图 ser=%llu %lux%lu → X32_Stencil8（分量全调成模板）%s", (unsigned long long)rp->t.serial, (unsigned long)base.width, (unsigned long)base.height, v == base ? "，建不出，按底图绑" : ""); }
     }
     rp->view = (void *)CFBridgingRetain(v); rp->view_rid = v.gpuResourceID._impl; rp->view_ser = sg; rp->view_dirty = dg;
     return v;
@@ -3121,11 +3130,13 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交�
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
+static void foutfacts_note(NvShader *fs, const uint32_t cfmt[8]);
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) {
     (void)unused;
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
     if (!vs) { RED_ONCE(13, "程序没有顶点着色器（或未映射）"); return nil; }
     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
+    foutfacts_note(fs, g_pass.cfmt);
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = hm_get_id(&g_pso, &k);
     if (cached) return cached;
@@ -3408,15 +3419,43 @@ static void attrfacts_note(NvShader *vs, int loc, int fmt) {
     if ([seen containsObject:line]) return;
     [seen addObject:line]; fprintf(f, "%s\n", line.UTF8String); fflush(f);
 }
-static void texfacts_note(NvShader *sh, int reg, MTLTextureType tt) {
+// 整数像素格式的分量类别（uint / sint），其余 NULL：贴图事实与片元输出事实都用它 | component class of an integer pixel format (uint / sint), NULL otherwise: used by both the texture facts and the fragment output facts
+static const char *pf_int_class(MTLPixelFormat pf) {
+    switch (pf) {
+        case MTLPixelFormatR8Uint: case MTLPixelFormatR16Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatR32Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA8Uint:
+        case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA32Uint:
+        case MTLPixelFormatStencil8: case MTLPixelFormatX32_Stencil8: case MTLPixelFormatX24_Stencil8: return "uint";   // 模板视图：Metal 只能按 texture2d<uint> 读 | stencil views: Metal reads them only through texture2d<uint>
+        case MTLPixelFormatR8Sint: case MTLPixelFormatR16Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatR32Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Sint:
+        case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Sint: return "sint";
+        default: return NULL;
+    }
+}
+// 片元输出分量类型作答（同一文件，行格式「片元键 \t fout:<目标号> \t uint|sint」）：翻译器缺省把片元输出声明成 float4，颜色目标是整数格式时 Metal 拒建管线
+// （UE4 的光照通道：CopyStencilToLightingChannels 把模板位拷进 R16Uint 贴图，装备界面的角色预览就靠它分光——管线建不出 → 角色全黑只剩自发光）
+// Fragment output component type answers (same file, line "fs key \t fout:<target> \t uint|sint"): the translator declares fragment outputs float4 by default, and Metal refuses the pipeline when the colour target is an integer format
+// (UE4 lighting channels: CopyStencilToLightingChannels copies the stencil bits into an R16Uint texture, the character preview of the equipment screen relies on it to route lights -- no pipeline → the character is black except emissive)
+static void foutfacts_note(NvShader *fs, const uint32_t cfmt[8]) {
+    static FILE *f; static int tried; static NSMutableSet *seen;
+    if (!tried) { tried = 1; const char *e = getenv("DM_NVN_TEXFACTS"); if (e) { f = fopen(e, "a"); seen = [NSMutableSet set]; } }
+    if (!f || !fs || !fs->key[0]) return;
+    for (int i = 0; i < 8; i++) { const char *cls = cfmt[i] ? pf_int_class((MTLPixelFormat)cfmt[i]) : NULL; if (!cls) continue;
+        NSString *line = [NSString stringWithFormat:@"%.16s\tfout:%d\t%s", fs->key, i, cls];
+        if ([seen containsObject:line]) continue;
+        [seen addObject:line]; fprintf(f, "%s\n", line.UTF8String); fflush(f); }
+}
+static void texfacts_note(NvShader *sh, int reg, MTLTextureType tt, MTLPixelFormat pf) {
     static FILE *f; static int tried; static NSMutableSet *seen;
     if (!tried) { tried = 1; const char *e = getenv("DM_NVN_TEXFACTS"); if (e) { f = fopen(e, "a"); seen = [NSMutableSet set]; } }
     if (!f || !sh || !sh->key[0]) return;
     static const char *const words[] = {"1d", "1darray", "2d", "2darray", "2dms", "cube", "cubearray", "3d", "2dmsarray", "buffer"};
     if ((unsigned)tt >= sizeof words / sizeof *words) return;
     NSString *line = [NSString stringWithFormat:@"%.16s\t%d\t%s", sh->key, reg, words[tt]];
-    if ([seen containsObject:line]) return;
-    [seen addObject:line]; fprintf(f, "%s\n", line.UTF8String); fflush(f);
+    if (![seen containsObject:line]) { [seen addObject:line]; fprintf(f, "%s\n", line.UTF8String); fflush(f); }
+    // 整数格式的贴图（R16Uint 光照通道等）：翻译器缺省按 texture2d<float> 声明，Metal 读整数贴图得到的不是原始位——记「texfmt:<槽> uint|sint」，出包时把声明改成整数类型并按位转回 float
+    // Integer-format textures (R16Uint lighting channels etc.): the translator declares texture2d<float> by default and Metal does not return the raw bits of an integer texture -- record "texfmt:<slot> uint|sint", the build switches the declaration to an integer type and bit-casts back to float
+    const char *cls = pf_int_class(pf);
+    if (cls) { NSString *l2 = [NSString stringWithFormat:@"%.16s\ttexfmt:%d\t%s", sh->key, reg, cls];
+        if (![seen containsObject:l2]) { [seen addObject:l2]; fprintf(f, "%s\n", l2.UTF8String); fflush(f); } }
 }
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
@@ -3483,7 +3522,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                        (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType);
-            if (t) texfacts_note(sh, reg, t.textureType);
+            if (t) texfacts_note(sh, reg, t.textureType, t.pixelFormat);
             if (t && tid < g_ntreg) reup_who_note(g_treg[tid].t.serial, sh->key, nvn_stage);
             if (t && nvn_stage == 1 && tid < g_ntreg) texraw_sel_note(t, g_treg[tid].t.serial);
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }

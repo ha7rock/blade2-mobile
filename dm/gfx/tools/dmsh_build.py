@@ -324,6 +324,31 @@ def raster_facts(stage, src):
             aff[str(k)] = {'attr': attr[fx[0][0]], 'sx': fx[1], 'ox': fx[2], 'sy': fy[1], 'oy': fy[2]}
     return {'pos_attr': attr[m0[0]], 'pos_w': w, 'uv_from_attr': uv, 'uv_affine': aff}
 
+def int_tex_rewrite(src, texfmt):
+    """整数格式贴图（作答表 texfmt: 槽 → uint|sint）：Ryujinx 一律按浮点采样类型声明（texture2d<float>），Metal 从整数贴图里读不出原始位（R16Uint 的 5 读成 0 / 垃圾），
+    着色器随后的 as_type<int> 全错。改写 MSL：该槽的声明换成 texture2d<uint|int>，read / sample / gather 的结果按位转回 float4（Maxwell 的 TLD 对整数格式就是把原始位放进寄存器）
+    Integer-format textures (answer table texfmt: slot → uint|sint): Ryujinx always declares the float sampled type (texture2d<float>), and Metal does not return the raw bits of an integer texture
+    (a 5 in R16Uint reads as 0 / garbage), so the shader's later as_type<int> is wrong. Rewrite the MSL: switch that slot's declaration to texture2d<uint|int> and bit-cast the result of read / sample / gather
+    back to float4 (Maxwell's TLD puts the raw bits in the register for integer formats)"""
+    names = {}
+    for m in re.finditer(r'\b(texture(?:1d|2d|3d|cube)(?:_array)?(?:_ms)?)<float>\s+([a-z]+_t\w*?_(?:cb\d+|tcb)_[0-9A-F]+)\s*\[\[id\(\d+\)\]\]', src):
+        d = decode_tex(m.group(2))
+        if d and str(d[0]) in texfmt: names[m.group(2)] = (m.group(1), {'uint': 'uint', 'sint': 'int'}[texfmt[str(d[0])]])
+    for nm, (ty, ct) in names.items():
+        src = re.sub(r'\b' + ty + r'<float>(\s+' + nm + r'\s*\[\[id\()', ty + '<' + ct + r'>\1', src, count=1)
+        out, i = [], 0
+        pat = re.compile(r'\b' + nm + r'\.(read|sample|gather)\(')
+        while True:
+            m = pat.search(src, i)
+            if not m: out.append(src[i:]); break
+            start = m.start(); j = m.end(); depth = 1   # 往前找表达式起点（spvDescriptorSet0. 前缀） | find the expression start (the spvDescriptorSet0. prefix) backwards
+            k = start
+            while k > 0 and (src[k - 1].isalnum() or src[k - 1] in '_.'): k -= 1
+            while j < len(src) and depth: depth += {'(': 1, ')': -1}.get(src[j], 0); j += 1
+            out.append(src[i:k]); out.append('as_type<float4>(' + src[k:j] + ')'); i = j
+        src = ''.join(out)
+    return src
+
 def decode_tex(name):
     """fp_t_cb{slots}_{handle} / fp_t_tcb_{handle}：贴图槽、采样器槽（Ryujinx TextureHandle 编码；c[2] 句柄表） | fp_t_cb{slots}_{handle} / fp_t_tcb_{handle}: texture slot, sampler slot (Ryujinx TextureHandle encoding; c[2] handle table)"""
     m = re.match(r'[a-z]+_[ti]\w*?_(?:cb(\d+)|tcb)_([0-9A-F]+)', name)
@@ -600,6 +625,8 @@ def finish(key, w, j, c1):
     r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
     src = open(msl).read()
+    if j.get('texfmt'):   # 整数格式贴图：改声明 + 按位转回（见 int_tex_rewrite）；改写后的 MSL 写回文件，metal 编译与反射都用它 | integer-format textures: switch the declaration + bit-cast back (see int_tex_rewrite); the rewritten MSL is written back, both the metal compile and the reflection use it
+        src = int_tex_rewrite(src, j['texfmt']); open(msl, 'w').write(src)
     fused = None
     if j['stage'] == 'vs' and key in PAIRS_GS:   # 顶点 + 直通写层号的几何：顶点着色器补写 [[render_target_array_index]]（分层目标），出成变体 <顶点键>+<几何键>_b
         for gk in sorted(PAIRS_GS[key]):
