@@ -2466,7 +2466,7 @@ static void shmap_load(void) {
     warm_start();
 }
 
-@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro; const char *builtin; uint64_t logged; char key[40]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     // 上次编好的参数缓冲
     // The argument buffer encoded last time
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass：编这块参数的渲染通道序号——只在同一通道内复用（跨通道 / 跨提交的块所在 arena 可能已回收重写） | ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
@@ -3239,11 +3239,16 @@ static void warm_start(void) {
     if (e && *e) {
         paths = @[@(e)];
     } else {
+        // 种子清单（包里 shader_map.tsv 旁的 pso_manifest.tsv）与本机记录（pso_user.tsv）有哪个用哪个：通用宿主的游戏没有种子清单时，只凭本机上一局记下的管线也要预热，
+        // 否则每局第一次遇到的管线都在提交线程同步编（Blade 一局 17 分钟里 8 次 20–63 ms 的长帧全是它）
+        // Seed manifest (pso_manifest.tsv next to shader_map.tsv in the bundle) and the local record (pso_user.tsv): use whichever exists. A generic-host game without a seed manifest must still warm up from what the last session on this machine recorded,
+        // otherwise every pipeline met for the first time in a session is compiled synchronously on the submit thread (in a 17-minute Blade session, all 8 long frames of 20-63 ms were this)
         NSString *seed = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_manifest.tsv"];
-        NSMutableArray<NSString *> *all = [NSMutableArray arrayWithObject:seed];
+        NSMutableArray<NSString *> *all = [NSMutableArray array];
+        if ([NSFileManager.defaultManager fileExistsAtPath:seed]) [all addObject:seed];
         NSString *user = pso_user_path();
         if (user && [NSFileManager.defaultManager fileExistsAtPath:user]) [all addObject:user];
-        if (![NSFileManager.defaultManager fileExistsAtPath:seed]) return;
+        if (!all.count) return;
         paths = all;
     }
     if (!g_warm_items) g_warm_items = [NSMutableArray array];

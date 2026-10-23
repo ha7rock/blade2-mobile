@@ -149,7 +149,7 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         // 按需抓取（dump.req，tools/dump_req.sh）不依赖画面触发器：命令文件 <应用支持>/dump.req，产物 <应用支持>/dump/ | Capture on request (dump.req, tools/dump_req.sh) no longer depends on the picture trigger: command file <Application Support>/dump.req, output <Application Support>/dump/
         if (!getenv("DM_NVN_REQ")) setenv("DM_NVN_REQ", [sup stringByAppendingPathComponent:@"dump"].fileSystemRepresentation, 1);
         if (!getenv("DM_NVN_TEXFACTS")) { NSString *tfp = [sup stringByAppendingPathComponent:@"texfacts.tsv"]; setenv("DM_NVN_TEXFACTS", tfp.fileSystemRepresentation, 1); }
-        if (!getenv("DM_PSO_MANIFEST")) setenv("DM_PSO_MANIFEST", "off", 1);
+        // 管线预热缺省开（2026-10-23）：种子清单 Resources/pso_manifest.tsv（打包脚本从工作区带入）+ 本机记录 pso_user.tsv；之前因为 Blade 没有种子清单而整个关掉，结果局内每条新管线都同步编 | Pipeline warm-up on by default (2026-10-23): seed manifest Resources/pso_manifest.tsv (brought in from the workspace by the packaging script) + local record pso_user.tsv; previously turned off entirely because Blade had no seed manifest, so every new pipeline in a session was compiled synchronously
         if (!getenv("DM_NVN_TBDR")) setenv("DM_NVN_TBDR", "0", 1);
 #else
         if (!getenv("DM_TOUCH_DEFAULTS")) setenv("DM_TOUCH_DEFAULTS", "1", 1);   // 产品缺省同 iOS 包（hle_fs.c settings_seed：玩家没碰过的设置键补上——小地图放右上角、进局自动打开、显示物品用开关式等；已有的键不动）。命令行宿主缺省不做，那边要对 Switch 真值比图 | product defaults same as the iOS package (hle_fs.c settings_seed: fills in settings keys the player has never touched - minimap in the top-right corner, opened automatically on entering a game, show-items as a toggle, and so on; existing keys are left alone). The command-line host does not do this by default, since it has to be compared against Switch ground-truth images

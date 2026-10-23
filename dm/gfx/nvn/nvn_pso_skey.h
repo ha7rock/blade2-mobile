@@ -15,14 +15,16 @@ typedef struct {
     int8_t fx[32];
 } pso_fz_desc;
 
-typedef struct { char vs[24], fs[24]; uint8_t vs_stage, fs_stage, merged, fz; pso_fz_desc fz_desc; pso_key k; } pso_skey;
+// 键名 40 字节：几何着色器融合变体名 <顶点键>+<几何键>_b 是 35 字节，原来的 24 字节截断后预热打不开库（2026-10-23；旧格式清单行长度不同，解析时跳过）
+// Key names 40 bytes: fused geometry-shader variant names <vs>+<gs>_b are 35 bytes; the old 24 truncated them and warm-up could not open the library (2026-10-23; old-format manifest lines differ in length and are skipped by the parser)
+typedef struct { char vs[40], fs[40]; uint8_t vs_stage, fs_stage, merged, fz; pso_fz_desc fz_desc; pso_key k; } pso_skey;
 
 static inline void pso_skey_from(const pso_key *k, NvShader *vs, NvShader *fs, int merged, const pso_fz_desc *fz, pso_skey *out) {
     memset(out, 0, sizeof *out);
     memcpy(&out->k, k, sizeof out->k);
     out->k.vs = out->k.fs = out->k.fsfn = NULL;
-    if (vs) { memcpy(out->vs, vs->key, sizeof out->vs); out->vs_stage = (uint8_t)vs->stage; }
-    if (fs) { memcpy(out->fs, fs->key, sizeof out->fs); out->fs_stage = (uint8_t)fs->stage; }
+    if (vs) { strlcpy(out->vs, vs->key, sizeof out->vs); out->vs_stage = (uint8_t)vs->stage; }
+    if (fs) { strlcpy(out->fs, fs->key, sizeof out->fs); out->fs_stage = (uint8_t)fs->stage; }
     out->merged = merged != 0;
     out->fz = k->fsfn != NULL;
     if (fz) memcpy(&out->fz_desc, fz, sizeof out->fz_desc);

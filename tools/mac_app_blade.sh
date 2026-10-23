@@ -21,6 +21,7 @@ cp "$DM/host/dmhost_blade" "$APP/Contents/MacOS/BladeII"
 RES="$APP/Contents/Resources"
 mkdir -p "$RES/product"; for f in main sdk; do cp "$P/$f.patched.bin" "$P/$f.fixups.tsv" "$P/$f.gates.tsv" "$P/$f.params.tsv" "$RES/product/"; cp "$P/$f.cuts.tsv" "$RES/product/" 2>/dev/null || true; done
 cp "$DM/gfx/nvn/shader_map.tsv" "$RES/shader_map.tsv"
+[ ! -f "$ROOT/pso_manifest.tsv" ] || cp "$ROOT/pso_manifest.tsv" "$RES/pso_manifest.tsv"   # 管线预热种子清单（本机游玩记下的 pso_user.tsv 汇总）| pipeline warm-up seed manifest (merged from pso_user.tsv recorded while playing)
 [ ! -f "$DM/gfx/nvn/c1_full.tsv" ] || cp "$DM/gfx/nvn/c1_full.tsv" "$RES/c1_full.tsv"
 V=$(sed -n 's/.*DMSH_CHAIN "\(.*\)".*/\1/p' "$DM/gfx/nvn/dmsh_chain.h")
 MSL=${DM_MSL_DIR:-$ROOT/build/cache/metal_shader_cache}/b-$V
