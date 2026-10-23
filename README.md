@@ -3,7 +3,7 @@
 这是对 [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)（把 Switch 版《暗黑破坏神 II：狱火重生》原生跑在 iPhone 上的开源兼容层）的**方法论拆解**，以及把同一套方法**举一反三**用到本地另一款 Switch 游戏（Blade II，UE4 4.17）上的工程。
 `dm/` 是 d2r-mobile 的 `dm/` 目录原样拷贝（MIT，见 `LICENSE.d2r-mobile`）加上 Blade 的改动；改动都能用 `git log -p` 看到。
 
-状态（2026-10-18，标签 `v0.1.0`）：**Mac 宿主可正常游玩（玩家已通过第 1–3 关，60 fps，有声音、有过场动画），全部 10 220 个着色器已离线抽出并翻译，不再依赖「走到哪补到哪」；iOS 壳（`dm/ios/blade`）能用全量着色器为 iphoneos 编出完整 App，待真机验证**；细节见文末「现状与下一步」。
+状态（2026-10-23）：**Mac 宿主可正常游玩（玩家已通过第 1–3 关与第一个 Boss，60 fps，有声音、有过场动画；第一 Boss 的金属盔甲、装备界面的角色光照、零星卡顿三项已由玩家在 10-22/23 验证通过），全部 10 220 个着色器已离线抽出并翻译，不再依赖「走到哪补到哪」；iOS 壳（`dm/ios/blade`）能用全量着色器为 iphoneos 编出完整 App，待真机验证**；细节见文末「现状与下一步」。给下一款游戏用的经验总结：[docs/porting_playbook.md](docs/porting_playbook.md)。
 游戏内容（程序、资源、改写产物）一律不进仓库。
 
 ## 画面（Mac 宿主，玩家实机对局时宿主自动留下的 1280×720 帧，缩到 960×540）
@@ -153,6 +153,7 @@ DM_OUT=$O dm/ios/blade/run.sh build && dm/ios/blade/run.sh install && dm/ios/bla
 
 | 标签 | 日期 | 内容 |
 |---|---|---|
+| （未打标签，`main`） | 2026-10-23 | 玩家验证通过的三条修复：第一 Boss 金属盔甲全黑（原子缓冲绑定传了贴图号而非 GPU 地址 + 环境 BRDF 查找表被池内陈旧字节重传）、装备界面角色全黑（UE4 光照通道的整数颜色目标 / 整数贴图，见下表）、零星卡顿（画面触发器同步存 PNG，缺省改关）；立方体数组贴图不再多建 6 倍；无声测试脚本 `tools/aba_run.sh`（`DM_AUDIO=0`、不点亮显示器）。 |
 | `v0.1.0` | 2026-10-18 | 第一个阶段性版本：Mac 宿主可通关游玩（已验证第 1–3 关，60 fps，音频、mp4 过场、实体手柄）；闪烁 / 一帧错画 / 显存暴涨三条线全部收口；`tools/pak_shaders.py` 离线抽出全部 10 220 个着色器并推出贴图 / 属性事实，Mac 与 iOS 着色器库都是全量；iOS 壳能编完整 App，尚未上真机。下一步：iOS 真机运行、性能、触摸虚拟手柄浮层。 |
 
 **2026-10-15 的结果（Mac 宿主，`tools/run_mac.sh`，60 fps）**：标题 → 读档确认（世界地图底图）→ 章节地图 → 关卡选择（角色立绘、关卡预览图）→ 读取画面 → Act 1「Darkness in Luemos」：带贴图的石板地、木桶、锁链、尖塔，雾、烛光、点光源，主角（白发角斗士）与敌人（骷髅兵）的完整模型、鹅、受击特效、连击数字、受伤红闪，画面与真机一致；不操作时主角被打死出「Defeat」画面。截图在 `~/blade2-work/run/shot_*.png`。
@@ -175,7 +176,7 @@ DM_OUT=$O dm/ios/blade/run.sh build && dm/ios/blade/run.sh install && dm/ios/bla
 | 2D 贴图全黑（读取画面底图、关卡预览、UI 图片），3D 材质平的 | d2r 只把带「打包布局」（`SetPackagedTextureLayout`）的贴图从内存池解排布上传；UE4 按 NVN 默认块线性布局直接 memcpy 进池、不带打包布局，于是采样贴图都建成了空的私有 MTLTexture | `tex_pool_src`：池里有存储、不是显示 / 图像 / 可压缩渲染目标 / 线性渲染目标 / 缓冲贴图的，一律按池内容上传（Blade 实测采样贴图 flags = 0x20 / 0，渲染目标 0x8 / 0xc）；脏页跟踪与重传照旧（一局首传 322 张、重传 8978 次） |
 | 地板成块缺失、带筛孔纹 | UE4 深度预通道 + 基础通道 GEQUAL 深度测试要求两个不同顶点着色器算出**逐位相同**的裁剪位置；Metal 默认 fast-math 下各着色器 fma 合并不同，MSL 的 `[[position, invariant]]` 不加编译选项不生效 | `xcrun metal -fpreserve-invariance`（Mac 与 iOS 两条编译口径都加） |
 | 主角 / 敌人只剩武器，身体不显示 | 蒙皮顶点着色器的骨骼索引属性是 RGBA8UI 整数格式，翻译器离线不知道属性类型、按 `float4` 声明；Metal 把整数转成浮点值，着色器再 `as_type<int>` 得到垃圾骨骼索引——只绑 0 号骨骼的部件（武器）碰巧正常 | 宿主在建管线时记录每个顶点属性的分量类型（`DM_NVN_TEXFACTS` 文件里的 `attr:<槽>` 行），`dmsh_from_dump.py` 合进作答表的 `attr`，翻译器按 `uint4` 声明 |
-| 装备界面的角色预览全黑，只剩金色自发光 | UE4 **光照通道**：`CopyStencilToLightingChannels` 把模板位拷进 **R16Uint** 贴图，各盏灯的像素着色器读它决定照不照——翻译器离线不知道整数格式：片元输出按 `float4` 声明，Metal 拒建管线（`output of type float4 is not compatible with R16Uint`）；灯的着色器把它按 `texture2d<float>` 声明，Metal 读整数贴图得不到原始位。两头都断 → 预览场景一盏灯都照不到角色 | 宿主记两种新事实：`fout:<目标号> uint/sint`（建管线时颜色目标是整数格式）、`texfmt:<槽> uint/sint`（绑定的贴图是整数格式）；出包时前者让 Ryujinx 直接出 `uint4` 输出，后者把声明改成 `texture2d<uint>` 并把 read / sample / gather 的结果 `as_type<float4>` 按位转回（`dmsh_build.py` 的 `int_tex_rewrite`） |
+| 装备界面的角色预览全黑，只剩金色自发光（2026-10-23 玩家验证已修） | UE4 **光照通道**：`CopyStencilToLightingChannels` 把模板位拷进 **R16Uint** 贴图，各盏灯的像素着色器读它决定照不照——翻译器离线不知道整数格式：片元输出按 `float4` 声明，Metal 拒建管线（`output of type float4 is not compatible with R16Uint`）；灯的着色器把它按 `texture2d<float>` 声明，Metal 读整数贴图得不到原始位。两头都断 → 预览场景一盏灯都照不到角色 | 宿主记两种新事实：`fout:<目标号> uint/sint`（建管线时颜色目标是整数格式）、`texfmt:<槽> uint/sint`（绑定的贴图是整数格式）；出包时前者让 Ryujinx 直接出 `uint4` 输出，后者把声明改成 `texture2d<uint>` 并把 read / sample / gather 的结果 `as_type<float4>` 按位转回（`dmsh_build.py` 的 `int_tex_rewrite`） |
 | 点光源立方体阴影不画 | 4 个几何着色器把三角形发到 6 个面（`EmitVertex` 18 次，层号 0–5 常量，每面乘 `gp_c3` 第 6+4f 行起的矩阵、`_m0[f].x` 为面开关） | 离线认出这一族（`dmsh_build.py gs_cube`），顶点变体按 `instance_id % 6` 选面与矩阵、输出层号与面号常量；几何阶段 uniform 以 `stage=2` 绑定挂进顶点参数块；宿主把实例数与基实例 ×6（反射 `gs_faces`）。坑：UE4 阴影顶点只写世界坐标 xyz，真机上未写的插值 w 缺省 1 而翻译出的 MSL 清零 → 融合时补 1，否则平移行丢失 |
 
 2026-10-15 午后：**有声音了**——`hle_blade.c` 的音频渲染器按 SDK 接口真混音（游戏用 32 个 44.1 kHz 单声道 DSP-ADPCM 声音槽 → 32 kHz 渲染器 → CoreAudio，`DM_AUDIO=1`，`DM_AUDIO_GAIN` 调响度，`DM_AUDIO_OUT_DUMP` 存混音）；d2r 的暗黑专属固定地址缺省在通用宿主下全部失效（`DM_GENERIC_HOST`）；TBDR 优化开启验证通过（画面一致、GPU 时间持平，Mac 默认仍关）；200 秒脚本游玩（移动 / 攻击）无崩溃。
