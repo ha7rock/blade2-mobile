@@ -29,6 +29,7 @@ Mac 宿主实机 1280×720 帧，缩到 960×540。截图只用于说明运行�
 
 ```bash
 tools/extract_game.sh "<你的 XCI>" prod.keys                       # 从你自己的游戏取 ExeFS / RomFS
+E=~/blade2-work/data/switch/01009cc00e224000/v131072/Update/ExeFS; O=~/blade2-work/build/out
 for m in sdk subsdk0 main; do python3 dm/tools/patch_nso.py $E/$m $O $m; done   # 改写三个模块
 tools/shaders_iterate.sh                                            # 全量着色器 → Metal
 DM_MAC_DMG=1 tools/mac_app_blade.sh $O                              # Blade II.app + dmg
