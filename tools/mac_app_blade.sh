@@ -23,6 +23,13 @@ mkdir -p "$RES/product"; for f in main sdk; do cp "$P/$f.patched.bin" "$P/$f.fix
 cp "$DM/gfx/nvn/shader_map.tsv" "$RES/shader_map.tsv"
 [ ! -f "$ROOT/pso_manifest.tsv" ] || cp "$ROOT/pso_manifest.tsv" "$RES/pso_manifest.tsv"   # 管线预热种子清单（本机游玩记下的 pso_user.tsv 汇总）| pipeline warm-up seed manifest (merged from pso_user.tsv recorded while playing)
 [ ! -f "$DM/gfx/nvn/c1_full.tsv" ] || cp "$DM/gfx/nvn/c1_full.tsv" "$RES/c1_full.tsv"
+# 图标：工作区 $ROOT/icon/icon.jpg = 游戏自己的 Switch 图标（控制分区 icon_*.dat，游戏内容，不进仓库），有就做成 AppIcon.icns | Icon: $ROOT/icon/icon.jpg = the game's own Switch icon (control partition icon_*.dat, game content, not in the repo); when present it becomes AppIcon.icns
+ICON=
+if [ -f "$ROOT/icon/icon.jpg" ]; then
+  mkdir -p "$ROOT/build/cache/tools"; MI="$ROOT/build/cache/tools/mac_icon"
+  [ -x "$MI" ] && [ "$MI" -nt "$HERE/tools/mac_icon.m" ] || clang -fobjc-arc -framework Cocoa "$HERE/tools/mac_icon.m" -o "$MI"
+  "$MI" "$ROOT/icon/icon.jpg" "$RES/AppIcon.icns" && ICON=1 || echo "🟡 图标没做成（继续打包，无图标）"
+fi
 V=$(sed -n 's/.*DMSH_CHAIN "\(.*\)".*/\1/p' "$DM/gfx/nvn/dmsh_chain.h")
 MSL=${DM_MSL_DIR:-$ROOT/build/cache/metal_shader_cache}/b-$V
 [ -d "$MSL" ] || { echo "🔴 没有着色器库 ${MSL}（先跑 tools/shaders_iterate.sh）"; exit 2; }
@@ -37,6 +44,7 @@ cat > "$APP/Contents/Info.plist" <<PL
 <key>CFBundleDisplayName</key><string>$NAME</string>
 <key>CFBundleIdentifier</key><string>$BID</string>
 <key>CFBundleExecutable</key><string>BladeII</string>
+${ICON:+<key>CFBundleIconFile</key><string>AppIcon</string>}
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$VER</string>
 <key>CFBundleVersion</key><string>$BUILD</string>
@@ -47,4 +55,9 @@ cat > "$APP/Contents/Info.plist" <<PL
 </dict></plist>
 PL
 codesign --force --sign - --deep "$APP" > /dev/null 2>&1 || { echo "🔴 签名失败"; exit 3; }
+# DM_MAC_DMG=1：再压一个可分发的 .dmg（App 旁，文件名带版本与构建号）| DM_MAC_DMG=1: also press a distributable .dmg next to the App (name carries version and build)
+if [ "${DM_MAC_DMG:-}" = 1 ]; then
+  DMG="$OUT/Blade II Mobile ${VER} (${BUILD}).dmg"; rm -f "$DMG"
+  hdiutil create -quiet -volname "Blade II Mobile" -srcfolder "$APP" -ov -format UDZO "$DMG" && echo "📦 ${DMG}（$(du -h "$DMG" | cut -f1)）"
+fi
 echo "✅ ${APP}（$(du -sh "$APP" | cut -f1)）：双击启动，第一次选游戏资源文件夹 Update/RomFS"

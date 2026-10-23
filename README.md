@@ -137,6 +137,10 @@ tools/pak_shaders.py extract $W/shpak/blobs $ROMFS/BladeII/Content/Paks/*.pak   
 tools/pak_shaders.py derive $W/shpak/blobs $W/shpak/dump $W/shpak/facts.tsv     # → 转储格式 + 事实表；rsync 进 $W/shdump，facts 并进 $W/texfacts.tsv
 tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_build → 重编宿主（全量 10 220 个约 14 分钟，J=12）
 
+# 4b. Mac 成品包：tools/mac_app_blade.sh（图标 = 游戏自己的 Switch 图标：hactool 取控制 NCA 的 icon_AmericanEnglish.dat 放到 ~/blade2-work/icon/icon.jpg，游戏内容不进仓库；DM_MAC_DMG=1 再出 .dmg）
+tools/mac_app_blade.sh ~/blade2-work/build/out2            # → ~/blade2-work/out/macapp/Blade II.app（AppIcon.icns、pso_manifest.tsv 预热清单、全量着色器库）
+DM_MAC_DMG=1 tools/mac_app_blade.sh ~/blade2-work/build/out2   # 再压一个 Blade II Mobile 0.1 (<构建号>).dmg
+
 # 5. iOS 壳（dm/ios/blade，不需要暗黑的 dm/ios 工程）：iphoneos 着色器库 → 生成工程 + 编译；没有签名身份时只做编译检查
 IOSOUT=$W/build/ios/dmsh_b J=8 $W/venv/bin/python3 -I dm/gfx/tools/dmsh_build.py $W/shpack $W/build/cache/metal_shader_cache
 cp dm/ios/local.env.example dm/ios/local.env   # 填 DM_TEAM_ID / DM_BUNDLE_ID / DM_DEVICE（见文件内说明）
