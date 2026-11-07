@@ -6,10 +6,10 @@ README 讲结果与最短用法；本页讲怎么工作：[d2r-mobile](https://g
 
 - `dm/`：d2r-mobile 的 `dm/` 原样 + Blade 改动（改写器 `dm/tools`、宿主 `dm/host`、图形与着色器链 `dm/gfx`、iOS 壳 `dm/ios/blade`）。
 - `scripts/`：从 XCI 到成品包要跑的脚本：`extract_game.sh`、`run_mac.sh`、`shaders_iterate.sh`、`pak_shaders.py`、`mac_app_blade.sh`（+ `mac_icon.m`）。
-- `tools/survey/`：开工前的静态调查（NSO 符号、导入覆盖、`br x18` 形态、NSO 审计、宿主试链接）。
+- `tools/survey/`：开工前的静态调查（NSO 符号、导入覆盖、`br x18` 形态、宿主试链接）。
 - `tools/diag/`：排错用（无声脚本局 `aba_run.sh`、按需抓取 `dump_req.sh`、一帧错画 / 亮度 / 通道环 / 池贴图块高 / GPU 滞后各检测器）。问题关闭后脚本保留，作为下一款游戏的现成探测器。
 - `tools/ios/`：触摸手柄效果图 `pad_mockup.m`。
-- `docs/`：本页、[blade_port.md](blade_port.md)、[porting_playbook.md](porting_playbook.md)、[ios_pad.md](ios_pad.md)、`survey/`、`screenshots/`。
+- `docs/`：本页、[blade_port.md](blade_port.md)、[porting_playbook.md](porting_playbook.md)、[ios_pad.md](ios_pad.md)、`main_imports_vs_d2r.tsv`（导入覆盖清单）、`screenshots/`。
 
 ## 工作区与环境
 

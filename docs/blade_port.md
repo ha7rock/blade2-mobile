@@ -1,6 +1,6 @@
 # Blade II: The Return of Evil on macOS（iOS 同源，Android 计划中）
 
-Blade II 的移植记录：游戏分析、每个问题的数字与根因、版本与现状。构建与着色器链命令见 [development.md](development.md)，给下一款游戏的坑表见 [porting_playbook.md](porting_playbook.md)，开工前（2026-10-14）的调研与审计见 [survey/](survey/)，触摸手柄见 [ios_pad.md](ios_pad.md)。
+Blade II 的移植记录：游戏分析、每个问题的数字与根因、版本与现状。构建与着色器链命令见 [development.md](development.md)，给下一款游戏的坑表见 [porting_playbook.md](porting_playbook.md)，触摸手柄见 [ios_pad.md](ios_pad.md)。
 
 游戏：title `01009cc00e224000`，更新 v131072，Unreal Engine 4.17，NintendoSDK 7.4。游戏内容（程序、资源、改写产物、着色器转储与 metallib、存档）一律不进仓库；下文 `W` = 工作区 `~/Documents/game_port/Blade/work`。
 
@@ -37,7 +37,7 @@ Blade II 的移植记录：游戏分析、每个问题的数字与根因、版�
 | 导入 | `main` 导入 608 个符号：d2r 宿主已接 153 个；其余 455 里 `nn::os` / libc++ / `nn::mem` / `nn::crypto` 等 SDK 用户态部分原样运行，真要新接的是 `nn::audio` 音频**渲染器**（39 个，D2R 只用 AudioOut）、联网一组、`nn::hid` Joy-Con / 六轴、`nn::time` 时区规则、`nn::swkbd` 配置、`movie` 媒体信息 6 个 |
 | SVC | `sdk` 里 60 处；d2r 实现 35 号，其余（IPC / 共享内存 / 端口类）在服务被接管后不会到达 |
 
-机器可读的清单：[`survey/main_imports_vs_d2r.tsv`](survey/main_imports_vs_d2r.tsv)（每个导入：命名空间、是否 d2r 已接、实现文件）。
+机器可读的清单：[`main_imports_vs_d2r.tsv`](main_imports_vs_d2r.tsv)（每个导入：命名空间、是否 d2r 已接、实现文件）。
 分析脚本在 `tools/`：`nso_syms.py`（NSO 动态符号）、`import_coverage.py`、`main_imports_vs_d2r.py`、`br18_sites.py`（跳转表写法分类）、`dm/gfx/tools/nvn_slots.py`（已参数化，`NVN_LOADER=0x33e6400 NVN_TEXT_END=0x42bcef0`）。
 
 ---

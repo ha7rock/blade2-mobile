@@ -35,7 +35,7 @@ scripts/shaders_iterate.sh                                            # 全量�
 DM_MAC_DMG=1 scripts/mac_app_blade.sh $O                              # Blade II.app + dmg
 ```
 
-文档都在 `docs/`：[blade_port.md](docs/blade_port.md)（移植记录：现状、分析、根因表、安卓计划）、[development.md](docs/development.md)（方法拆解、改了什么、完整构建）、[porting_playbook.md](docs/porting_playbook.md)（给下一款游戏的坑表与第一天清单）、[ios_pad.md](docs/ios_pad.md)（触摸手柄）、[survey/](docs/survey/)（开工前的调研与审计表）。
+文档都在 `docs/`：[blade_port.md](docs/blade_port.md)（移植记录：现状、分析、根因表、安卓计划）、[development.md](docs/development.md)（方法拆解、改了什么、完整构建）、[porting_playbook.md](docs/porting_playbook.md)（给下一款游戏的坑表与第一天清单）、[ios_pad.md](docs/ios_pad.md)（触摸手柄）、[main_imports_vs_d2r.tsv](docs/main_imports_vs_d2r.tsv)（导入覆盖清单）。
 
 ## 版权与致谢 | Copyright and acknowledgements
 
