@@ -3,7 +3,7 @@
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 for spec in "$@"; do
   set -- $spec; tag=$1; shift
-  env ABA_DRAWSET=1 DM_PRESENT_LINK=${DM_PRESENT_LINK:-0} "$@" "$HERE/tools/aba_run.sh" "$tag" 55 0 ${ABA_WATCH:-100} > "$HOME/blade2-work/run/aba/$tag.out" 2>&1
+  env ABA_DRAWSET=1 DM_PRESENT_LINK=${DM_PRESENT_LINK:-0} "$@" "$HERE/tools/aba_run.sh" "$tag" 55 0 ${ABA_WATCH:-100} > "${DM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/work}/run/aba/$tag.out" 2>&1
   echo "$tag done"
 done
 echo ALLDONE

@@ -2,7 +2,7 @@
 
 Blade II 的移植记录：游戏分析、每个问题的数字与根因、版本与现状。构建与着色器链命令见 [development.md](development.md)，给下一款游戏的坑表见 [porting_playbook.md](porting_playbook.md)，开工前（2026-10-14）的调研与审计见 [survey/](survey/)，触摸手柄见 [ios_pad.md](ios_pad.md)。
 
-游戏：title `01009cc00e224000`，更新 v131072，Unreal Engine 4.17，NintendoSDK 7.4。游戏内容（程序、资源、改写产物、着色器转储与 metallib、存档）一律不进仓库；下文 `W` = 工作区 `~/blade2-work`。
+游戏：title `01009cc00e224000`，更新 v131072，Unreal Engine 4.17，NintendoSDK 7.4。游戏内容（程序、资源、改写产物、着色器转储与 metallib、存档）一律不进仓库；下文 `W` = 工作区 `~/Documents/game_port/Blade/work`。
 
 ## 现状（2026-11-07）
 
@@ -50,7 +50,7 @@ Blade II 的移植记录：游戏分析、每个问题的数字与根因、版�
 | （未打标签，`main`） | 2026-10-23 | 玩家验证通过的三条修复：第一 Boss 金属盔甲全黑（原子缓冲绑定传了贴图号而非 GPU 地址 + 环境 BRDF 查找表被池内陈旧字节重传）、装备界面角色全黑（UE4 光照通道的整数颜色目标 / 整数贴图，见下表）、零星卡顿（画面触发器同步存 PNG，缺省改关）；立方体数组贴图不再多建 6 倍；无声测试脚本 `tools/aba_run.sh`（`DM_AUDIO=0`、不点亮显示器）；管线预热缺省开（见下表「局内零星长帧」）。 |
 | `v0.1.0` | 2026-10-18 | 第一个阶段性版本：Mac 宿主可通关游玩（已验证第 1–3 关，60 fps，音频、mp4 过场、实体手柄）；闪烁 / 一帧错画 / 显存暴涨三条线全部收口；`tools/pak_shaders.py` 离线抽出全部 10 220 个着色器并推出贴图 / 属性事实，Mac 与 iOS 着色器库都是全量；iOS 壳能编完整 App，尚未上真机。下一步：iOS 真机运行、性能、触摸虚拟手柄浮层。 |
 
-**2026-10-15 的结果（Mac 宿主，`tools/run_mac.sh`，60 fps）**：标题 → 读档确认（世界地图底图）→ 章节地图 → 关卡选择（角色立绘、关卡预览图）→ 读取画面 → Act 1「Darkness in Luemos」：带贴图的石板地、木桶、锁链、尖塔，雾、烛光、点光源，主角（白发角斗士）与敌人（骷髅兵）的完整模型、鹅、受击特效、连击数字、受伤红闪，画面与真机一致；不操作时主角被打死出「Defeat」画面。截图在 `~/blade2-work/run/shot_*.png`。
+**2026-10-15 的结果（Mac 宿主，`tools/run_mac.sh`，60 fps）**：标题 → 读档确认（世界地图底图）→ 章节地图 → 关卡选择（角色立绘、关卡预览图）→ 读取画面 → Act 1「Darkness in Luemos」：带贴图的石板地、木桶、锁链、尖塔，雾、烛光、点光源，主角（白发角斗士）与敌人（骷髅兵）的完整模型、鹅、受击特效、连击数字、受伤红闪，画面与真机一致；不操作时主角被打死出「Defeat」画面。截图在 `~/Documents/game_port/Blade/work/run/shot_*.png`。
 
 着色器链已通：宿主转储（`DM_NVN_SHDUMP`）→ `dmsh_from_dump.py` 合成包 + 映射表 + 作答表 → `dmsh_build.py`（Ryujinx → spirv-cross → metal）→ 285 个着色器 281 个出库（4 个是立方体阴影的几何着色器，见下）。一轮迭代：`tools/shaders_iterate.sh`。
 

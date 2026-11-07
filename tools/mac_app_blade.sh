@@ -1,16 +1,16 @@
 #!/bin/bash
 # 把 Blade II 的 Mac 宿主包成能双击起的 macOS App：tools/mac_app_blade.sh <改写产物目录(out2)> [输出目录]
-#   产出 <输出目录>/Blade II.app（缺省 ~/blade2-work/out/macapp）。包里带：宿主程序、改写后的游戏程序（Resources/product，约 150 MB）、
+#   产出 <输出目录>/Blade II.app（缺省 ~/Documents/game_port/Blade/work/out/macapp）。包里带：宿主程序、改写后的游戏程序（Resources/product，约 150 MB）、
 #   着色器映射表 / c1 表、编好的着色器库（Resources/msl/b-<链版本>，只带 .metallib 与 .json）。游戏资源（RomFS）不进包：
 #   第一次启动弹文件夹选择框，选解出来的 Update/RomFS（里面有 BladeII/Content/Paks），记进偏好；存档在 ~/Library/Application Support/Blade II Mobile/save，
 #   日志在 ~/Library/Logs/Blade II Mobile/host.log。本地临时签名，本机直接能跑。
 # Wrap the Blade II Mac host into a double-clickable macOS App: tools/mac_app_blade.sh <rewrite output dir (out2)> [output dir]
-#   Produces <output dir>/Blade II.app (default ~/blade2-work/out/macapp). The package holds: the host, the rewritten game program (Resources/product, ~150 MB),
+#   Produces <output dir>/Blade II.app (default ~/Documents/game_port/Blade/work/out/macapp). The package holds: the host, the rewritten game program (Resources/product, ~150 MB),
 #   the shader map / c1 table, the compiled shader library (Resources/msl/b-<chain>, .metallib + .json only). The game resources (RomFS) are not in the package:
 #   the first launch asks for the folder (the extracted Update/RomFS containing BladeII/Content/Paks) and remembers it; saves go to ~/Library/Application Support/Blade II Mobile/save,
 #   the log to ~/Library/Logs/Blade II Mobile/host.log. Ad-hoc signed, runs on this machine.
 set -eu
-HERE=$(cd "$(dirname "$0")/.." && pwd); DM=$HERE/dm; ROOT=${DM_ROOT:-$HOME/blade2-work}
+HERE=$(cd "$(dirname "$0")/.." && pwd); DM=$HERE/dm; ROOT=${DM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/work}
 P=${1:?改写产物目录 | rewrite output dir}; OUT=${2:-$ROOT/out/macapp}
 [ -f "$P/main.patched.bin" ] || { echo "🔴 ${P} 里没有 main.patched.bin"; exit 2; }
 NAME="Blade II"; BID=${DM_MAC_BUNDLE_ID:-org.blade2mobile.mac}

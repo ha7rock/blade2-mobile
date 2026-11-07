@@ -5,15 +5,15 @@
 #   DM_NVN_SERIAL_FRAME=1 tools/aba_run.sh serial1
 # The game window stays behind everything, small, in the bottom-right corner (DM_WINDOW_BACK=1) so a person working on the Mac is not interrupted; ABA_TOP=1 restores the old on-top window for screen recording.
 # Silent by default (DM_AUDIO=0: no CoreAudio output unit at all); DM_AUDIO=1 in the environment turns sound back on.
-# Outputs: ~/blade2-work/run/aba/<tag>/{rec.mov, small.raw, reglum.txt, host.log, stderr.log, screen.txt, reglum_aba.txt, env.txt}
+# Outputs: ~/Documents/game_port/Blade/work/run/aba/<tag>/{rec.mov, small.raw, reglum.txt, host.log, stderr.log, screen.txt, reglum_aba.txt, env.txt}
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TAG=${1:?tag}; RS=${2:-55}; RD=${3:-60}; WATCH=${4:-120}
-#   ABA_APP=<.app> (default ~/blade2-work/out/macapp/Blade II.app), ABA_OUT=<dir> (default ~/blade2-work/run/aba), ABA_SAVEDIR=<scratch save copy> (default ~/blade2-work/run/save_play),
+#   ABA_APP=<.app> (default ~/Documents/game_port/Blade/work/out/macapp/Blade II.app), ABA_OUT=<dir> (default ~/Documents/game_port/Blade/work/run/aba), ABA_SAVEDIR=<scratch save copy> (default ~/Documents/game_port/Blade/work/run/save_play),
 #   ABA_LAG=1 adds DM_NVN_LAGLOG=<out>/lag.txt; other BladeII processes seen during the run are logged to <out>/overlap.txt (a non-empty file = timing-contaminated run)
-W=$HOME/blade2-work; APP=${ABA_APP:-"$W/out/macapp/Blade II.app"}; O=${ABA_OUT:-$W/run/aba}/$TAG; SP=${ABA_SAVEDIR:-$W/run/save_play}
+W=${DM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/work}; APP=${ABA_APP:-"$W/out/macapp/Blade II.app"}; O=${ABA_OUT:-$W/run/aba}/$TAG; SP=${ABA_SAVEDIR:-$W/run/save_play}
 CROP=${ABA_CROP:-2560:1400:640:248}
-# One game instance at a time (two agents share this Mac; a second instance kills / perturbs the first): mkdir lock ~/blade2-work/run/gpu.lock, stale lock (dead pid) removed
+# One game instance at a time (two agents share this Mac; a second instance kills / perturbs the first): mkdir lock ~/Documents/game_port/Blade/work/run/gpu.lock, stale lock (dead pid) removed
 LK=$W/run/gpu.lock
 while ! mkdir "$LK" 2>/dev/null; do p=$(cat "$LK/pid" 2>/dev/null); if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LK"; continue; fi; sleep 3; done
 echo $$ > "$LK/pid"; echo "$TAG" > "$LK/tag"; trap 'rm -rf "$LK"' EXIT

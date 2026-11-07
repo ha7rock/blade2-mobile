@@ -3,7 +3,7 @@
 # take the updated program files (ExeFS: main / sdk / subsdk0 / rtld / main.npdm) and the assets (RomFS: UE4 paks + movies)
 # out of YOUR OWN game dump and put them into the workspace. Nothing is copied anywhere else or uploaded.
 # Usage: extract_game.sh <game dump .xci or .nsp> <prod.keys>
-# Output: $DM_ROOT/data/switch/01009cc00e224000/v131072/Update/{ExeFS,RomFS}   (DM_ROOT defaults to ~/blade2-work)
+# Output: $DM_ROOT/data/switch/01009cc00e224000/v131072/Update/{ExeFS,RomFS}   (DM_ROOT defaults to ~/Documents/game_port/Blade/work)
 # Needs: hactool (https://github.com/SciresM/hactool, `make`), on PATH or HACTOOL=<path>. About 10 GB free disk.
 # Differences from d2r-mobile's dm/tools/extract_game.sh (same structure, adapted):
 #   · title id / version / SDK of this game; the update program NCA (BKTR) is layered on the base NCA of the same title
@@ -12,7 +12,7 @@
 #   · version check = the NSO build ids (bytes 0x40..0x50 of each NSO), not sha256 of the whole file
 set -u
 [ $# -eq 2 ] || { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
-PKG=$1; KEYS=$2; DM_ROOT=${DM_ROOT:-$HOME/blade2-work}; TITLE=01009cc00e224000; OUT=$DM_ROOT/data/switch/$TITLE/v131072/Update
+PKG=$1; KEYS=$2; DM_ROOT=${DM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/work}; TITLE=01009cc00e224000; OUT=$DM_ROOT/data/switch/$TITLE/v131072/Update
 die() { echo "✗ $*" >&2; exit 1; }
 HT=${HACTOOL:-$(command -v hactool || true)}; [ -n "$HT" ] && [ -x "$HT" ] || die "hactool not found: build it and put it on PATH, or set HACTOOL=<path>"
 [ -f "$PKG" ] || die "no such game dump: $PKG"; [ -f "$KEYS" ] || die "no such key file: $KEYS"

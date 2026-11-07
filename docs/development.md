@@ -4,7 +4,7 @@ README 讲结果与最短用法；本页讲怎么工作：[d2r-mobile](https://g
 
 ## 工作区与环境
 
-- 工作区 `~/blade2-work`：`data/`（ExeFS / RomFS）、`build/`（改写产物 `out*`、`cache/metal_shader_cache/b-<链版本>`）、`run/`（日志、存档副本）、`shdump/`、`shpak/`（pak 抽出的着色器）、`shpack/`、`texfacts.tsv`、`pso_manifest.tsv`、`icon/icon.jpg`、`venv/`、`out/macapp/`（成品）。游戏内容只放这里。
+- 工作区 `~/Documents/game_port/Blade/work`：`data/`（ExeFS / RomFS）、`build/`（改写产物 `out*`、`cache/metal_shader_cache/b-<链版本>`）、`run/`（日志、存档副本）、`shdump/`、`shpak/`（pak 抽出的着色器）、`shpack/`、`texfacts.tsv`、`pso_manifest.tsv`、`icon/icon.jpg`、`venv/`、`out/macapp/`（成品）。游戏内容只放这里。
 - 着色器翻译器是 .NET apphost：`DOTNET_ROOT=/opt/homebrew/opt/dotnet/libexec`（`tools/shaders_iterate.sh` 自己设；直接调 `dmsh_build.py` 要手动设）。`shaders_iterate.sh` 用 `bash` 跑。
 - 测试规矩（无声、不点亮显示器、不让玩家为诊断玩游戏、根因要有计数）见 [porting_playbook.md](porting_playbook.md) 第 1 节。
 
@@ -92,28 +92,28 @@ AArch64 上只有四类东西在苹果内核下不能原样跑，改写器用线
 
 ```bash
 # 1. 取游戏文件（自己的 XCI + 自己的 prod.keys；hactool 自己从源码 make）
-DM_ROOT=~/blade2-work tools/extract_game.sh "Blade II ... .xci" prod.keys
+DM_ROOT=~/Documents/game_port/Blade/work tools/extract_game.sh "Blade II ... .xci" prod.keys
 
 # 2. Python 环境 + 改写三个模块（main 两遍约 5 分钟）
-python3 -m venv ~/blade2-work/venv && ~/blade2-work/venv/bin/pip install lz4 capstone unicorn pillow numpy
-E=~/blade2-work/data/switch/01009cc00e224000/v131072/Update/ExeFS; O=~/blade2-work/build/out
-for m in sdk subsdk0 main; do ~/blade2-work/venv/bin/python3 dm/tools/patch_nso.py $E/$m $O $m; done
+python3 -m venv ~/Documents/game_port/Blade/work/venv && ~/Documents/game_port/Blade/work/venv/bin/pip install lz4 capstone unicorn pillow numpy
+E=~/Documents/game_port/Blade/work/data/switch/01009cc00e224000/v131072/Update/ExeFS; O=~/Documents/game_port/Blade/work/build/out
+for m in sdk subsdk0 main; do ~/Documents/game_port/Blade/work/venv/bin/python3 dm/tools/patch_nso.py $E/$m $O $m; done
 
 # 3. Mac 宿主
 make -C dm/host -f Makefile.blade
-tools/run_mac.sh $O 120        # 日志在 ~/blade2-work/run/log/
+tools/run_mac.sh $O 120        # 日志在 ~/Documents/game_port/Blade/work/run/log/
 
 # 4. 着色器（反复几轮直到没有「不在映射表里」）：带转储 / 配对 / 贴图类型记录跑一遍，再出包重编
-W=~/blade2-work
+W=~/Documents/game_port/Blade/work
 tools/run_mac.sh $O 100 DM_PRESENT_LINK=0 DM_MSL_DIR=$W/build/cache/metal_shader_cache DM_NVN_SHDUMP=$W/shdump \
   DM_PSO_MANIFEST=off DM_NVN_TBDR=0 DM_KEYS="A@6,A@10,A@14,A@18,A@24,A@30,A@36,A@55" DM_NVN_SHOT=3000:$W/run/shot_%d.png
 tools/pak_shaders.py extract $W/shpak/blobs $ROMFS/BladeII/Content/Paks/*.pak   # 全部着色器离线抽出（一次即可，约 3 分钟）
 tools/pak_shaders.py derive $W/shpak/blobs $W/shpak/dump $W/shpak/facts.tsv     # → 转储格式 + 事实表；rsync 进 $W/shdump，facts 并进 $W/texfacts.tsv
 tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_build → 重编宿主（全量 10 220 个约 14 分钟，J=12）
 
-# 4b. Mac 成品包：tools/mac_app_blade.sh（图标 = 游戏自己的 Switch 图标：hactool 取控制 NCA 的 icon_AmericanEnglish.dat 放到 ~/blade2-work/icon/icon.jpg，游戏内容不进仓库；DM_MAC_DMG=1 再出 .dmg）
-tools/mac_app_blade.sh ~/blade2-work/build/out2            # → ~/blade2-work/out/macapp/Blade II.app（AppIcon.icns、pso_manifest.tsv 预热清单、全量着色器库）
-DM_MAC_DMG=1 tools/mac_app_blade.sh ~/blade2-work/build/out2   # 再压一个 Blade II Mobile 0.1 (<构建号>).dmg
+# 4b. Mac 成品包：tools/mac_app_blade.sh（图标 = 游戏自己的 Switch 图标：hactool 取控制 NCA 的 icon_AmericanEnglish.dat 放到 ~/Documents/game_port/Blade/work/icon/icon.jpg，游戏内容不进仓库；DM_MAC_DMG=1 再出 .dmg）
+tools/mac_app_blade.sh ~/Documents/game_port/Blade/work/build/out2            # → ~/Documents/game_port/Blade/work/out/macapp/Blade II.app（AppIcon.icns、pso_manifest.tsv 预热清单、全量着色器库）
+DM_MAC_DMG=1 tools/mac_app_blade.sh ~/Documents/game_port/Blade/work/build/out2   # 再压一个 Blade II Mobile 0.1 (<构建号>).dmg
 
 # 5. iOS 壳（dm/ios/blade，不需要暗黑的 dm/ios 工程）：iphoneos 着色器库 → 生成工程 + 编译；没有签名身份时只做编译检查
 IOSOUT=$W/build/ios/dmsh_b J=8 $W/venv/bin/python3 -I dm/gfx/tools/dmsh_build.py $W/shpack $W/build/cache/metal_shader_cache

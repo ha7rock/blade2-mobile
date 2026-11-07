@@ -6,7 +6,7 @@
 #   ./run.sh launch                           在 DM_DEVICE 上启动；日志在 App 的 Documents/boot.txt（「文件」App 里可见）
 # 输入：DM_OUT（main / sdk 的 .patched.bin、fixups / gates / cuts 表）、iOS 版着色器库 $DM_ROOT/build/ios/dmsh_b/b-<V>
 #      （出法：IOSOUT=$DM_ROOT/build/ios/dmsh_b python3 dm/gfx/tools/dmsh_build.py $DM_ROOT/shpack $DM_ROOT/build/cache/metal_shader_cache；V 见 dm/gfx/nvn/dmsh_chain.h）
-# 产物与日志在 $DM_ROOT/run/ios/（缺省 ~/blade2-work）。
+# 产物与日志在 $DM_ROOT/run/ios/（缺省 ~/Documents/game_port/Blade/work）。
 # Blade II iOS shell: generate Gen/ and the project, compile; install; launch. Usage:
 #   DM_OUT=<rewrite output dir> ./run.sh build   generate + compile. With DM_TEAM_ID in the local config (../local.env, see ../local.env.example) a signed Release build is made;
 #                                                without it only a compile check (CODE_SIGNING_ALLOWED=NO, Debug, cannot be installed)
@@ -14,11 +14,11 @@
 #   ./run.sh launch                               launch on DM_DEVICE; the log is in the App's Documents/boot.txt (visible in the Files app)
 # Inputs: DM_OUT (main / sdk .patched.bin, fixups / gates / cuts tables), the iOS shader library $DM_ROOT/build/ios/dmsh_b/b-<V>
 #      (built by: IOSOUT=$DM_ROOT/build/ios/dmsh_b python3 dm/gfx/tools/dmsh_build.py $DM_ROOT/shpack $DM_ROOT/build/cache/metal_shader_cache; V in dm/gfx/nvn/dmsh_chain.h)
-# Outputs and logs go to $DM_ROOT/run/ios/ (default ~/blade2-work).
+# Outputs and logs go to $DM_ROOT/run/ios/ (default ~/Documents/game_port/Blade/work).
 set -u
 cd "$(dirname "$0")"
 source ../tools/local_env.sh
-W=${DM_ROOT:-$HOME/blade2-work}; R=$W/run/ios; mkdir -p "$R"
+W=${DM_ROOT:-$(cd "$(dirname "$0")/../../../.." && pwd)/work}; R=$W/run/ios; mkdir -p "$R"
 DD=${DM_IOS_DD:-$R/dd_blade}
 B=${DM_BUNDLE_ID:-org.example.blade2}; T=${DM_TEAM_ID:-}
 CFG=${DM_CONFIG:-$([ -n "$T" ] && echo Release || echo Debug)}

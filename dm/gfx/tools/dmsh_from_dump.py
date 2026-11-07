@@ -50,7 +50,7 @@ import json
 # Texture type answers: "key \t slot \t type word" recorded by the host via DM_NVN_TEXFACTS (buffer / 3D / cube ...; the translator defaults to 2D and Metal reads 0 when the type does not match -- UE4 skinning's bone matrices are a texture buffer)
 # When one slot was seen with several types the last one wins with a notice
 texfacts, attrfacts, foutfacts, texfmtfacts = {}, {}, {}, {}
-tf = os.environ.get('DM_TEXFACTS', os.path.join(os.environ.get('DM_ROOT', os.path.expanduser('~/blade2-work')), 'texfacts.tsv'))
+tf = os.environ.get('DM_TEXFACTS', os.path.join(os.environ.get('DM_ROOT', os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', 'work'))), 'texfacts.tsv'))
 if os.path.exists(tf):
     for ln in open(tf):
         c = ln.rstrip('\n').split('\t')

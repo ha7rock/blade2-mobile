@@ -13,7 +13,7 @@
 3. **导入清单**：`tools/nso_syms.py`、`tools/import_coverage.py`、`tools/main_imports_vs_d2r.py` → 哪些 SDK 接口 d2r 已接、哪些要新接（Blade 的新接是音频渲染器、hid 六轴、time 时区、swkbd、movie）。`HLE_FORCE` 表必须精确：表里有、没人引用的条目装载即报错。
 4. **图形 API 面**：`dm/gfx/tools/nvn_slots.py`（`NVN_LOADER` / `NVN_TEXT_END` 按本游戏填）数一下静态调用了哪些 NVN 函数、哪些 d2r 没实现。UE4 用了 37 个 D2R 从未调的入口（DrawElements、BindTexture、nvnBuffer*、FenceSync…）。
 5. **跳转表写法**：`tools/br18_sites.py` 分类 `br x18` 的形态；新 clang / 新引擎会出现改写器不认识的写法（见 §2）。
-6. **工作区**：`~/<game>-work`（data / build / run / shdump / shpack / texfacts.tsv / venv），游戏内容永远不进仓库。
+6. **工作区**：`game_port/<游戏>/work`（data / build / run / shdump / shpack / texfacts.tsv / venv，仓库在旁边的 `<game>-mobile/`），游戏内容永远不进仓库。
 
 ---
 
