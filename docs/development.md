@@ -14,6 +14,7 @@ README 讲结果与最短用法；本页讲怎么工作：[d2r-mobile](https://g
 ## 工作区与环境
 
 - 工作区 `~/Documents/game_port/Blade/work`：`data/`（ExeFS / RomFS）、`build/`（改写产物 `out*`、`cache/metal_shader_cache/b-<链版本>`）、`run/`（`saves/` 测试存档副本、`aba/` 脚本局、`ios/` 构建日志、`pso_user.tsv`）、`shdump/`、`shpak/`（pak 抽出的着色器）、`shpack/`、`texfacts.tsv`、`pso_manifest.tsv`、`icon/icon.jpg`、`venv/`、`out/macapp/`（成品）。游戏内容只放这里。
+- 工作区里只有 `data/`（游戏文件）、`out/macapp/`（成品 App / dmg）、三份事实表（`texfacts.tsv`、`pso_manifest.tsv`、`shpairs.txt`）、`icon/`、`tools/hactool` 需要保留；`build/`、`shdump/`、`shpack/`、`shpak/`、`run/`、`venv/` 都能按下文命令重建（改写 5 分钟、pak 抽着色器 3 分钟、全量翻译约 14 分钟），2026-11-07 起平时不保留。
 - 着色器翻译器是 .NET apphost：`DOTNET_ROOT=/opt/homebrew/opt/dotnet/libexec`（`scripts/shaders_iterate.sh` 自己设；直接调 `dmsh_build.py` 要手动设）。`shaders_iterate.sh` 用 `bash` 跑。
 - 测试规矩（无声、不点亮显示器、不让玩家为诊断玩游戏、根因要有计数）见 [porting_playbook.md](porting_playbook.md) 第 1 节。
 
