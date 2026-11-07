@@ -2,7 +2,7 @@
 
 给**下一个移植任务**看的总结。每条都是 Blade II（UE4 4.17，NintendoSDK 7.4）上真实踩过、有提交记录的问题，按工程阶段排列；每条写明「现象 → 根因 → 处理 → 在哪」。引擎相关的条目标了【UE4】，换引擎时只借思路；没标的是方法论层面的，任何游戏都会遇到。
 
-方法论本身见仓库 [README](../README.md) 第一节；本文只讲坑。
+方法论拆解见 [development.md](development.md)，Blade II 的根因表与现状见 [blade_port.md](blade_port.md)；本文只讲坑。
 
 ---
 
