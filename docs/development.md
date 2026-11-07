@@ -2,10 +2,19 @@
 
 README 讲结果与最短用法；本页讲怎么工作：[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) 方法的拆解、为 Blade II 改了什么、从 XCI 到成品包的完整命令。工程记录（分析、根因表、现状）见 [blade_port.md](blade_port.md)。`dm/` 是 d2r-mobile 的 `dm/` 目录原样拷贝（MIT，见 `LICENSE.d2r-mobile`）加上 Blade 的改动；改动都能用 `git log -p` 看到。
 
+## 仓库布局
+
+- `dm/`：d2r-mobile 的 `dm/` 原样 + Blade 改动（改写器 `dm/tools`、宿主 `dm/host`、图形与着色器链 `dm/gfx`、iOS 壳 `dm/ios/blade`）。
+- `scripts/`：从 XCI 到成品包要跑的脚本：`extract_game.sh`、`run_mac.sh`、`shaders_iterate.sh`、`pak_shaders.py`、`mac_app_blade.sh`（+ `mac_icon.m`）。
+- `tools/survey/`：开工前的静态调查（NSO 符号、导入覆盖、`br x18` 形态、NSO 审计、宿主试链接）。
+- `tools/diag/`：排错用（无声脚本局 `aba_run.sh`、按需抓取 `dump_req.sh`、一帧错画 / 亮度 / 通道环 / 池贴图块高 / GPU 滞后各检测器）。问题关闭后脚本保留，作为下一款游戏的现成探测器。
+- `tools/ios/`：触摸手柄效果图 `pad_mockup.m`。
+- `docs/`：本页、[blade_port.md](blade_port.md)、[porting_playbook.md](porting_playbook.md)、[ios_pad.md](ios_pad.md)、`survey/`、`screenshots/`。
+
 ## 工作区与环境
 
-- 工作区 `~/Documents/game_port/Blade/work`：`data/`（ExeFS / RomFS）、`build/`（改写产物 `out*`、`cache/metal_shader_cache/b-<链版本>`）、`run/`（日志、存档副本）、`shdump/`、`shpak/`（pak 抽出的着色器）、`shpack/`、`texfacts.tsv`、`pso_manifest.tsv`、`icon/icon.jpg`、`venv/`、`out/macapp/`（成品）。游戏内容只放这里。
-- 着色器翻译器是 .NET apphost：`DOTNET_ROOT=/opt/homebrew/opt/dotnet/libexec`（`tools/shaders_iterate.sh` 自己设；直接调 `dmsh_build.py` 要手动设）。`shaders_iterate.sh` 用 `bash` 跑。
+- 工作区 `~/Documents/game_port/Blade/work`：`data/`（ExeFS / RomFS）、`build/`（改写产物 `out*`、`cache/metal_shader_cache/b-<链版本>`）、`run/`（`saves/` 测试存档副本、`aba/` 脚本局、`ios/` 构建日志、`pso_user.tsv`）、`shdump/`、`shpak/`（pak 抽出的着色器）、`shpack/`、`texfacts.tsv`、`pso_manifest.tsv`、`icon/icon.jpg`、`venv/`、`out/macapp/`（成品）。游戏内容只放这里。
+- 着色器翻译器是 .NET apphost：`DOTNET_ROOT=/opt/homebrew/opt/dotnet/libexec`（`scripts/shaders_iterate.sh` 自己设；直接调 `dmsh_build.py` 要手动设）。`shaders_iterate.sh` 用 `bash` 跑。
 - 测试规矩（无声、不点亮显示器、不让玩家为诊断玩游戏、根因要有计数）见 [porting_playbook.md](porting_playbook.md) 第 1 节。
 
 ---
@@ -81,10 +90,10 @@ AArch64 上只有四类东西在苹果内核下不能原样跑，改写器用线
 ### 宿主（`dm/host`）
 
 - `Makefile.blade`：只编通用部分（装载 / SVC / 服务接管 / 图形层），不带任何 `dm_*.c` 暗黑功能文件、`diag.c`、`touch_mac.c`。
-- `blade_stubs.c`：通用文件里残留的 100 个 D2R 功能钩子的中性实现（过滤器原样放行、查询答「没有」、D2R 剪口才会到的宿主调用一律中止）。清单由 `tools/host_trial_build.sh` 的链接缺符号列表得出。
+- `blade_stubs.c`：通用文件里残留的 100 个 D2R 功能钩子的中性实现（过滤器原样放行、查询答「没有」、D2R 剪口才会到的宿主调用一律中止）。清单由 `tools/survey/host_trial_build.sh` 的链接缺符号列表得出。
 - `hle_blade.c`：Blade 多用到的 SDK 接口——movie 媒体信息、hid 六轴 / 握持 / 手柄支持小程序、oe、time 时区规则、swkbd 配置、vi 缩放、web / err / pctl / diag，**音频渲染器**（在 SDK 接口层按 voice 混音：PcmInt16 / DSP-ADPCM 解码、线性插值重采样、音量 × 混音矩阵（含 BufferMixer 路由）叠成立体声，CoreAudio 出声或静音接收端按实时消耗；波形缓冲播完归还、已播样本数如实；`DM_AUDIO=1` 出声，`DM_AUDIO_OUT_DUMP=<文件>` 转储混音结果），联网一组一律「不可用」。
 - `hle_hid.c`：Joy-Con 双持 / 左 / 右三种样式答「没接」；`hle_fs.c`：`DeleteDirectory`、`CommitSaveData`、`GetDirectoryEntryCount`。
-- `tools/extract_game.sh`：按本游戏的 title / 版本从 XCI 取文件（prod.keys 里格式不对的行先过滤）。
+- `scripts/extract_game.sh`：按本游戏的 title / 版本从 XCI 取文件（prod.keys 里格式不对的行先过滤）。
 
 ---
 
@@ -92,7 +101,7 @@ AArch64 上只有四类东西在苹果内核下不能原样跑，改写器用线
 
 ```bash
 # 1. 取游戏文件（自己的 XCI + 自己的 prod.keys；hactool 自己从源码 make）
-DM_ROOT=~/Documents/game_port/Blade/work tools/extract_game.sh "Blade II ... .xci" prod.keys
+DM_ROOT=~/Documents/game_port/Blade/work scripts/extract_game.sh "Blade II ... .xci" prod.keys
 
 # 2. Python 环境 + 改写三个模块（main 两遍约 5 分钟）
 python3 -m venv ~/Documents/game_port/Blade/work/venv && ~/Documents/game_port/Blade/work/venv/bin/pip install lz4 capstone unicorn pillow numpy
@@ -101,24 +110,24 @@ for m in sdk subsdk0 main; do ~/Documents/game_port/Blade/work/venv/bin/python3 
 
 # 3. Mac 宿主
 make -C dm/host -f Makefile.blade
-tools/run_mac.sh $O 120        # 日志在 ~/Documents/game_port/Blade/work/run/log/
+scripts/run_mac.sh $O 120        # 日志在 ~/Documents/game_port/Blade/work/run/log/
 
 # 4. 着色器（反复几轮直到没有「不在映射表里」）：带转储 / 配对 / 贴图类型记录跑一遍，再出包重编
 W=~/Documents/game_port/Blade/work
-tools/run_mac.sh $O 100 DM_PRESENT_LINK=0 DM_MSL_DIR=$W/build/cache/metal_shader_cache DM_NVN_SHDUMP=$W/shdump \
+scripts/run_mac.sh $O 100 DM_PRESENT_LINK=0 DM_MSL_DIR=$W/build/cache/metal_shader_cache DM_NVN_SHDUMP=$W/shdump \
   DM_PSO_MANIFEST=off DM_NVN_TBDR=0 DM_KEYS="A@6,A@10,A@14,A@18,A@24,A@30,A@36,A@55" DM_NVN_SHOT=3000:$W/run/shot_%d.png
-tools/pak_shaders.py extract $W/shpak/blobs $ROMFS/BladeII/Content/Paks/*.pak   # 全部着色器离线抽出（一次即可，约 3 分钟）
-tools/pak_shaders.py derive $W/shpak/blobs $W/shpak/dump $W/shpak/facts.tsv     # → 转储格式 + 事实表；rsync 进 $W/shdump，facts 并进 $W/texfacts.tsv
-tools/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_build → 重编宿主（全量 10 220 个约 14 分钟，J=12）
+scripts/pak_shaders.py extract $W/shpak/blobs $ROMFS/BladeII/Content/Paks/*.pak   # 全部着色器离线抽出（一次即可，约 3 分钟）
+scripts/pak_shaders.py derive $W/shpak/blobs $W/shpak/dump $W/shpak/facts.tsv     # → 转储格式 + 事实表；rsync 进 $W/shdump，facts 并进 $W/texfacts.tsv
+scripts/shaders_iterate.sh         # dotnet publish → dmsh_from_dump → dmsh_build → 重编宿主（全量 10 220 个约 14 分钟，J=12）
 
-# 4b. Mac 成品包：tools/mac_app_blade.sh（图标 = 游戏自己的 Switch 图标：hactool 取控制 NCA 的 icon_AmericanEnglish.dat 放到 ~/Documents/game_port/Blade/work/icon/icon.jpg，游戏内容不进仓库；DM_MAC_DMG=1 再出 .dmg）
-tools/mac_app_blade.sh ~/Documents/game_port/Blade/work/build/out2            # → ~/Documents/game_port/Blade/work/out/macapp/Blade II.app（AppIcon.icns、pso_manifest.tsv 预热清单、全量着色器库）
-DM_MAC_DMG=1 tools/mac_app_blade.sh ~/Documents/game_port/Blade/work/build/out2   # 再压一个 Blade II Mobile 0.1 (<构建号>).dmg
+# 4b. Mac 成品包：scripts/mac_app_blade.sh（图标 = 游戏自己的 Switch 图标：hactool 取控制 NCA 的 icon_AmericanEnglish.dat 放到 ~/Documents/game_port/Blade/work/icon/icon.jpg，游戏内容不进仓库；DM_MAC_DMG=1 再出 .dmg）
+scripts/mac_app_blade.sh ~/Documents/game_port/Blade/work/build/out2            # → ~/Documents/game_port/Blade/work/out/macapp/Blade II.app（AppIcon.icns、pso_manifest.tsv 预热清单、全量着色器库）
+DM_MAC_DMG=1 scripts/mac_app_blade.sh ~/Documents/game_port/Blade/work/build/out2   # 再压一个 Blade II Mobile 0.1 (<构建号>).dmg
 
 # 5. iOS 壳（dm/ios/blade，不需要暗黑的 dm/ios 工程）：iphoneos 着色器库 → 生成工程 + 编译；没有签名身份时只做编译检查
 IOSOUT=$W/build/ios/dmsh_b J=8 $W/venv/bin/python3 -I dm/gfx/tools/dmsh_build.py $W/shpack $W/build/cache/metal_shader_cache
 cp dm/ios/local.env.example dm/ios/local.env   # 填 DM_TEAM_ID / DM_BUNDLE_ID / DM_DEVICE（见文件内说明）
 DM_OUT=$O dm/ios/blade/run.sh build && dm/ios/blade/run.sh install && dm/ios/blade/run.sh launch
 # RomFS：用「文件」App 把 Update/RomFS 的内容（含 BladeII/Content/Paks）拷进 App 的文件夹；日志在 App 的 Documents/boot.txt
-# 不用真机验 iOS 的装载路径：make -C dm/host -f Makefile.blade embed EMBED_S=$PWD/dm/ios/blade/Gen/embed.S && DM_HOST_BIN=dmhost_blade_embed tools/run_mac.sh $O 60
+# 不用真机验 iOS 的装载路径：make -C dm/host -f Makefile.blade embed EMBED_S=$PWD/dm/ios/blade/Gen/embed.S && DM_HOST_BIN=dmhost_blade_embed scripts/run_mac.sh $O 60
 ```

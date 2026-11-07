@@ -1,7 +1,7 @@
 #!/bin/bash
-# 向正在运行的 Blade II Mac 宿主发「按需抓取」命令（nvn_mtl.m 的 req_poll）：tools/dump_req.sh [all|shot|draws|rts|texraw <序号>…] [等待秒数=8]
+# 向正在运行的 Blade II Mac 宿主发「按需抓取」命令（nvn_mtl.m 的 req_poll）：tools/diag/dump_req.sh [all|shot|draws|rts|texraw <序号>…] [等待秒数=8]
 #   命令写进 ~/Library/Application Support/Blade II Mobile/dump.req，宿主在 10 帧内读走；然后列出 dump/ 里新出现的文件。玩家停在要看的画面时用。
-# Send a capture-on-request command to the running Blade II Mac host (req_poll in nvn_mtl.m): tools/dump_req.sh [all|shot|draws|rts|texraw <serial>...] [wait seconds=8]
+# Send a capture-on-request command to the running Blade II Mac host (req_poll in nvn_mtl.m): tools/diag/dump_req.sh [all|shot|draws|rts|texraw <serial>...] [wait seconds=8]
 #   The command is written to ~/Library/Application Support/Blade II Mobile/dump.req, picked up by the host within 10 frames; the files that appeared in dump/ are then listed.
 set -u
 SUP="$HOME/Library/Application Support/Blade II Mobile"; REQ="$SUP/dump.req"; OUT="$SUP/dump"

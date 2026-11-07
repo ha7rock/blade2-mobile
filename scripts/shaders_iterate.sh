@@ -1,6 +1,6 @@
 #!/bin/bash
 # 一轮着色器迭代：转储目录 → 合成包 + 映射表 → 翻译链版本头 → 翻译 → c1 清单 → 重编宿主。
-# 用法：tools/shaders_iterate.sh            （DM_ROOT 缺省 ~/Documents/game_port/Blade/work；转储在 $DM_ROOT/shdump，库在 $DM_ROOT/build/cache/metal_shader_cache）
+# 用法：scripts/shaders_iterate.sh            （DM_ROOT 缺省 ~/Documents/game_port/Blade/work；转储在 $DM_ROOT/shdump，库在 $DM_ROOT/build/cache/metal_shader_cache）
 # One shader iteration: dump dir → synthetic packages + map → chain header → translate → c1 list → rebuild the host.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd); W=${DM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/work}; export DM_ROOT=$W

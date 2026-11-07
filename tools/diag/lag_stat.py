@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize a DM_NVN_LAGLOG run dir (tools/aba_run.sh with ABA_LAG=1): GPU lag at present (submits / unfinished presents),
+"""Summarize a DM_NVN_LAGLOG run dir (tools/diag/aba_run.sh with ABA_LAG=1): GPU lag at present (submits / unfinished presents),
 fps and present-interval p99 from REGLUM timestamps, centre black frames (same rule as reglum_black.py) and, for each black
 frame, the S/A/P lines of the frames around it.  Usage: lag_stat.py <run_dir> [--from 3000] [--detail]"""
 import sys, os

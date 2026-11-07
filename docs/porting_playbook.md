@@ -8,11 +8,11 @@
 
 ## 0. 新游戏第一天清单
 
-1. **提取**：`tools/extract_game.sh <xci/nsp> prod.keys`（按 title / 版本取 ExeFS + RomFS；prod.keys 里格式不对的行要先过滤，hactool 自己从源码 make）。nsp 本体 + 升级档的情况要分别解出再按「Update 覆盖 base」取文件。
+1. **提取**：`scripts/extract_game.sh <xci/nsp> prod.keys`（按 title / 版本取 ExeFS + RomFS；prod.keys 里格式不对的行要先过滤，hactool 自己从源码 make）。nsp 本体 + 升级档的情况要分别解出再按「Update 覆盖 base」取文件。
 2. **认引擎与 SDK**：在 `main` 解压映像里搜构建字符串（`++UE4+Release-x.y`、`Unity`、构建路径）；npdm 看 `SystemResourceSize`（0 → `DM_SYSRES_MB=0`，游戏走普通堆）。
-3. **导入清单**：`tools/nso_syms.py`、`tools/import_coverage.py`、`tools/main_imports_vs_d2r.py` → 哪些 SDK 接口 d2r 已接、哪些要新接（Blade 的新接是音频渲染器、hid 六轴、time 时区、swkbd、movie）。`HLE_FORCE` 表必须精确：表里有、没人引用的条目装载即报错。
+3. **导入清单**：`tools/survey/nso_syms.py`、`tools/survey/import_coverage.py`、`tools/survey/main_imports_vs_d2r.py` → 哪些 SDK 接口 d2r 已接、哪些要新接（Blade 的新接是音频渲染器、hid 六轴、time 时区、swkbd、movie）。`HLE_FORCE` 表必须精确：表里有、没人引用的条目装载即报错。
 4. **图形 API 面**：`dm/gfx/tools/nvn_slots.py`（`NVN_LOADER` / `NVN_TEXT_END` 按本游戏填）数一下静态调用了哪些 NVN 函数、哪些 d2r 没实现。UE4 用了 37 个 D2R 从未调的入口（DrawElements、BindTexture、nvnBuffer*、FenceSync…）。
-5. **跳转表写法**：`tools/br18_sites.py` 分类 `br x18` 的形态；新 clang / 新引擎会出现改写器不认识的写法（见 §2）。
+5. **跳转表写法**：`tools/survey/br18_sites.py` 分类 `br x18` 的形态；新 clang / 新引擎会出现改写器不认识的写法（见 §2）。
 6. **工作区**：`game_port/<游戏>/work`（data / build / run / shdump / shpack / texfacts.tsv / venv，仓库在旁边的 `<game>-mobile/`），游戏内容永远不进仓库。
 
 ---
@@ -21,8 +21,8 @@
 
 | 规矩 | 原因 |
 |---|---|
-| **无声、不点亮显示器**：`tools/aba_run.sh`（`DM_AUDIO=0`、`caffeinate -ims` 不带 `-d/-u`、`DM_WINDOW_BACK=1` 小窗在后面、截图走 `DM_NVN_SHOT=帧号:路径` 而不是屏幕录制） | 玩家的电视和 Mac 在同一条 HDMI-CEC 链上，点亮显示器会把电视切过来 |
-| **不让玩家为诊断玩游戏**；要抓活实例用 `tools/dump_req.sh shot/draws/rts/texraw/texlist`（写 `dump.req`，宿主下一帧响应） | 玩家明确要求；而且抓活实例比复现快 |
+| **无声、不点亮显示器**：`tools/diag/aba_run.sh`（`DM_AUDIO=0`、`caffeinate -ims` 不带 `-d/-u`、`DM_WINDOW_BACK=1` 小窗在后面、截图走 `DM_NVN_SHOT=帧号:路径` 而不是屏幕录制） | 玩家的电视和 Mac 在同一条 HDMI-CEC 链上，点亮显示器会把电视切过来 |
+| **不让玩家为诊断玩游戏**；要抓活实例用 `tools/diag/dump_req.sh shot/draws/rts/texraw/texlist`（写 `dump.req`，宿主下一帧响应） | 玩家明确要求；而且抓活实例比复现快 |
 | **根因要有计数**：探测器行（`[帧账]`、`[长帧]`、`画面触发器`、`【红】`）数出来再说「根因」；A/B 用环境开关对比，开关验证完就删 | 猜过的根因（寄存器 8 是 2D 贴图、驻留提交导致卡顿）都被计数否定 |
 | **一个方向失败 2–3 次就停**，换路或报告 | 脚本走标题→大厅三次没通就停了，交给玩家下次顺手看 |
 | **每次改动最多启动一次**；别让实例留着 | 启动会污染玩家的存档 / host.log（所有运行写同一个 host.log） |
@@ -69,7 +69,7 @@
 | 只剩武器，身体不显示（骨骼索引属性 RGBA8UI 按 float4 声明） | 顶点属性分量类型 | `key\tattr:<槽>\tuint/sint` |
 | 【UE4】装备界面角色全黑（光照通道：R16Uint 目标 + 整数贴图读） | 颜色目标整数格式、贴图整数格式 | `key\tfout:<目标>\tuint/sint`、`key\ttexfmt:<槽>\tuint/sint`（`dmsh_build.py int_tex_rewrite` 改声明并 `as_type<float4>` 按位转回） |
 
-**全量离线抽取**胜过「走到哪补到哪」：`tools/pak_shaders.py extract/derive` 从 pak 里抽出全部着色器并从汇编推出事实（UE4 专用；别的引擎要另写抽取器，但思路一样：找到打包格式里的 NVN 着色器 blob）。
+**全量离线抽取**胜过「走到哪补到哪」：`scripts/pak_shaders.py extract/derive` 从 pak 里抽出全部着色器并从汇编推出事实（UE4 专用；别的引擎要另写抽取器，但思路一样：找到打包格式里的 NVN 着色器 blob）。
 
 ### 4.2 Metal 与 NVN 的语义差
 
@@ -79,7 +79,7 @@
 | 地板成块缺失、筛孔纹 | 深度预通道 + GEQUAL 要两套顶点着色器算出**逐位相同**的位置；fast-math 下 fma 合并不同 | `xcrun metal -fpreserve-invariance`（Mac 与 iOS 两条编译口都要） |
 | 读模板位得到 0 | STENCIL8 视图只能以 `X32_Stencil8` 读；HLSL 读 `.g`，宿主不记 NVN 分量调换 | 视图四分量全调成模板（swizzle rrrr） |
 | 立方体数组 | NVN 的 depth 数**面**，Metal 的 arrayLength 数**立方体** | 建图 `depth/6`，上传按面数——**两处要一起改**（原来两处相乘抵消，单改一处 → GPU 错误恢复 ×4/局） |
-| 火焰成方块、大贴图 2×2 错位条纹 | 贴图按驱动缺省块线性布局进池；deko3d 的「高度×1.5」挑块高，压缩格式真机最多 8 GOB | 压缩格式块高封顶 8；`DM_NVN_POOLDUMP` + `tools/pooltex_th.py` 按块间连续性核对 |
+| 火焰成方块、大贴图 2×2 错位条纹 | 贴图按驱动缺省块线性布局进池；deko3d 的「高度×1.5」挑块高，压缩格式真机最多 8 GOB | 压缩格式块高封顶 8；`DM_NVN_POOLDUMP` + `tools/diag/pooltex_th.py` 按块间连续性核对 |
 | 金属全黑（无反射） | ① spirv-cross 给缓冲贴图原子操作生成 `device atomic_uint*` 成员，宿主填了贴图号而不是 GPU 地址 → 光照网格全零；② GPU 拷贝填充的池内贴图被脏页跟踪用**陈旧池字节**重传（环境 BRDF 查找表被冲掉） | ① `nvn_rbind.ptr` 按 MSL 类型含 `*` 判断传地址；② 拷贝目的地也标 GPU 拥有，免重传 |
 | 一帧错画 / 黑帧 | 宿主资源跨帧复用 | `DM_NVN_SERIAL=1`（present 时等本帧 GPU 工作）+ 上传暂存块复用；`ACQ_DEPTH=2` 更糟，别再试 |
 | 闪烁（60 / 120 Hz） | 出图节拍 | 刷新率分档 + `DM_PRESENT_LINK=0` 缺省 |
@@ -89,13 +89,13 @@
 
 ### 4.3 D2R 专属缺省
 
-d2r 宿主里有 D2R 调过的缺省（TBDR 写回前瞻、固定地址、暗黑功能钩子）。通用宿主用 `-DDM_GENERIC_HOST=1` 关掉；`blade_stubs.c` 的中性桩清单由 `tools/host_trial_build.sh` 的链接缺符号列表得出。TBDR 优化（`DM_NVN_TBDR=0`）要在新游戏上重新验证再开。
+d2r 宿主里有 D2R 调过的缺省（TBDR 写回前瞻、固定地址、暗黑功能钩子）。通用宿主用 `-DDM_GENERIC_HOST=1` 关掉；`blade_stubs.c` 的中性桩清单由 `tools/survey/host_trial_build.sh` 的链接缺符号列表得出。TBDR 优化（`DM_NVN_TBDR=0`）要在新游戏上重新验证再开。
 
 ---
 
 ## 5. 着色器链操作细节
 
-- 一轮迭代：`bash tools/shaders_iterate.sh`（文件没有可执行位，直接运行会 Permission denied）。
+- 一轮迭代：`bash scripts/shaders_iterate.sh`（文件没有可执行位，直接运行会 Permission denied）。
 - 翻译器是 .NET apphost：直接调 `dmsh_build.py` 要 `DOTNET_ROOT=/opt/homebrew/opt/dotnet/libexec`，锁文件变了用 `--update-lock`。
 - CAS 以工具指纹 + `dmsh_build.py` 源码指纹为键：改链文件 = 全量重编（10 220 个约 14 分钟 J=12，25 分钟 J=4 nice）。只加事实不改链 → 增量。
 - 13 个 SPIRV-Cross 失败是历史遗留，库数基线 10 205；每次重编对库数。

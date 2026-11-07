@@ -1,9 +1,9 @@
 // 把游戏原版图标（Switch 控制分区里 256×256 的 icon_*.dat，JPEG）做成 macOS 的 AppIcon.icns：
 // 1024 画布、824 见方居中、圆角 22.5%（macOS 图标网格），各档尺寸由 CoreGraphics 缩放后交给 iconutil。
-// 用法：clang -fobjc-arc -framework Cocoa tools/mac_icon.m -o <bin> && <bin> <icon.jpg> <AppIcon.icns>
+// 用法：clang -fobjc-arc -framework Cocoa scripts/mac_icon.m -o <bin> && <bin> <icon.jpg> <AppIcon.icns>
 // Turn the game's own icon (the 256x256 icon_*.dat JPEG from the Switch control partition) into a macOS AppIcon.icns:
 // 1024 canvas, 824 square centred, 22.5% corner radius (the macOS icon grid); each size is scaled by CoreGraphics and handed to iconutil.
-// Usage: clang -fobjc-arc -framework Cocoa tools/mac_icon.m -o <bin> && <bin> <icon.jpg> <AppIcon.icns>
+// Usage: clang -fobjc-arc -framework Cocoa scripts/mac_icon.m -o <bin> && <bin> <icon.jpg> <AppIcon.icns>
 #import <Cocoa/Cocoa.h>
 static CGImageRef render(CGImageRef src, size_t px) {
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();

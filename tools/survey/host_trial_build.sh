@@ -3,7 +3,7 @@
 # print the undefined symbols = the set of D2R-feature entry points the generic files still depend on.
 # Usage: host_trial_build.sh <build dir>
 set -u
-HERE=$(cd "$(dirname "$0")/.." && pwd); B=${1:?build dir}; mkdir -p "$B"
+HERE=$(cd "$(dirname "$0")/../.." && pwd); B=${1:?build dir}; mkdir -p "$B"
 cd "$HERE/dm/host" || exit 1
 SRC="app_mac.m crash.c entry.S front_mac.m hle.c loader.c main.c memstat.m romfs_validate.c thread.c $(ls hle_*.c)"
 GFX="$(ls ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m)"

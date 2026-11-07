@@ -233,12 +233,12 @@ static pthread_mutex_t g_deferred_mu = PTHREAD_MUTEX_INITIALIZER;
 //   defer_obj_unref   = only the reference I hold is no longer wanted, the object itself may still be in use (the view cache of a texture ID may hold the base texture itself): only drop the reference, leave the residency set alone.
 // Previously only the former existed: when the view cache was invalidated, a texture that 'is still the current storage of some serial' was also removed from the residency set. Invalidation used to happen only when the base texture was really replaced, so it was never hit;
 // after the transparency chain's in-place composite swapped the storage of two textures, each of the two live textures was removed once this way, and afterwards they are used as attachments and sampled every frame as usual - the GPU accesses non-resident memory.
-// ---------- 诊断 DM_NVN_LAGLOG=文件（缺省关）：GPU 落后量与每次提交复用了什么，逐行写文件（tools/lag_stat.py 统计 / 与黑帧对齐） ----------
+// ---------- 诊断 DM_NVN_LAGLOG=文件（缺省关）：GPU 落后量与每次提交复用了什么，逐行写文件（tools/diag/lag_stat.py 统计 / 与黑帧对齐） ----------
 //   S 行（每次提交）：帧 栅栏 开工时已完成 提交时已完成 分配器槽 该槽上次栅栏 新建? 竞技场复用 竞技场新建 复用竞技场最小余量(已完成−其栅栏) 延迟释放登记 延迟释放落地 内联UB次数 字节 缓冲拷贝 上传冲刷 上传blit 重传贴图
 //   P 行（每次出图入队）：票号 帧 已提交栅栏 已完成栅栏 落后提交数 未完成的出图帧数；A 行（取交换链贴图）：帧 图号 等的栅栏 等前已完成 等待 ns；O 行：完成回调乱序；B 行：黑帧触发器（REGLUM 中央亮度 A-B-A）
 // 候选修正（缺省全关，只为对照测量）：DM_NVN_ARENA_SLACK=k 竞技场多等 k 个提交才复用；DM_NVN_DEFER_SLACK=k 延迟释放多等 k 个提交；DM_NVN_ALLOC_SLACK=k 命令分配器多等 k 个提交；
 //   DM_NVN_UB_ARENA=1 内联 uniform 更新在提交时先拷进竞技场（不让 GPU 晚读客体命令内存）；DM_NVN_GPU_SPIN=n 每帧第一个提交前让 GPU 空转 n 次（不开着色器校验也能把 GPU 拖慢）
-// ---------- Diagnostic DM_NVN_LAGLOG=file (off by default): GPU lag and what each submission reused, one line per event (tools/lag_stat.py summarizes / joins with black frames) ----------
+// ---------- Diagnostic DM_NVN_LAGLOG=file (off by default): GPU lag and what each submission reused, one line per event (tools/diag/lag_stat.py summarizes / joins with black frames) ----------
 //   S (per submit): frame fence done_at_begin done_at_commit alloc_slot slot_prev_fence new? arena_reused arena_new min_reuse_margin(done-fence) defer_enqueued defer_drained ub_n ub_bytes b2b_n up_flushes up_blits reuploads
 //   P (per present enqueue): ticket frame submitted completed lag_submits unfinished_presents; A (swapchain acquire): frame idx waited_fence done_before wait_ns; O: out-of-order completion; B: black trigger (REGLUM centre A-B-A)
 // Candidate fixes (all off by default, measurement only): DM_NVN_ARENA_SLACK=k arenas reused only k submits later; DM_NVN_DEFER_SLACK=k deferred releases wait k more submits; DM_NVN_ALLOC_SLACK=k likewise for command allocators;
@@ -1494,7 +1494,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     nvn_dirty_protect(t->mem, t->L.size);
     *stamp = nvn_dirty_now();
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    {   // DM_NVN_POOLDUMP=目录：池内贴图首传时把存储原样（块线性）存下来，文件名带描述，用于离线核对块高规则（tools/pooltex_th.py） | DM_NVN_POOLDUMP=dir: on first upload save the storage of pool textures as is (block-linear), descriptor in the file name, for checking the block-height rule offline (tools/pooltex_th.py)
+    {   // DM_NVN_POOLDUMP=目录：池内贴图首传时把存储原样（块线性）存下来，文件名带描述，用于离线核对块高规则（tools/diag/pooltex_th.py） | DM_NVN_POOLDUMP=dir: on first upload save the storage of pool textures as is (block-linear), descriptor in the file name, for checking the block-height rule offline (tools/diag/pooltex_th.py)
         static const char *pd; static int pdn = -1; if (pdn < 0) { pd = getenv("DM_NVN_POOLDUMP"); pdn = 0; }
         if (pd && pdn < 600 && t->d.target == 1 && t->L.size <= (8u << 20)) { unsigned th, td; nvn_tex_level_tiles(&t->d, 0, &th, &td);
             char path[1024]; snprintf(path, sizeof path, "%s/%llu_%ux%u_l%u_f%#x_fl%#x_b%d_%d_%d_th%u.bin", pd, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.levels, t->d.format, t->d.flags, bpb, bw, bh, th);
@@ -6689,7 +6689,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
             for (NSUInteger k = 0; k < rl_w * rl_h; k++) sum += q[4 * k] + q[4 * k + 1] + q[4 * k + 2];
             pthread_mutex_lock(rl_mu); fprintf(rl_f, "%llu\t%llu\t%.4f\t", rl_n, rl_tns, sum / (3.0 * rl_w * rl_h)); for (NSUInteger k = 0; k < ng; k++) fprintf(rl_f, "%02x", g[k]); fputc('\n', rl_f); fflush(rl_f); pthread_mutex_unlock(rl_mu);
             double lum = sum / (3.0 * rl_w * rl_h); static double prev_lum; static int trig_n;
-            if (lag_on()) {   // DM_NVN_LAGLOG 黑帧触发器：中央区（小图第 4–31 行、第 8–55 列，避开大部分界面）均值 A-B-A，B < 0.35×min(A, C)（同 tools/reglum_black.py），记 B 行 | black trigger: centre mean A-B-A as in tools/reglum_black.py
+            if (lag_on()) {   // DM_NVN_LAGLOG 黑帧触发器：中央区（小图第 4–31 行、第 8–55 列，避开大部分界面）均值 A-B-A，B < 0.35×min(A, C)（同 tools/diag/reglum_black.py），记 B 行 | black trigger: centre mean A-B-A as in tools/diag/reglum_black.py
                 static double cm[2]; static unsigned long long cn[2]; static int nc; double c = 0; for (int y = 4; y < 32; y++) for (int x = 8; x < 56; x++) c += g[y * 64 + x]; c /= 28 * 48;
                 if (nc >= 2 && cm[0] > 10 && c > 10 && cm[1] < 0.35 * fmin(cm[0], c)) { lag_printf("B\t%llu\t%.1f\t%.1f\t%.1f\n", cn[1], cm[0], cm[1], c); MLOG("【红】黑帧触发器（中央）：出图 %llu 中央亮度 %.1f → %.1f → %.1f", cn[1], cm[0], cm[1], c); }
                 cm[0] = cm[1]; cn[0] = cn[1]; cm[1] = c; cn[1] = rl_n; if (nc < 2) nc++; }

@@ -1,14 +1,14 @@
 // 通用宿主的 iOS 前端（front.h 的实现，对应 Mac 的 dm/host/front_mac.m）：Metal 出图视图 + 通用虚拟手柄 + 软键盘输入框 + 场景生命周期。
 // 虚拟手柄：画在游戏画面之上、只画不收触点，触点由出图视图统一收；每根手指按落点归类——按钮圆内 = 该键，左半屏空处 = 左摇杆（浮动：落点为中心），
 // 右半屏空处 = 右摇杆；每次变化把整组状态经 dm_input_set 交给宿主（hle_hid.c 在游戏读手柄时落地）。键位 = dm_input.h 的 DM_BTN_*，摇杆 ±32767、上为正。
-// 图层的几何与绘制在 pad_layout.h（布局依据与尺寸口径见该文件头），Mac 上 tools/pad_mockup.m 用同一份代码出效果图；空闲 2.5 s 淡出、按键有震感。
+// 图层的几何与绘制在 pad_layout.h（布局依据与尺寸口径见该文件头），Mac 上 tools/ios/pad_mockup.m 用同一份代码出效果图；空闲 2.5 s 淡出、按键有震感。
 // 不接触摸屏（dm_touch_set）：游戏只认手柄；DM_PAD_OVERLAY=0 不画控件。
 // 实体手柄（dm/host/gamepad_generic.m，GameController）：连上第一个时覆盖层自动藏起、只剩摇杆落点区；最后一个断开再显出来。失活时手柄键一并清零。
 // Generic host iOS front end (implements front.h, the counterpart of dm/host/front_mac.m on the Mac): Metal present view + generic virtual gamepad + software keyboard input box + scene lifecycle.
 // Virtual gamepad: drawn over the game picture, draws only and takes no touches; touches are collected by the present view. Each finger is classified by where it lands --
 // inside a button circle = that button, free space in the left half = left stick (floating: the landing point is the centre), free space in the right half = right stick;
 // on every change the whole state goes to the host through dm_input_set (hle_hid.c applies it when the game polls the controller). Buttons = DM_BTN_* of dm_input.h, sticks ±32767, up positive.
-// Geometry and drawing of the layer live in pad_layout.h (layout rationale and sizing in its header); tools/pad_mockup.m renders mock-ups on the Mac from the same code; fades after 2.5 s idle, haptic tap on buttons.
+// Geometry and drawing of the layer live in pad_layout.h (layout rationale and sizing in its header); tools/ios/pad_mockup.m renders mock-ups on the Mac from the same code; fades after 2.5 s idle, haptic tap on buttons.
 // The touchscreen (dm_touch_set) is not wired: the game only accepts controllers; DM_PAD_OVERLAY=0 hides the widgets.
 // Physical controllers (dm/host/gamepad_generic.m, GameController): when the first one connects the overlay hides itself and only the stick landing zones remain; it reappears when the last one disconnects. Controller buttons are zeroed on resign active as well.
 #import <UIKit/UIKit.h>
@@ -24,7 +24,7 @@
 
 static CAMetalLayer *g_layer;
 
-// ---- 虚拟手柄：几何与绘制在 pad_layout.h（与 tools/pad_mockup.m 共用） | virtual gamepad: geometry and drawing live in pad_layout.h (shared with tools/pad_mockup.m) ----
+// ---- 虚拟手柄：几何与绘制在 pad_layout.h（与 tools/ios/pad_mockup.m 共用） | virtual gamepad: geometry and drawing live in pad_layout.h (shared with tools/ios/pad_mockup.m) ----
 // 环境变量：DM_PAD_OVERLAY=0 不画；DM_PAD_SCALE=0.8–1.4 整体缩放；DM_PAD_ALPHA=空闲透明度（缺省 0.45，松手 2.5 s 后淡下去，再碰立即恢复）；DM_PAD_HAPTIC=0 关按键震感
 // Environment: DM_PAD_OVERLAY=0 hides it; DM_PAD_SCALE=0.8-1.4 scales everything; DM_PAD_ALPHA = idle opacity (default 0.45, fades 2.5 s after the last touch, restored on the next touch); DM_PAD_HAPTIC=0 disables button haptics
 #include "pad_layout.h"

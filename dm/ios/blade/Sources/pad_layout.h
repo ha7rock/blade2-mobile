@@ -1,5 +1,5 @@
 // Blade II 触摸虚拟手柄的图层：几何（放哪、多大、命中）与绘制（CoreGraphics），纯 C，不依赖 UIKit，
-// 所以 iOS 壳（front_blade.m 的覆盖层）和 Mac 上的效果图工具（tools/pad_mockup.m）用的是同一份代码——效果图里看到的就是真机上画的。
+// 所以 iOS 壳（front_blade.m 的覆盖层）和 Mac 上的效果图工具（tools/ios/pad_mockup.m）用的是同一份代码——效果图里看到的就是真机上画的。
 // 键帽用系统自带的手柄图标（SF Symbols：a.circle、zl.button.roundedtop.horizontal、dpad、l.joystick…，正是 Switch 的键形），
 // 由宿主通过 pad_glyph 回调提供位图（iOS：UIImage systemImageNamed；Mac：NSImage imageWithSystemSymbolName），这里只负责摆放与染色；
 // 没有图标时退回画字。坐标系：原点左上、y 向下（UIKit drawRect 的上下文即如此；效果图工具自己翻转位图上下文）。
@@ -14,7 +14,7 @@
 // 左侧 / 顶边控件以窗口高为基准：r = H×0.058（夹在 17–32 点，DM_PAD_SCALE 再乘）；右手 8 键以画面宽为基准，见 pad_layout_make。
 //
 // Touch gamepad layer for Blade II: geometry (where, how big, hit testing) and drawing (CoreGraphics), plain C with no UIKit dependency,
-// so the iOS shell (overlay in front_blade.m) and the Mac mock-up tool (tools/pad_mockup.m) share one copy -- what the mock-up shows is what the device draws.
+// so the iOS shell (overlay in front_blade.m) and the Mac mock-up tool (tools/ios/pad_mockup.m) share one copy -- what the mock-up shows is what the device draws.
 // Key caps are the system's own controller glyphs (SF Symbols: a.circle, zl.button.roundedtop.horizontal, dpad, l.joystick... -- the Switch shapes),
 // supplied as bitmaps by the host through the pad_glyph callback (iOS: UIImage systemImageNamed; Mac: NSImage imageWithSystemSymbolName); this file only
 // places and tints them, and falls back to text when no glyph is available. Coordinates: origin top left, y down (UIKit's drawRect context; the mock-up tool flips its own bitmap context).

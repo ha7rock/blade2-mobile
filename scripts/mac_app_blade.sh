@@ -1,10 +1,10 @@
 #!/bin/bash
-# 把 Blade II 的 Mac 宿主包成能双击起的 macOS App：tools/mac_app_blade.sh <改写产物目录(out2)> [输出目录]
+# 把 Blade II 的 Mac 宿主包成能双击起的 macOS App：scripts/mac_app_blade.sh <改写产物目录(out2)> [输出目录]
 #   产出 <输出目录>/Blade II.app（缺省 ~/Documents/game_port/Blade/work/out/macapp）。包里带：宿主程序、改写后的游戏程序（Resources/product，约 150 MB）、
 #   着色器映射表 / c1 表、编好的着色器库（Resources/msl/b-<链版本>，只带 .metallib 与 .json）。游戏资源（RomFS）不进包：
 #   第一次启动弹文件夹选择框，选解出来的 Update/RomFS（里面有 BladeII/Content/Paks），记进偏好；存档在 ~/Library/Application Support/Blade II Mobile/save，
 #   日志在 ~/Library/Logs/Blade II Mobile/host.log。本地临时签名，本机直接能跑。
-# Wrap the Blade II Mac host into a double-clickable macOS App: tools/mac_app_blade.sh <rewrite output dir (out2)> [output dir]
+# Wrap the Blade II Mac host into a double-clickable macOS App: scripts/mac_app_blade.sh <rewrite output dir (out2)> [output dir]
 #   Produces <output dir>/Blade II.app (default ~/Documents/game_port/Blade/work/out/macapp). The package holds: the host, the rewritten game program (Resources/product, ~150 MB),
 #   the shader map / c1 table, the compiled shader library (Resources/msl/b-<chain>, .metallib + .json only). The game resources (RomFS) are not in the package:
 #   the first launch asks for the folder (the extracted Update/RomFS containing BladeII/Content/Paks) and remembers it; saves go to ~/Library/Application Support/Blade II Mobile/save,
@@ -27,12 +27,12 @@ cp "$DM/gfx/nvn/shader_map.tsv" "$RES/shader_map.tsv"
 ICON=
 if [ -f "$ROOT/icon/icon.jpg" ]; then
   mkdir -p "$ROOT/build/cache/tools"; MI="$ROOT/build/cache/tools/mac_icon"
-  [ -x "$MI" ] && [ "$MI" -nt "$HERE/tools/mac_icon.m" ] || clang -fobjc-arc -framework Cocoa "$HERE/tools/mac_icon.m" -o "$MI"
+  [ -x "$MI" ] && [ "$MI" -nt "$HERE/scripts/mac_icon.m" ] || clang -fobjc-arc -framework Cocoa "$HERE/scripts/mac_icon.m" -o "$MI"
   "$MI" "$ROOT/icon/icon.jpg" "$RES/AppIcon.icns" && ICON=1 || echo "🟡 图标没做成（继续打包，无图标）"
 fi
 V=$(sed -n 's/.*DMSH_CHAIN "\(.*\)".*/\1/p' "$DM/gfx/nvn/dmsh_chain.h")
 MSL=${DM_MSL_DIR:-$ROOT/build/cache/metal_shader_cache}/b-$V
-[ -d "$MSL" ] || { echo "🔴 没有着色器库 ${MSL}（先跑 tools/shaders_iterate.sh）"; exit 2; }
+[ -d "$MSL" ] || { echo "🔴 没有着色器库 ${MSL}（先跑 scripts/shaders_iterate.sh）"; exit 2; }
 mkdir -p "$RES/msl/b-$V"; rsync -a --include='*.metallib' --include='*.json' --exclude='*' "$MSL/" "$RES/msl/b-$V/"
 VER=${DM_MAC_VERSION:-0.1}; BUILD=${DM_MAC_BUILD:-$(date +%m%d%H%M)}
 echo "版本 ${VER} 构建 ${BUILD} 提交 $(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo 未知) 着色器链 b-$V" > "$RES/build.txt"

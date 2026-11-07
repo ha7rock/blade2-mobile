@@ -1,17 +1,17 @@
 #!/bin/bash
 # One scripted fight run of the Mac app + screen recording + A-B-A detection (screen and game-frame thumbnails).
-# Usage: tools/aba_run.sh <tag> [rec_start_s=55] [rec_dur_s=60] [watch_s=120]
+# Usage: tools/diag/aba_run.sh <tag> [rec_start_s=55] [rec_dur_s=60] [watch_s=120]
 #   Extra DM_* env for the app: pass them in the environment of this script (they are inherited), e.g.
-#   DM_NVN_SERIAL_FRAME=1 tools/aba_run.sh serial1
+#   DM_NVN_SERIAL_FRAME=1 tools/diag/aba_run.sh serial1
 # The game window stays behind everything, small, in the bottom-right corner (DM_WINDOW_BACK=1) so a person working on the Mac is not interrupted; ABA_TOP=1 restores the old on-top window for screen recording.
 # Silent by default (DM_AUDIO=0: no CoreAudio output unit at all); DM_AUDIO=1 in the environment turns sound back on.
 # Outputs: ~/Documents/game_port/Blade/work/run/aba/<tag>/{rec.mov, small.raw, reglum.txt, host.log, stderr.log, screen.txt, reglum_aba.txt, env.txt}
 set -u
-HERE=$(cd "$(dirname "$0")/.." && pwd)
+HERE=$(cd "$(dirname "$0")/../.." && pwd)
 TAG=${1:?tag}; RS=${2:-55}; RD=${3:-60}; WATCH=${4:-120}
-#   ABA_APP=<.app> (default ~/Documents/game_port/Blade/work/out/macapp/Blade II.app), ABA_OUT=<dir> (default ~/Documents/game_port/Blade/work/run/aba), ABA_SAVEDIR=<scratch save copy> (default ~/Documents/game_port/Blade/work/run/save_play),
+#   ABA_APP=<.app> (default ~/Documents/game_port/Blade/work/out/macapp/Blade II.app), ABA_OUT=<dir> (default ~/Documents/game_port/Blade/work/run/aba), ABA_SAVEDIR=<scratch save copy> (default ~/Documents/game_port/Blade/work/run/saves/play),
 #   ABA_LAG=1 adds DM_NVN_LAGLOG=<out>/lag.txt; other BladeII processes seen during the run are logged to <out>/overlap.txt (a non-empty file = timing-contaminated run)
-W=${DM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/work}; APP=${ABA_APP:-"$W/out/macapp/Blade II.app"}; O=${ABA_OUT:-$W/run/aba}/$TAG; SP=${ABA_SAVEDIR:-$W/run/save_play}
+W=${DM_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)/work}; APP=${ABA_APP:-"$W/out/macapp/Blade II.app"}; O=${ABA_OUT:-$W/run/aba}/$TAG; SP=${ABA_SAVEDIR:-$W/run/saves/play}
 CROP=${ABA_CROP:-2560:1400:640:248}
 # One game instance at a time (two agents share this Mac; a second instance kills / perturbs the first): mkdir lock ~/Documents/game_port/Blade/work/run/gpu.lock, stale lock (dead pid) removed
 LK=$W/run/gpu.lock
@@ -21,7 +21,7 @@ while pgrep -x BladeII > /dev/null; do sleep 3; done   # an instance started wit
 rm -rf "$O"; mkdir -p "$O"
 caffeinate -ims -t $((WATCH + 30)) &   # 只防系统睡眠；不带 -d/-u：那两个会点亮显示器，经 HDMI-CEC 把电视切过来 | keep the system awake only; no -d/-u: those wake the display and switch the TV over HDMI-CEC
 CAF=$!
-rm -rf "$SP"; cp -r "${ABA_SAVESRC:-$W/run/save}" "$SP"   # ABA_SAVESRC=<存档目录>：换一份起始存档（如通关存档，开局进大厅而不是新游戏） | ABA_SAVESRC=<save dir>: start from another save (e.g. a cleared-stage save that opens in the lobby instead of a new game)
+rm -rf "$SP"; cp -r "${ABA_SAVESRC:-$W/run/saves/base}" "$SP"   # ABA_SAVESRC=<存档目录>：换一份起始存档（如通关存档，开局进大厅而不是新游戏） | ABA_SAVESRC=<save dir>: start from another save (e.g. a cleared-stage save that opens in the lobby instead of a new game)
 K="A@6,A@10,A@14,A@18,A@24,A@30,A@36"
 for i in $(seq 0 90); do K="$K,A@$(echo "55+$i*0.7" | bc)"; done
 K="$K,LSU@70+2,LSR@85+2"

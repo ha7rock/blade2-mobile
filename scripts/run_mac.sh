@@ -7,7 +7,7 @@ set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd); OUT=${1:?rewrite output dir}; SECS=${2:-90}; shift; shift 2>/dev/null
 W=${DM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/work}; export DM_ROOT=$W
 export DM_ROMFS=${DM_ROMFS:-$W/data/switch/01009cc00e224000/v131072/Update/RomFS}
-export DM_SAVE=${DM_SAVE:-$W/run/save} DM_TEMP=${DM_TEMP:-$W/run/temp}
+export DM_SAVE=${DM_SAVE:-$W/run/saves/base} DM_TEMP=${DM_TEMP:-$W/run/temp}
 mkdir -p "$DM_SAVE" "$DM_TEMP" "$W/run/log"
 [ -d "$DM_ROMFS/BladeII" ] || { echo "DM_ROMFS=$DM_ROMFS has no BladeII/ directory"; exit 1; }
 LOG=$W/run/log/host_$(date +%m%d_%H%M%S).log

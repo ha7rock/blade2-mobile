@@ -1,6 +1,6 @@
 // iOS 虚拟手柄图层的效果图：在 Mac 上用 dm/ios/blade/Sources/pad_layout.h 的同一份几何与绘制代码，把图层画在一张游戏截图上，
 // 按给定的 iPhone 点尺寸、安全区和像素比出 PNG——不用真机就能看布局、改尺寸；真机上 front_blade.m 画的就是这份。
-//   clang -fobjc-arc -framework AppKit -framework CoreText -I dm/host -I dm/ios/blade/Sources tools/pad_mockup.m -o /tmp/pad_mockup
+//   clang -fobjc-arc -framework AppKit -framework CoreText -I dm/host -I dm/ios/blade/Sources tools/ios/pad_mockup.m -o /tmp/pad_mockup
 //   /tmp/pad_mockup <截图.jpg> <出.png> <宽 点> <高 点> <上 左 下 右 安全区> [scale=3] [pressed=A,ZL|-] [stick=dx,dy|-] [alpha=1]
 //   例：iPhone 15 Pro 横屏 852x393，安全区 0 59 21 59；iPhone SE 667x375，安全区 0 0 0 0
 // Mock-up of the iOS touch-gamepad layer: on the Mac, draw the layer over a game screenshot with the very same geometry and drawing code

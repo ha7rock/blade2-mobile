@@ -1,6 +1,6 @@
 # iOS 触摸虚拟手柄图层（设计，2026-10-18，第 4 稿：右手键直接叠在游戏 HUD 的格子上）
 
-代码：`dm/ios/blade/Sources/pad_layout.h`（几何 + 绘制，纯 C / CoreGraphics；右手 8 键是叠在游戏 HUD 格子上的半透明菱形框，左侧 / 顶边的小键用系统 SF Symbols 手柄图标 `dpad` / `l.joystick` / `plus.circle`…，由宿主按名提供位图、这里染白摆放）、`dm/ios/blade/Sources/front_blade.m`（触点归类、淡出、震感）、`tools/pad_mockup.m`（Mac 上出效果图，用的是同一份几何与绘制代码）。
+代码：`dm/ios/blade/Sources/pad_layout.h`（几何 + 绘制，纯 C / CoreGraphics；右手 8 键是叠在游戏 HUD 格子上的半透明菱形框，左侧 / 顶边的小键用系统 SF Symbols 手柄图标 `dpad` / `l.joystick` / `plus.circle`…，由宿主按名提供位图、这里染白摆放）、`dm/ios/blade/Sources/front_blade.m`（触点归类、淡出、震感）、`tools/ios/pad_mockup.m`（Mac 上出效果图，用的是同一份几何与绘制代码）。
 
 ## 效果图（Mac 渲染，真机画的就是这份）
 
@@ -42,7 +42,7 @@
 
 ## 改布局的流程
 
-改 `pad_layout.h`（右手 8 键的比例坐标在 `hud_u` / `hud_v`，左侧图标名在 `k_glyph`）→ `clang -fobjc-arc -framework AppKit -framework CoreText -I dm/host -I dm/ios/blade/Sources tools/pad_mockup.m -o /tmp/pad_mockup` → `/tmp/pad_mockup docs/screenshots/03_skeletons.jpg out.png 852 393 0 59 21 59 3 Y,R 0.7,0.5 1` 看图（工具还会打印每个键的中心 / 半径 / 命中半径 / 与最近邻的间隙）→ 真机 `dm/ios/blade/run.sh build && install && launch`。
+改 `pad_layout.h`（右手 8 键的比例坐标在 `hud_u` / `hud_v`，左侧图标名在 `k_glyph`）→ `clang -fobjc-arc -framework AppKit -framework CoreText -I dm/host -I dm/ios/blade/Sources tools/ios/pad_mockup.m -o /tmp/pad_mockup` → `/tmp/pad_mockup docs/screenshots/03_skeletons.jpg out.png 852 393 0 59 21 59 3 Y,R 0.7,0.5 1` 看图（工具还会打印每个键的中心 / 半径 / 命中半径 / 与最近邻的间隙）→ 真机 `dm/ios/blade/run.sh build && install && launch`。
 
 ## 真机上要验的
 

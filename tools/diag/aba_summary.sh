@@ -1,6 +1,6 @@
 #!/bin/bash
-# One summary line per run dir: tools/aba_summary.sh <tag>... ; appends to ~/Documents/game_port/Blade/work/run/aba/summary.tsv
-A=${DM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/work}/run/aba; T=$(cd "$(dirname "$0")" && pwd)
+# One summary line per run dir: tools/diag/aba_summary.sh <tag>... ; appends to ~/Documents/game_port/Blade/work/run/aba/summary.tsv
+A=${DM_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)/work}/run/aba; T=$(cd "$(dirname "$0")" && pwd)
 for d in "$@"; do
   D=$A/$d; [ -d "$D" ] || continue
   if [ ! -f "$D/drawset_fight.txt" ] && { [ -f "$D/drawset.txt" ] || [ -f "$D/drawset.txt.gz" ]; }; then
